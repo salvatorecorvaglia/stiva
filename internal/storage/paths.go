@@ -235,7 +235,9 @@ func (fs *FilesystemEngine) checkPathConflict(objPath string, bucket string) err
 		}
 		dir = parent
 	}
-	return nil
+	// A Stat error above means the path simply isn't there, which is exactly
+	// the no-conflict case this reports.
+	return nil //nolint:nilerr // intentional: a missing parent path is not a conflict
 }
 
 func (fs *FilesystemEngine) validateBucketName(name string) error {

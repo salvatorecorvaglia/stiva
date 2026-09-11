@@ -323,6 +323,19 @@ func (v *SigV4Verifier) verifyPresigned(r *http.Request) error {
 	return nil
 }
 
+// AccessKeyFromAuthHeader returns the access key named in a SigV4
+// Authorization header, or "" if the header is absent or unparseable.
+//
+// The access logger needs exactly this and used to re-implement the parsing
+// inline, splitting on commas and slashes in its own slightly different way.
+func AccessKeyFromAuthHeader(header string) string {
+	parsed, err := parseAuthHeader(header)
+	if err != nil {
+		return ""
+	}
+	return parsed.AccessKey
+}
+
 // parseAuthHeader parses an AWS SigV4 Authorization header.
 // Format: AWS4-HMAC-SHA256 Credential=<accessKey>/<date>/<region>/<service>/aws4_request, SignedHeaders=<headers>, Signature=<sig>
 func parseAuthHeader(header string) (*parsedAuth, error) {

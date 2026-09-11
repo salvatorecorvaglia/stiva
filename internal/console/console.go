@@ -26,10 +26,9 @@ import (
 )
 
 const (
-	errMethodNotAllowed = "method not allowed"
-	errInvalidRequest   = "invalid request"
-	contentTypeHeader   = "Content-Type"
-	errMissingKey       = "missing key parameter"
+	errInvalidRequest = "invalid request"
+	contentTypeHeader = "Content-Type"
+	errMissingKey     = "missing key parameter"
 
 	// maxJSONRequestBody bounds the JSON body accepted by the console API.
 	// These handlers decoded straight from r.Body with no ceiling, unlike their
@@ -166,6 +165,7 @@ type Handler struct {
 	region           string
 	s3Endpoint       string
 	mux              *http.ServeMux
+	apiPaths         *http.ServeMux
 	loginLimiter     *rateLimiter
 	apiLimiter       *rateLimiter
 	trustProxy       bool
@@ -192,6 +192,7 @@ func NewHandler(opts Options) *Handler {
 		region:           opts.Region,
 		s3Endpoint:       opts.S3Endpoint,
 		mux:              http.NewServeMux(),
+		apiPaths:         http.NewServeMux(),
 		loginLimiter:     newRateLimiter(opts.LoginRateLimit),
 		apiLimiter:       newRateLimiter(opts.APIRateLimit),
 		trustProxy:       opts.TrustProxy,
@@ -213,12 +214,92 @@ func (h *Handler) rateLimitMiddleware(limiter *rateLimiter, next http.HandlerFun
 	}
 }
 
+// bucketRoute adapts a bucket-scoped handler to a ServeMux pattern carrying a
+// {bucket} wildcard, validating the name once here instead of in each handler.
+func (h *Handler) bucketRoute(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bucket := r.PathValue("bucket")
+		if !storage.IsValidBucketName(bucket) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+			return
+		}
+		next(w, r, bucket)
+	}
+}
+
+// setupRoutes declares the console API as method-and-path patterns.
+//
+// This used to be a single "/api/buckets/" catch-all that hand-parsed the
+// remainder of the path and dispatched through a fourteen-arm switch on
+// (action, method), with each arm re-deriving the bucket name. ServeMux has
+// expressed exactly this since Go 1.22.
+//
+// The routes are declared once, in a table, and registered into two muxes: the
+// real one, and a method-agnostic copy used only to tell a wrong-method request
+// (405) from an unknown endpoint (404). ServeMux answers 405 by itself, but
+// only when no other pattern matches the path at all — and the SPA's "/"
+// catch-all matches everything, so without this a PUT to a GET-only API route
+// would be answered with index.html and a 200.
 func (h *Handler) setupRoutes() {
-	// API routes
-	h.mux.HandleFunc("/api/login", h.rateLimitMiddleware(h.loginLimiter, h.handleLogin))
-	h.mux.HandleFunc("/api/config", h.rateLimitMiddleware(h.apiLimiter, h.authMiddleware(h.handleGetConfig)))
-	h.mux.HandleFunc("/api/buckets", h.rateLimitMiddleware(h.apiLimiter, h.authMiddleware(h.handleBuckets)))
-	h.mux.HandleFunc("/api/buckets/", h.rateLimitMiddleware(h.apiLimiter, h.authMiddleware(h.handleBucketObjects)))
+	// api wraps a handler in the rate limiter and the session check.
+	api := func(next http.HandlerFunc) http.HandlerFunc {
+		return h.rateLimitMiddleware(h.apiLimiter, h.authMiddleware(next))
+	}
+	// bucketAPI additionally resolves and validates the {bucket} wildcard.
+	bucketAPI := func(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+		return api(h.bucketRoute(next))
+	}
+
+	routes := []struct {
+		method  string
+		path    string
+		handler http.HandlerFunc
+	}{
+		{http.MethodPost, "/api/login", h.rateLimitMiddleware(h.loginLimiter, h.handleLogin)},
+		{http.MethodGet, "/api/config", api(h.handleGetConfig)},
+
+		{http.MethodGet, "/api/buckets", api(h.listBuckets)},
+		{http.MethodPost, "/api/buckets", api(h.createBucket)},
+		{http.MethodDelete, "/api/buckets/{bucket}", bucketAPI(h.deleteBucket)},
+
+		{http.MethodGet, "/api/buckets/{bucket}/public", bucketAPI(h.handleGetBucketPublic)},
+		{http.MethodPost, "/api/buckets/{bucket}/public", bucketAPI(h.handleSetBucketPublic)},
+
+		{http.MethodGet, "/api/buckets/{bucket}/objects", bucketAPI(h.listObjects)},
+		{http.MethodDelete, "/api/buckets/{bucket}/objects", bucketAPI(h.deleteObject)},
+		{http.MethodGet, "/api/buckets/{bucket}/objects/presign", bucketAPI(h.handlePresignObject)},
+		{http.MethodPost, "/api/buckets/{bucket}/objects/upload", bucketAPI(h.uploadObject)},
+		{http.MethodGet, "/api/buckets/{bucket}/objects/download", bucketAPI(h.downloadObject)},
+
+		{http.MethodPost, "/api/buckets/{bucket}/multipart/initiate", bucketAPI(h.initiateMultipart)},
+		{http.MethodPost, "/api/buckets/{bucket}/multipart/upload-part", bucketAPI(h.uploadPart)},
+		{http.MethodPost, "/api/buckets/{bucket}/multipart/complete", bucketAPI(h.completeMultipart)},
+		{http.MethodPost, "/api/buckets/{bucket}/multipart/abort", bucketAPI(h.abortMultipart)},
+
+		{http.MethodGet, "/api/buckets/{bucket}/lifecycle", bucketAPI(h.handleGetLifecycle)},
+		{http.MethodPost, "/api/buckets/{bucket}/lifecycle", bucketAPI(h.handlePutLifecycle)},
+		{http.MethodDelete, "/api/buckets/{bucket}/lifecycle", bucketAPI(h.handleDeleteLifecycle)},
+	}
+
+	registered := make(map[string]bool, len(routes))
+	for _, rt := range routes {
+		h.mux.HandleFunc(rt.method+" "+rt.path, rt.handler)
+		if !registered[rt.path] {
+			registered[rt.path] = true
+			h.apiPaths.HandleFunc(rt.path, func(http.ResponseWriter, *http.Request) {})
+		}
+	}
+
+	// Anything else under /api/ is either a known path reached with the wrong
+	// method, or no endpoint at all. Either way it must not reach the SPA
+	// fallback below and come back as index.html.
+	h.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := h.apiPaths.Handler(r); pattern != "" {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+	})
 
 	// Prometheus metrics endpoint
 	h.mux.HandleFunc("/metrics", h.handleMetrics)
@@ -337,21 +418,12 @@ func (h *Handler) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // render itself correctly — currently just the S3 API port, which the
 // top-bar badge used to hardcode as "Port 9000" regardless of the operator's
 // actual STIVA_S3_PORT.
-func (h *Handler) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": errMethodNotAllowed})
-		return
-	}
+func (h *Handler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int{"s3Port": h.s3Port})
 }
 
 // handleLogin handles POST /api/login.
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": errMethodNotAllowed})
-		return
-	}
-
 	var req struct {
 		AccessKey string `json:"accessKey"`
 		SecretKey string `json:"secretKey"`
@@ -378,18 +450,6 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"token": token})
-}
-
-// handleBuckets handles /api/buckets (GET = list, POST = create).
-func (h *Handler) handleBuckets(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		h.listBuckets(w, r)
-	case http.MethodPost:
-		h.createBucket(w, r)
-	default:
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-	}
 }
 
 func (h *Handler) listBuckets(w http.ResponseWriter, _ *http.Request) {
@@ -447,64 +507,6 @@ func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name})
 }
 
-// handleBucketObjects handles /api/buckets/<name>/... routes.
-func (h *Handler) handleBucketObjects(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/buckets/")
-	parts := strings.SplitN(path, "/", 2)
-	bucketName := parts[0]
-
-	// Validate bucket name (SEC-7 / Traversal Protection)
-	if !storage.IsValidBucketName(bucketName) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
-		return
-	}
-
-	// Check if this is a bucket delete or object operations
-	if len(parts) == 1 || parts[1] == "" {
-		if r.Method == http.MethodDelete {
-			h.deleteBucket(w, r, bucketName)
-			return
-		}
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		return
-	}
-
-	action := parts[1]
-
-	switch {
-	case action == "public" && r.Method == http.MethodPost:
-		h.handleSetBucketPublic(w, r, bucketName)
-	case action == "public" && r.Method == http.MethodGet:
-		h.handleGetBucketPublic(w, r, bucketName)
-	case action == "objects" && r.Method == http.MethodGet:
-		h.listObjects(w, r, bucketName)
-	case action == "objects/presign" && r.Method == http.MethodGet:
-		h.handlePresignObject(w, r, bucketName)
-	case action == "objects/upload" && r.Method == http.MethodPost:
-		h.uploadObject(w, r, bucketName)
-	case action == "objects/download" && r.Method == http.MethodGet:
-		h.downloadObject(w, r, bucketName)
-	case action == "objects" && r.Method == http.MethodDelete:
-		h.deleteObject(w, r, bucketName)
-	case action == "multipart/initiate" && r.Method == http.MethodPost:
-		h.initiateMultipart(w, r, bucketName)
-	case action == "multipart/upload-part" && r.Method == http.MethodPost:
-		h.uploadPart(w, r, bucketName)
-	case action == "multipart/complete" && r.Method == http.MethodPost:
-		h.completeMultipart(w, r, bucketName)
-	case action == "multipart/abort" && r.Method == http.MethodPost:
-		h.abortMultipart(w, r, bucketName)
-	case action == "lifecycle" && r.Method == http.MethodGet:
-		h.handleGetLifecycle(w, r, bucketName)
-	case action == "lifecycle" && r.Method == http.MethodPost:
-		h.handlePutLifecycle(w, r, bucketName)
-	case action == "lifecycle" && r.Method == http.MethodDelete:
-		h.handleDeleteLifecycle(w, r, bucketName)
-	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-	}
-}
-
 func (h *Handler) deleteBucket(w http.ResponseWriter, _ *http.Request, name string) {
 	if err := h.engine.DeleteBucket(name); err != nil {
 		writeStorageError(w, err, "failed to delete bucket")
@@ -514,8 +516,22 @@ func (h *Handler) deleteBucket(w http.ResponseWriter, _ *http.Request, name stri
 }
 
 func (h *Handler) handleSetBucketPublic(w http.ResponseWriter, r *http.Request, bucket string) {
+	// Anything unrecognised used to mean "false" and return 200, so a typo in
+	// a call meant to publish a bucket reported success while doing the
+	// opposite. For a control over public access, say so instead.
 	publicStr := r.URL.Query().Get("public")
-	public := publicStr == "true"
+	var public bool
+	switch strings.ToLower(publicStr) {
+	case "true", "1", "yes", "on":
+		public = true
+	case "false", "0", "no", "off":
+		public = false
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": `the "public" parameter must be true or false`,
+		})
+		return
+	}
 
 	if err := h.engine.SetBucketPublic(bucket, public); err != nil {
 		writeStorageError(w, err, "failed to update bucket access")

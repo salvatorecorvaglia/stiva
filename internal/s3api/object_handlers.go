@@ -332,9 +332,10 @@ func (rt *Router) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 			writeS3Error(w, "NoSuchKey", "The specified key does not exist.", resource)
 			return
 		}
-		if handleStorageError(w, err, resource) {
-			return
-		}
+		// Unconditional: handleStorageError only returns false for a nil
+		// error, so falling through here would dereference a nil info.
+		handleStorageError(w, err, resource)
+		return
 	}
 
 	w.Header().Set(contentTypeHeader, info.ContentType)
@@ -374,21 +375,18 @@ func (rt *Router) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 	resource := "/" + bucket + "/" + key
 
 	if err != nil {
-		if handleStorageError(w, err, resource) {
-			return
-		}
+		handleStorageError(w, err, resource)
+		return
 	}
 
 	// If a delete marker was created, S3 returns 204 with delete marker headers
-	if err == nil {
-		if versionID == "" && isDeleteMarker {
-			w.Header().Set(amzDeleteMarkerHeader, "true")
-			if delVersionID != "" {
-				w.Header().Set(amzVersionIDHeader, delVersionID)
-			}
-		} else if versionID != "" {
-			w.Header().Set(amzVersionIDHeader, versionID)
+	if versionID == "" && isDeleteMarker {
+		w.Header().Set(amzDeleteMarkerHeader, "true")
+		if delVersionID != "" {
+			w.Header().Set(amzVersionIDHeader, delVersionID)
 		}
+	} else if versionID != "" {
+		w.Header().Set(amzVersionIDHeader, versionID)
 	}
 
 	// S3 returns 204 even if the key doesn't exist

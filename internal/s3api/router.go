@@ -212,19 +212,8 @@ func (rt *Router) logAccess(r *http.Request, bucket, key string, statusCode int,
 	remoteIP := httpx.ClientIP(r, rt.trustProxy, rt.trustedProxyHops)
 
 	requester := "-"
-	authHeader := r.Header.Get("Authorization")
-	if strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256") {
-		parts := strings.Split(authHeader, ",")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if strings.HasPrefix(part, "Credential=") {
-				cred := strings.TrimPrefix(part, "Credential=")
-				credParts := strings.Split(cred, "/")
-				if len(credParts) > 0 {
-					requester = credParts[0]
-				}
-			}
-		}
+	if ak := auth.AccessKeyFromAuthHeader(r.Header.Get("Authorization")); ak != "" {
+		requester = ak
 	}
 
 	requestID := "stiva"

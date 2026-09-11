@@ -135,10 +135,7 @@ func (rt *Router) handlePutBucketVersioning(w http.ResponseWriter, r *http.Reque
 // handleGetBucketLifecycle handles GET /<bucket>?lifecycle.
 func (rt *Router) handleGetBucketLifecycle(w http.ResponseWriter, _ *http.Request, bucket string) {
 	lc, err := rt.engine.GetBucketLifecycle(bucket)
-	if err != nil {
-		if handleStorageError(w, err, "/"+bucket) {
-			return
-		}
+	if handleStorageError(w, err, "/"+bucket) {
 		return
 	}
 

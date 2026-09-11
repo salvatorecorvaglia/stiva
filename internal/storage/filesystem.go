@@ -726,7 +726,9 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 
 	info, err := fs.metadata.GetObjectMeta(bucket, key, "")
 	if err != nil {
-		return false, "", nil
+		// Deleting a key that isn't there is a success in S3: DELETE is
+		// idempotent and returns 204 either way.
+		return false, "", nil //nolint:nilerr // intentional: absent key is not an error
 	}
 
 	// Fetch all versions of the object to remove their files from disk
@@ -1137,7 +1139,9 @@ func cleanupOrphanedTempFiles(dataDir string) {
 	for _, dir := range walkDirs {
 		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				return nil
+				// Skip anything unreadable rather than abandoning the sweep;
+				// this is best-effort startup cleanup.
+				return nil //nolint:nilerr // intentional: keep walking past unreadable entries
 			}
 			// Only regular files are removed: skipping symlinks avoids the
 			// TOCTOU traversal a symlinked temp name could otherwise cause.

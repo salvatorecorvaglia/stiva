@@ -11,6 +11,10 @@ linters:
     - gocritic
     - gosec
     - misspell
+    # nilerr catches "if err != nil { ... }" blocks that fall through instead of
+    # returning — the shape behind a latent nil dereference in the object
+    # handlers, where a failed HeadObject carried on to read info.ContentType.
+    - nilerr
     - noctx
     - revive
     - unconvert

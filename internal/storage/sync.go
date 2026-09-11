@@ -174,9 +174,9 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 			return err
 		}
 	case "PUT":
-		info, err := fs.metadata.GetObjectMeta(bucket, key, "")
-		if err != nil {
-			return fmt.Errorf("failed to fetch object metadata: %w", err)
+		info, metaErr := fs.metadata.GetObjectMeta(bucket, key, "")
+		if metaErr != nil {
+			return fmt.Errorf("failed to fetch object metadata: %w", metaErr)
 		}
 
 		// GetObject below is called without SSE-C parameters, because the
@@ -187,9 +187,9 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 			return errSkipSSEC
 		}
 
-		reader, _, err := fs.GetObject(ctx, bucket, key, "")
-		if err != nil {
-			return fmt.Errorf("failed to get object reader: %w", err)
+		reader, _, readErr := fs.GetObject(ctx, bucket, key, "")
+		if readErr != nil {
+			return fmt.Errorf("failed to get object reader: %w", readErr)
 		}
 		defer reader.Close()
 
