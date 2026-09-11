@@ -16,13 +16,9 @@ import (
 )
 
 var (
-	BucketsBucket   = []byte("buckets")
-	ObjectsBucket   = []byte("objects")
-	MultipartBucket = []byte("multipart")
-
-	bucketsBucket   = BucketsBucket
-	objectsBucket   = ObjectsBucket
-	multipartBucket = MultipartBucket
+	bucketsBucket   = []byte("buckets")
+	objectsBucket   = []byte("objects")
+	multipartBucket = []byte("multipart")
 )
 
 type initLock struct {
@@ -30,10 +26,9 @@ type initLock struct {
 	refCount int
 }
 
-// MaxOpenBucketDBs bounds the number of cached per-bucket bbolt handles. It is
+// maxOpenBucketDBs bounds the number of cached per-bucket bbolt handles. It is
 // a soft cap: a handle that is still in use is never evicted (see bucketDBEntry).
-const MaxOpenBucketDBs = 100
-const maxOpenBucketDBs = MaxOpenBucketDBs
+const maxOpenBucketDBs = 100
 
 // bucketDBEntry is a refcounted bbolt handle.
 //
@@ -233,42 +228,6 @@ func (m *MetadataStore) evictLocked(keep string) {
 
 // acquireBucketDB returns a bbolt handle for the bucket along with a release
 // function that must be called when the caller is done with it.
-// GlobalDB returns the central bbolt database handle.
-func (m *MetadataStore) GlobalDB() *bolt.DB {
-	return m.globalDB
-}
-
-// HasInitLock returns true if an initLock exists for the given bucket.
-func (m *MetadataStore) HasInitLock(bucket string) bool {
-	m.initMu.Lock()
-	defer m.initMu.Unlock()
-	_, exists := m.initLocks[bucket]
-	return exists
-}
-
-// AcquireBucketDB acquires a reference-counted handle to a bucket's bbolt database.
-func (m *MetadataStore) AcquireBucketDB(bucket string) (*bolt.DB, func(), error) {
-	return m.acquireBucketDB(bucket)
-}
-
-// ActiveBucketsCount returns the number of active bucket DB handles in the cache.
-func (m *MetadataStore) ActiveBucketsCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.activeBuckets)
-}
-
-// ActiveBucketRefCount returns the reference count for an active bucket DB handle.
-func (m *MetadataStore) ActiveBucketRefCount(bucket string) (int, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	entry, ok := m.activeBuckets[bucket]
-	if !ok {
-		return 0, false
-	}
-	return entry.refCount, true
-}
-
 func (m *MetadataStore) acquireBucketDB(bucket string) (*bolt.DB, func(), error) {
 	m.mu.Lock()
 	if entry, ok := m.activeBuckets[bucket]; ok {
@@ -373,7 +332,7 @@ func (m *MetadataStore) acquireBucketDB(bucket string) (*bolt.DB, func(), error)
 	return db, func() { m.releaseBucketDB(entry) }, nil
 }
 
-func (m *MetadataStore) CloseAndRemoveBucketDB(bucket string) error {
+func (m *MetadataStore) closeAndRemoveBucketDB(bucket string) error {
 	m.mu.Lock()
 	if entry, ok := m.activeBuckets[bucket]; ok {
 		delete(m.activeBuckets, bucket)
@@ -595,7 +554,7 @@ func (m *MetadataStore) DeleteBucket(name string) error {
 	delete(m.bucketCache, name)
 	m.cacheMu.Unlock()
 	m.invalidateCount(name)
-	return m.CloseAndRemoveBucketDB(name)
+	return m.closeAndRemoveBucketDB(name)
 }
 
 // IsBucketEmpty checks if both objects and multipart uploads are empty.
@@ -1010,41 +969,6 @@ func (m *MetadataStore) ListAllObjectMetas(bucket string) ([]ObjectInfo, error) 
 			// Skip version history records (which contain another \x00)
 			objectKey := string(k[len(prefix):])
 			if strings.Contains(objectKey, "\x00") {
-				continue
-			}
-
-			var info ObjectInfo
-			if err := json.Unmarshal(v, &info); err != nil {
-				return err
-			}
-			objects = append(objects, info)
-		}
-		return nil
-	})
-	return objects, err
-}
-
-// ListAllObjectVersions returns all object version records (excluding latest pointers) for a given bucket.
-func (m *MetadataStore) ListAllObjectVersions(bucket string) ([]ObjectInfo, error) {
-	unlock := m.acquireBucketLock(bucket, false)
-	defer unlock()
-	db, releasedb, err := m.acquireBucketDB(bucket)
-	if err != nil {
-		return nil, err
-	}
-	defer releasedb()
-	var objects []ObjectInfo
-	prefix := []byte(bucket + "\x00")
-	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(objectsBucket)
-		if b == nil {
-			return nil
-		}
-		c := b.Cursor()
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			objectKey := string(k[len(prefix):])
-			// A version record contains a second \x00
-			if !strings.Contains(objectKey, "\x00") {
 				continue
 			}
 

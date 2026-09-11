@@ -411,11 +411,6 @@ func (v *SigV4Verifier) buildCanonicalRequest(r *http.Request, signedHeaders []s
 	)
 }
 
-// BuildCanonicalRequestPresigned constructs the canonical request for presigned URLs.
-func (v *SigV4Verifier) BuildCanonicalRequestPresigned(r *http.Request, signedHeaders []string) string {
-	return v.buildCanonicalRequestPresigned(r, signedHeaders)
-}
-
 // buildCanonicalRequestPresigned constructs the canonical request for presigned URLs.
 func (v *SigV4Verifier) buildCanonicalRequestPresigned(r *http.Request, signedHeaders []string) string {
 	method := r.Method
@@ -474,11 +469,6 @@ func awsPercentEncode(s string) string {
 	return buf.String()
 }
 
-// GetCanonicalQueryString returns the sorted, URL-encoded query string.
-func GetCanonicalQueryString(values url.Values) string {
-	return getCanonicalQueryString(values)
-}
-
 // getCanonicalQueryString returns the sorted, URL-encoded query string.
 func getCanonicalQueryString(values url.Values) string {
 	if len(values) == 0 {
@@ -501,11 +491,6 @@ func getCanonicalQueryString(values url.Values) string {
 	}
 
 	return strings.Join(pairs, "&")
-}
-
-// DeriveSigningKey derives the SigV4 signing key.
-func (v *SigV4Verifier) DeriveSigningKey(datestamp, region, service string) []byte {
-	return v.deriveSigningKey(datestamp, region, service)
 }
 
 // deriveSigningKey derives the SigV4 signing key.
@@ -539,16 +524,6 @@ func hmacSHA256(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
 	_, _ = h.Write(data)
 	return h.Sum(nil)
-}
-
-// HmacSHA256 computes HMAC-SHA256 and is exported for other packages.
-func HmacSHA256(key, data []byte) []byte {
-	return hmacSHA256(key, data)
-}
-
-// HashSHA256 computes SHA256 hash and returns hex string.
-func HashSHA256(data []byte) string {
-	return hashSHA256(data)
 }
 
 // hashSHA256 computes SHA256 hash and returns hex string.

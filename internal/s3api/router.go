@@ -336,11 +336,6 @@ func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, buck
 	rt.handleObjectOps(w, r, bucket, key)
 }
 
-// ResolveBucketAndKey resolves the bucket and key from an HTTP request.
-func (rt *Router) ResolveBucketAndKey(r *http.Request) (string, string) {
-	return rt.resolveBucketAndKey(r)
-}
-
 func (rt *Router) resolveBucketAndKey(r *http.Request) (string, string) {
 	host := r.Host
 	if strings.Contains(host, ":") {
@@ -388,7 +383,7 @@ func (rt *Router) handleCORS(w http.ResponseWriter, r *http.Request, bucket stri
 		return false
 	}
 
-	headers, matched := EvaluateCORS(r, cors)
+	headers, matched := evaluateCORS(r, cors)
 	if matched {
 		for k, v := range headers {
 			w.Header().Set(k, v)
@@ -409,11 +404,6 @@ func (rt *Router) handleServiceOps(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeS3Error(w, "MethodNotAllowed", "Method not allowed", "/")
 	}
-}
-
-// HandleBucketOps handles bucket-level operations.
-func (rt *Router) HandleBucketOps(w http.ResponseWriter, r *http.Request, bucket string) {
-	rt.handleBucketOps(w, r, bucket)
 }
 
 // handleBucketOps handles bucket-level operations.
@@ -494,11 +484,6 @@ func (rt *Router) handleBucketOps(w http.ResponseWriter, r *http.Request, bucket
 
 // handleObjectOps handles object-level operations. See handleBucketOps for why
 // unhandled subresources must be rejected rather than falling through.
-// HandleObjectOps handles object-level operations.
-func (rt *Router) HandleObjectOps(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	rt.handleObjectOps(w, r, bucket, key)
-}
-
 func (rt *Router) handleObjectOps(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	query := r.URL.Query()
 	resource := "/" + bucket + "/" + key

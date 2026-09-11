@@ -8,11 +8,6 @@ import (
 	"strings"
 )
 
-// BucketPath returns the physical filesystem path for a bucket.
-func (fs *FilesystemEngine) BucketPath(name string) string {
-	return fs.bucketPath(name)
-}
-
 func (fs *FilesystemEngine) bucketPath(name string) string {
 	return filepath.Join(fs.dataDir, "buckets", name)
 }
@@ -51,11 +46,6 @@ func (fs *FilesystemEngine) validatePathSafety(bucket, key, versionID string) er
 	return nil
 }
 
-// ObjectPath returns the resolved physical filesystem path for a given bucket and key.
-func (fs *FilesystemEngine) ObjectPath(bucket, key string) (string, error) {
-	return fs.objectPath(bucket, key)
-}
-
 func (fs *FilesystemEngine) objectPath(bucket, key string) (string, error) {
 	if err := fs.validatePathSafety(bucket, key, ""); err != nil {
 		return "", err
@@ -74,11 +64,6 @@ func (fs *FilesystemEngine) objectPath(bucket, key string) (string, error) {
 		return "", errors.New(errInvalidKeyTraversal)
 	}
 	return resolved, nil
-}
-
-// ObjectPathWithVersion returns the resolved physical filesystem path for a versioned object.
-func (fs *FilesystemEngine) ObjectPathWithVersion(bucket, key, versionID string) (string, error) {
-	return fs.objectPathWithVersion(bucket, key, versionID)
 }
 
 func (fs *FilesystemEngine) objectPathWithVersion(bucket, key, versionID string) (string, error) {
@@ -148,11 +133,6 @@ func (fs *FilesystemEngine) cleanupParentDirs(objPath string, bucket string) {
 	}
 }
 
-// MultipartUploadPath returns the metadata file path for a multipart upload ID.
-func (fs *FilesystemEngine) MultipartUploadPath(bucket, uploadID string) (string, error) {
-	return fs.multipartUploadPath(bucket, uploadID)
-}
-
 func (fs *FilesystemEngine) multipartUploadPath(bucket, uploadID string) (string, error) {
 	if !filepath.IsLocal(bucket) || hasPathTraversal(bucket) {
 		return "", errors.New(errInvalidBucketTraversal)
@@ -172,11 +152,6 @@ func (fs *FilesystemEngine) multipartUploadPath(bucket, uploadID string) (string
 		return "", errors.New(errInvalidUploadID)
 	}
 	return resolved, nil
-}
-
-// MultipartDir returns the staging directory path for a multipart upload.
-func (fs *FilesystemEngine) MultipartDir(bucket, key, uploadID string) (string, error) {
-	return fs.multipartDir(bucket, key, uploadID)
 }
 
 func (fs *FilesystemEngine) multipartDir(bucket, key, uploadID string) (string, error) {

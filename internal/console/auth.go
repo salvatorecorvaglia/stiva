@@ -18,11 +18,6 @@ func SetJWTSecret(secret []byte) {
 	jwtSecret = secret
 }
 
-// GetJWTSecret returns the console JWT token signing key.
-func GetJWTSecret() []byte {
-	return jwtSecret
-}
-
 // GenerateToken creates a JWT token for authenticated console sessions.
 func GenerateToken(accessKey string) (string, error) {
 	claims := jwt.MapClaims{

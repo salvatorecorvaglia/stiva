@@ -89,10 +89,9 @@ type Config struct {
 	invalidEnvVars []string
 }
 
-// RateLimitDisabledSentinel is the sentinel that turns a rate limiter off. A limit of 0
+// rateLimitDisabled is the sentinel that turns a rate limiter off. A limit of 0
 // locks callers out permanently, so disabled rate limiters must be explicit.
-const RateLimitDisabledSentinel = -1
-const rateLimitDisabled = RateLimitDisabledSentinel
+const rateLimitDisabled = -1
 
 // Validate reports configuration that would leave the server broken or
 // insecure. It is called before anything binds a port.
@@ -175,15 +174,9 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// MinJWTSecretLen is the shortest console signing secret we accept. HS256 with
+// minJWTSecretLen is the shortest console signing secret we accept. HS256 with
 // less entropy can be cracked offline once one session token is observed.
-const MinJWTSecretLen = 32
-const minJWTSecretLen = MinJWTSecretLen
-
-// EnvBool returns true if an environment variable holds a common truthy value.
-func EnvBool(key string) bool {
-	return envBool(key)
-}
+const minJWTSecretLen = 32
 
 func validatePort(name string, port int) error {
 	if port < 1 || port > 65535 {

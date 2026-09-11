@@ -228,7 +228,7 @@ rclone lsd stiva:
 
 ## 🧪 Running Tests
 
-Unit, integration, and fuzz tests are located under the `tests/` directory (`tests/auth`, `tests/config`, `tests/console`, `tests/httpx`, `tests/s3api`, `tests/server`, `tests/storage`).
+Unit, integration, and fuzz tests live alongside the code they cover, as in-package `_test.go` files under `internal/` (`internal/auth`, `internal/config`, `internal/console`, `internal/httpx`, `internal/s3api`, `internal/server`, `internal/storage`).
 
 To run the test suite:
 

@@ -50,21 +50,6 @@ func (fs *FilesystemEngine) initWebhookDispatcher() {
 	}
 }
 
-// TriggerWebhook sends a webhook notification for an object operation.
-func (fs *FilesystemEngine) TriggerWebhook(action string, info *ObjectInfo) {
-	fs.triggerWebhook(action, info)
-}
-
-// IsWebhookShuttingDown reports whether the webhook dispatcher has begun shutting down.
-func (fs *FilesystemEngine) IsWebhookShuttingDown() bool {
-	return atomic.LoadInt32(&fs.isWebhookShuttingDown) == 1
-}
-
-// IsSyncShuttingDown reports whether the mirror sync dispatcher has begun shutting down.
-func (fs *FilesystemEngine) IsSyncShuttingDown() bool {
-	return atomic.LoadInt32(&fs.isSyncShuttingDown) == 1
-}
-
 // StopWebhookDispatcher halts webhook processing, flushes remaining notifications, and waits for workers to terminate.
 func (fs *FilesystemEngine) StopWebhookDispatcher() {
 	fs.webhookMu.Lock()

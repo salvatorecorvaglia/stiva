@@ -9,10 +9,10 @@ import (
 	"github.com/salvatorecorvaglia/stiva/internal/storage"
 )
 
-// EvaluateCORS evaluates a request against a bucket's CORS configuration.
+// evaluateCORS evaluates a request against a bucket's CORS configuration.
 // If a rule matches, it returns a map of CORS headers that should be set, and true.
 // Otherwise, it returns nil, false.
-func EvaluateCORS(r *http.Request, cors *storage.CORSConfiguration) (map[string]string, bool) {
+func evaluateCORS(r *http.Request, cors *storage.CORSConfiguration) (map[string]string, bool) {
 	if cors == nil || len(cors.CORSRules) == 0 {
 		return nil, false
 	}
@@ -85,11 +85,6 @@ func EvaluateCORS(r *http.Request, cors *storage.CORSConfiguration) (map[string]
 	return nil, false
 }
 
-// MatchOrigin tests if an origin matches an allowed origins list.
-func MatchOrigin(origin string, allowedOrigins []string) bool {
-	return matchOrigin(origin, allowedOrigins)
-}
-
 func matchOrigin(origin string, allowedOrigins []string) bool {
 	origin = strings.ToLower(origin)
 	originURL, err := url.Parse(origin)
@@ -135,11 +130,6 @@ func matchOrigin(origin string, allowedOrigins []string) bool {
 	return false
 }
 
-// MatchMethod tests if an HTTP method matches an allowed methods list.
-func MatchMethod(method string, allowedMethods []string) bool {
-	return matchMethod(method, allowedMethods)
-}
-
 func matchMethod(method string, allowedMethods []string) bool {
 	method = strings.ToUpper(method)
 	for _, allowed := range allowedMethods {
@@ -148,11 +138,6 @@ func matchMethod(method string, allowedMethods []string) bool {
 		}
 	}
 	return false
-}
-
-// MatchHeaders tests if requested headers match allowed headers list.
-func MatchHeaders(reqHeaders, allowedHeaders []string) bool {
-	return matchHeaders(reqHeaders, allowedHeaders)
 }
 
 func matchHeaders(reqHeaders, allowedHeaders []string) bool {

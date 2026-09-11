@@ -116,11 +116,6 @@ type uploadLock struct {
 	refCount int
 }
 
-// NewFilesystemEngineForTesting initializes a FilesystemEngine struct without disk side effects.
-func NewFilesystemEngineForTesting(dataDir string) *FilesystemEngine {
-	return &FilesystemEngine{dataDir: dataDir}
-}
-
 // NewFilesystemEngine creates a new filesystem-backed storage engine.
 func NewFilesystemEngine(dataDir string, syncCfg *SyncConfig, webhookURL string) (*FilesystemEngine, error) {
 	bucketsDir := filepath.Join(dataDir, "buckets")
