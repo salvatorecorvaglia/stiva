@@ -1197,8 +1197,10 @@ func TestOutboundMirroring(t *testing.T) {
 	if !put {
 		t.Error("expected mock server to receive PUT request for replication")
 	}
-	if path != "/backup-bucket/sync.txt" {
-		t.Errorf("expected path /backup-bucket/sync.txt, got %q", path)
+	// The source bucket is part of the destination key, so source buckets
+	// sharing a key name cannot overwrite each other on the mirror.
+	if path != "/backup-bucket/"+bucket+"/sync.txt" {
+		t.Errorf("expected path /backup-bucket/%s/sync.txt, got %q", bucket, path)
 	}
 	if !strings.Contains(auth, "AWS4-HMAC-SHA256") {
 		t.Errorf("expected Authorization header to contain AWS4-HMAC-SHA256, got %q", auth)
@@ -1235,8 +1237,8 @@ func TestOutboundMirroring(t *testing.T) {
 	if !del {
 		t.Error("expected mock server to receive DELETE request for replication")
 	}
-	if pathDel != "/backup-bucket/sync.txt" {
-		t.Errorf("expected path /backup-bucket/sync.txt, got %q", pathDel)
+	if pathDel != "/backup-bucket/"+bucket+"/sync.txt" {
+		t.Errorf("expected path /backup-bucket/%s/sync.txt, got %q", bucket, pathDel)
 	}
 }
 

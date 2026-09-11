@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Replication now mirrors objects to `<STIVA_SYNC_BUCKET>/<source-bucket>/<key>` instead of `<STIVA_SYNC_BUCKET>/<key>`. Every source bucket was previously flattened into the target bucket under the bare object key, so two source buckets holding the same key silently overwrote each other on the replica. Existing mirrors keep their old flat keys and are **not** migrated: re-sync the source, or move the existing objects under the matching per-bucket prefix, before relying on the replica.
+
+### Fixed
+
+- Replication no longer silently drops SSE-C encrypted objects after three failed retries. Because the customer key is deliberately never persisted, such an object can never be read back for replication; it is now skipped once with an explicit warning that the mirror will not contain it, instead of scheduling a retry chain that could not succeed and that stalled engine shutdown behind its timers.
+- Signed request bodies over 2MiB are no longer left on disk. `HashPayload` spools them to a temp file and replaces `r.Body` with a reader that deletes the file on `Close`, but nothing ever closed it — `net/http` closes the original body, not the replacement — so every such request leaked a `stiva-body-*` file, including requests later rejected for a bad signature. The startup orphan sweep also now reclaims `stiva-chunked-*` files, which it previously never matched.
+
+### Security
+
+- Fixed a stored cross-site scripting vulnerability in the Console file browser. `escapeHtml` round-tripped values through `textContent`/`innerHTML`, which escapes `&`, `<` and `>` but not quotes, and its output is interpolated into double-quoted HTML attributes carrying object keys. An object key containing a double quote could therefore close the attribute and inject an inline event handler, executing script in the Console where the session token is held. Quotes are now escaped as well.
+- The Console `Content-Security-Policy` no longer permits inline scripts (`script-src 'self'`). The page ships no inline handlers or inline `<script>` blocks, so `'unsafe-inline'` provided nothing while disabling the protection that would otherwise have contained an injected event handler. `style-src` continues to allow inline styles, which the UI does use.
+
 ## [1.2.0] - 2026-08-25
 
 ### Added

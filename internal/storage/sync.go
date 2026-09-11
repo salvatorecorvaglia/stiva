@@ -3,6 +3,7 @@ package storage
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +33,12 @@ type syncTask struct {
 	key    string
 	op     string
 }
+
+// errSkipSSEC marks an object that is deliberately not replicated because it
+// is encrypted with a customer-provided key Stiva does not retain. It is not a
+// transient failure: without the key the object cannot be read here at all, so
+// every retry would fail identically.
+var errSkipSSEC = errors.New("object is SSE-C encrypted; the customer key is not retained, so it cannot be replicated")
 
 const syncQueueSize = 5000
 const syncWorkerCount = 10
@@ -64,6 +71,14 @@ func (fs *FilesystemEngine) attemptSync(task syncTask, n int) {
 	err := performSync(context.Background(), task.fs, task.fs.syncClient, task.cfg, task.bucket, task.key, task.op)
 	if err == nil {
 		slog.Info("[Sync] Mirroring succeeded", "op", task.op, "bucket", task.bucket, "key", task.key)
+		return
+	}
+
+	// Retrying cannot help, and reporting it as a failure three times buried
+	// the real message: this object will be missing from the mirror.
+	if errors.Is(err, errSkipSSEC) {
+		slog.Warn("[Sync] Skipping SSE-C encrypted object; the mirror will not contain it",
+			"op", task.op, "bucket", task.bucket, "key", task.key)
 		return
 	}
 
@@ -139,10 +154,15 @@ func (fs *FilesystemEngine) MirrorSync(bucket, key, op string) {
 func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client, cfg *SyncConfig, bucket, key, op string) error {
 	// Construct the destination URL.
 	//
+	// The source bucket is part of the destination key. Every source bucket
+	// used to be flattened into cfg.Bucket under the bare object key, so two
+	// buckets holding the same key silently overwrote each other on the
+	// mirror — the replica lost data with no error anywhere.
+	//
 	// Each path segment is escaped individually: interpolating the raw key meant
 	// that any key containing '?', '#' or a space produced a malformed request
 	// whose path no longer matched the one being signed.
-	destURL := fmt.Sprintf("%s/%s/%s", cfg.Endpoint, url.PathEscape(cfg.Bucket), escapeObjectKey(key))
+	destURL := fmt.Sprintf("%s/%s/%s", cfg.Endpoint, url.PathEscape(cfg.Bucket), escapeObjectKey(bucket+"/"+key))
 
 	var req *http.Request
 	var err error
@@ -157,6 +177,14 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 		info, err := fs.metadata.GetObjectMeta(bucket, key, "")
 		if err != nil {
 			return fmt.Errorf("failed to fetch object metadata: %w", err)
+		}
+
+		// GetObject below is called without SSE-C parameters, because the
+		// customer key is deliberately never persisted. For an encrypted
+		// object it therefore always fails; detect that here so it is
+		// reported once, as a skip, rather than three times as a failure.
+		if info.SSECustomerAlgorithm != "" {
+			return errSkipSSEC
 		}
 
 		reader, _, err := fs.GetObject(ctx, bucket, key, "")

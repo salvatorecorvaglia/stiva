@@ -159,6 +159,10 @@ Stiva is configured exclusively via environment variables. You can find a baseli
 
 Setting these variables enables automated, asynchronous background replication. Whenever objects are written (`PUT`) or deleted (`DELETE`) in Stiva, the operations are queue-dispatched to the replication target.
 
+Objects are mirrored to **`<STIVA_SYNC_BUCKET>/<source-bucket>/<key>`**, so each source bucket occupies its own prefix in the target bucket and buckets sharing a key name cannot overwrite one another.
+
+> **Note:** SSE-C encrypted objects are **not** replicated. Stiva deliberately never persists the customer-provided key, so it cannot read those objects back to send them; each is skipped with a warning in the logs.
+
 ### 🪝 Webhook Event Notifications Configuration
 
 Set the `STIVA_WEBHOOK_URL` variable to dispatch event JSON payloads to a webhook listener.
