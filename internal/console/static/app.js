@@ -1451,10 +1451,19 @@
         return `${size} ${units[i]}`;
     }
 
+    // Escapes for element text *and* quoted-attribute contexts. The previous
+    // textContent -> innerHTML round-trip relied on the HTML serializer, which
+    // escapes only & < > and leaves quotes intact. Since this value is
+    // interpolated into double-quoted attributes (data-key, aria-label, ...),
+    // an object key containing a double quote could close the attribute early
+    // and append an inline event handler.
     function escapeHtml(str) {
-        const div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     // ---- Init ----

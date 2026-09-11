@@ -246,9 +246,14 @@ func (h *Handler) setupRoutes() {
 // securityHeaders applies the baseline browser protections the console was
 // serving without: framing, MIME sniffing, referrer leakage and a CSP.
 //
-// The CSP permits inline styles and scripts because the SPA ships inline
-// handlers and style attributes; it still blocks loading code from any other
-// origin, and 'frame-ancestors none' is the modern equivalent of DENY.
+// The CSP permits inline *styles* because the SPA sets style attributes, both
+// in index.html and on the nodes app.js builds. It deliberately does not
+// permit inline scripts: index.html carries no inline handlers and no inline
+// <script>, only <script src="app.js">, so 'unsafe-inline' bought nothing
+// there while disarming the main protection a script-src offers — under it,
+// an injected on*= attribute (say, from an object key rendered into the file
+// browser) would still execute. 'frame-ancestors none' is the modern
+// equivalent of DENY.
 func securityHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("X-Content-Type-Options", "nosniff")
@@ -259,7 +264,7 @@ func securityHeaders(w http.ResponseWriter) {
 			"img-src 'self' data: blob:; "+
 			"media-src 'self' blob:; "+
 			"style-src 'self' 'unsafe-inline'; "+
-			"script-src 'self' 'unsafe-inline'; "+
+			"script-src 'self'; "+
 			"connect-src 'self'; "+
 			"font-src 'self'; "+
 			"frame-src 'self' blob:; "+
