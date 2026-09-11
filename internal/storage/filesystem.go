@@ -1128,7 +1128,7 @@ func cleanupOrphanedTempFiles(dataDir string) {
 			// TOCTOU traversal a symlinked temp name could otherwise cause.
 			if d.Type().IsRegular() {
 				name := d.Name()
-				if strings.HasPrefix(name, ".stiva-tmp-") || strings.HasPrefix(name, ".part-tmp-") || strings.HasPrefix(name, ".stiva-multipart-") || strings.HasPrefix(name, "stiva-body-") {
+				if strings.HasPrefix(name, ".stiva-tmp-") || strings.HasPrefix(name, ".part-tmp-") || strings.HasPrefix(name, ".stiva-multipart-") || strings.HasPrefix(name, "stiva-body-") || strings.HasPrefix(name, "stiva-chunked-") {
 					_ = os.Remove(path) //nolint:gosec // startup sweep over our own data dir; symlinks excluded above
 				}
 			}

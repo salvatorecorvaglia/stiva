@@ -141,6 +141,21 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rt.activeReqs.Add(1)
 	defer rt.activeReqs.Done()
 
+	// The SigV4 layer may replace r.Body with a reader backed by a temp file
+	// (auth.HashPayload spools bodies over 2MiB, and decodeStreamingPayload
+	// does the same for aws-chunked uploads). That reader deletes its file on
+	// Close, but net/http only closes the *original* body it captured when it
+	// read the request — never the replacement — so without this every signed
+	// request over 2MiB left a file behind for good. Closing here covers the
+	// rejected-signature path too, where the body is spooled before the
+	// signature is compared. Close is idempotent and safe on the unreplaced
+	// body.
+	defer func() {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}()
+
 	start := time.Now()
 	mrw := &metricsResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 	storage.GlobalMetrics.IncRequests()
