@@ -28,7 +28,7 @@ We are always looking for ways to make Stiva better! If you have a feature reque
 
 ### Prerequisites
 
-- **Go 1.25 or higher** (Required to compile and run the project)
+- **Go 1.26 or higher** (Required to compile and run the project)
 - **Docker & Docker Compose** (Optional, for building/testing containerized builds)
 - **golangci-lint** (For running lint checks locally)
 - **AWS CLI / Boto3** (Optional, for S3 API compatibility verification)
