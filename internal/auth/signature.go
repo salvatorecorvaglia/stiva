@@ -34,6 +34,12 @@ const (
 	maxPresignValidity = 7 * 24 * time.Hour
 	// maxInMemoryPayload is the largest request body hashed entirely in memory.
 	maxInMemoryPayload = 2 * 1024 * 1024
+	// maxChunkSize bounds a single aws-chunked frame. The frame's declared
+	// size is allocated up front to read it, and was checked only against
+	// MaxPayloadSize (5GiB by default) — so one chunk header could drive a
+	// 5GiB allocation before a single byte of data arrived. Real SDKs chunk
+	// at 64KiB to 8MiB.
+	maxChunkSize = 16 * 1024 * 1024
 )
 
 // MaxPayloadSize bounds the request body Stiva will buffer while verifying a
@@ -55,15 +61,51 @@ func (e *AuthError) Error() string {
 	return e.Message
 }
 
+// maxSigningKeyCacheEntries bounds the derived-signing-key cache.
+//
+// The cache key is datestamp/region/service. All three come verbatim from the
+// caller's credential scope, and the cache was an unbounded sync.Map that never
+// evicted — so anyone who knew the access key (which is not a secret) could add
+// one permanent entry per request, reached before the signature is even
+// compared. Legitimate traffic needs a handful of entries at most: one region,
+// one service, and two datestamps around a UTC midnight boundary.
+//
+// Like the bucket metadata cache in the storage layer, this drops everything at
+// the bound rather than tracking recency — an entry is one HMAC chain to
+// rebuild, and the bound is only a safety valve.
+const maxSigningKeyCacheEntries = 64
+
+// maxCredentialScopePart bounds a single component of the credential scope,
+// which also bounds the size of a cache key built from it.
+const maxCredentialScopePart = 64
+
 // SigV4Verifier verifies AWS Signature Version 4 requests.
 type SigV4Verifier struct {
-	creds       *Credentials
-	signingKeys sync.Map
+	creds *Credentials
+
+	keysMu      sync.Mutex
+	signingKeys map[string][]byte
 }
 
 // NewSigV4Verifier creates a new verifier with the given credentials.
 func NewSigV4Verifier(creds *Credentials) *SigV4Verifier {
-	return &SigV4Verifier{creds: creds}
+	return &SigV4Verifier{
+		creds:       creds,
+		signingKeys: make(map[string][]byte, maxSigningKeyCacheEntries),
+	}
+}
+
+// validateCredentialScope rejects a credential scope whose region or service
+// could not have come from a real S3 client. Beyond being more correct than
+// accepting anything, it keeps the signing-key cache key space small.
+func validateCredentialScope(region, service string) error {
+	if service != "s3" {
+		return &AuthError{Code: "AuthorizationHeaderMalformed", Message: "Credential should be scoped to the service 's3'."}
+	}
+	if region == "" || len(region) > maxCredentialScopePart {
+		return &AuthError{Code: "AuthorizationHeaderMalformed", Message: "Credential contains an invalid region."}
+	}
+	return nil
 }
 
 // Creds returns the credentials associated with this verifier.
@@ -105,6 +147,10 @@ func (v *SigV4Verifier) Verify(r *http.Request) error {
 		return &AuthError{Code: "InvalidAccessKeyId", Message: "The Access Key Id you provided does not exist in our records."}
 	}
 
+	if err := validateCredentialScope(parsed.Region, parsed.Service); err != nil {
+		return err
+	}
+
 	// Get the date for signing
 	dateStr := r.Header.Get(amzDateHeader)
 	if dateStr == "" {
@@ -129,21 +175,8 @@ func (v *SigV4Verifier) Verify(r *http.Request) error {
 		return &AuthError{Code: "RequestTimeTooSkewed", Message: "The difference between the request time and the current time is too large."}
 	}
 
-	// Verify request payload matches content SHA256 header (if not unsigned or streaming)
 	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
 	isStreaming := payloadHash == streamingPayload
-	if payloadHash != "" && payloadHash != unsignedPayload && !isStreaming {
-		actualHash, err := HashPayload(r)
-		if err != nil {
-			return fmt.Errorf("failed to hash request payload: %w", err)
-		}
-		if actualHash != payloadHash {
-			return &AuthError{
-				Code:    "SignatureDoesNotMatch",
-				Message: "The request signature we calculated does not match the signature you provided (payload hash mismatch).",
-			}
-		}
-	}
 
 	datestamp := t.Format("20060102")
 
@@ -164,6 +197,25 @@ func (v *SigV4Verifier) Verify(r *http.Request) error {
 
 	if !hmac.Equal([]byte(expectedSig), []byte(parsed.Signature)) {
 		return &AuthError{Code: "SignatureDoesNotMatch", Message: "The request signature we calculated does not match the signature you provided."}
+	}
+
+	// Only now that the signature checks out do we touch the body. Hashing it
+	// first meant an unauthenticated caller — the access key is not a secret —
+	// could make the server spool up to MaxPayloadSize to disk per request and
+	// only then be told the signature was wrong. The canonical request above
+	// uses the *header* value, so verifying in this order changes nothing
+	// about what is signed.
+	if payloadHash != "" && payloadHash != unsignedPayload && !isStreaming {
+		actualHash, err := HashPayload(r)
+		if err != nil {
+			return fmt.Errorf("failed to hash request payload: %w", err)
+		}
+		if actualHash != payloadHash {
+			return &AuthError{
+				Code:    "SignatureDoesNotMatch",
+				Message: "The request signature we calculated does not match the signature you provided (payload hash mismatch).",
+			}
+		}
 	}
 
 	// STREAMING-AWS4-HMAC-SHA256-PAYLOAD carries the body as a sequence of
@@ -199,6 +251,15 @@ func (v *SigV4Verifier) verifyPresigned(r *http.Request) error {
 
 	if accessKey != v.creds.AccessKey {
 		return &AuthError{Code: "InvalidAccessKeyId", Message: "The Access Key Id you provided does not exist in our records."}
+	}
+
+	// The presigned credential scope is entirely caller-supplied, including the
+	// datestamp, and feeds the signing-key cache key.
+	if err := validateCredentialScope(region, service); err != nil {
+		return err
+	}
+	if len(datestamp) > maxCredentialScopePart {
+		return &AuthError{Code: "AccessDenied", Message: "invalid credential format"}
 	}
 
 	dateStr := q.Get(amzDateHeader)
@@ -450,16 +511,26 @@ func (v *SigV4Verifier) DeriveSigningKey(datestamp, region, service string) []by
 // deriveSigningKey derives the SigV4 signing key.
 func (v *SigV4Verifier) deriveSigningKey(datestamp, region, service string) []byte {
 	cacheKey := datestamp + "/" + region + "/" + service
-	if val, ok := v.signingKeys.Load(cacheKey); ok {
-		return val.([]byte)
+
+	v.keysMu.Lock()
+	if key, ok := v.signingKeys[cacheKey]; ok {
+		v.keysMu.Unlock()
+		return key
 	}
+	v.keysMu.Unlock()
 
 	kDate := hmacSHA256([]byte("AWS4"+v.creds.SecretKey), []byte(datestamp))
 	kRegion := hmacSHA256(kDate, []byte(region))
 	kService := hmacSHA256(kRegion, []byte(service))
 	kSigning := hmacSHA256(kService, []byte("aws4_request"))
 
-	v.signingKeys.Store(cacheKey, kSigning)
+	v.keysMu.Lock()
+	if v.signingKeys == nil || len(v.signingKeys) >= maxSigningKeyCacheEntries {
+		v.signingKeys = make(map[string][]byte, maxSigningKeyCacheEntries)
+	}
+	v.signingKeys[cacheKey] = kSigning
+	v.keysMu.Unlock()
+
 	return kSigning
 }
 
@@ -679,6 +750,11 @@ func decodeStreamingPayload(r *http.Request, signingKey []byte, dateStr, scope, 
 		if MaxPayloadSize > 0 && chunkSize > MaxPayloadSize {
 			cleanup()
 			return &AuthError{Code: "EntityTooLarge", Message: "Your proposed upload exceeds the maximum allowed size."}
+		}
+		// Bound the allocation below, which happens before any data is read.
+		if chunkSize > maxChunkSize {
+			cleanup()
+			return &AuthError{Code: "InvalidRequest", Message: "Chunk size exceeds the maximum allowed for an aws-chunked upload."}
 		}
 
 		chunkData := make([]byte, chunkSize)

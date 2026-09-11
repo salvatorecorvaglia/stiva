@@ -4,6 +4,7 @@ package httpx
 import (
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -61,4 +62,29 @@ func remoteHost(remoteAddr string) string {
 		return host
 	}
 	return remoteAddr
+}
+
+// MaxPageSize is the largest page S3 will return for a listing, whatever the
+// caller asks for.
+const MaxPageSize = 1000
+
+// MaxKeys parses a caller-supplied page-size parameter (max-keys, max-uploads,
+// max-parts, the console's maxKeys), falling back to def when it is absent or
+// unusable and clamping it to MaxPageSize.
+//
+// It lives here because the console used to apply no ceiling at all while the
+// S3 API clamped at 1000: a console caller could ask for any number of keys and
+// have the engine accumulate them all in memory.
+func MaxKeys(raw string, def int) int {
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	if v > MaxPageSize {
+		return MaxPageSize
+	}
+	return v
 }

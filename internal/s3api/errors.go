@@ -20,6 +20,7 @@ const s3XmlNamespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 // the handlers and storage engine emit.
 var errorHTTPStatus = map[string]int{
 	"AccessDenied":                 http.StatusForbidden,
+	"AuthorizationHeaderMalformed": http.StatusBadRequest,
 	"BadRequest":                   http.StatusBadRequest,
 	"BucketAlreadyExists":          http.StatusConflict,
 	"BucketAlreadyOwnedByYou":      http.StatusConflict,

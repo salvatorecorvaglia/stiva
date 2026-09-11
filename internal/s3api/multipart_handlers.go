@@ -43,8 +43,9 @@ func (rt *Router) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 	resource := "/" + bucket + "/" + key
 
 	partNumber, err := strconv.Atoi(partNumberStr)
-	if err != nil || partNumber < 1 {
-		writeS3Error(w, "InvalidArgument", "Invalid part number", resource)
+	if err != nil || partNumber < 1 || partNumber > storage.MaxPartNumber {
+		writeS3Error(w, "InvalidArgument",
+			fmt.Sprintf("Part number must be an integer between 1 and %d, inclusive.", storage.MaxPartNumber), resource)
 		return
 	}
 
@@ -84,8 +85,9 @@ func (rt *Router) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, b
 	resource := "/" + bucket + "/" + key
 
 	partNumber, err := strconv.Atoi(partNumberStr)
-	if err != nil || partNumber < 1 {
-		writeS3Error(w, "InvalidArgument", "Invalid part number", resource)
+	if err != nil || partNumber < 1 || partNumber > storage.MaxPartNumber {
+		writeS3Error(w, "InvalidArgument",
+			fmt.Sprintf("Part number must be an integer between 1 and %d, inclusive.", storage.MaxPartNumber), resource)
 		return
 	}
 

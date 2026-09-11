@@ -75,9 +75,23 @@ func (fs *FilesystemEngine) CreateMultipartUpload(bucket, key, contentType strin
 	}, nil
 }
 
+// MaxPartNumber is the highest part number S3 accepts for a multipart upload.
+//
+// Enforcing it here rather than only in the handlers matters: the parts slice
+// lives in the upload's metadata record, and PutMultipartMeta rewrites that
+// whole JSON blob on every part. An unbounded part-number space therefore
+// meant unbounded metadata growth and O(n^2) metadata writes.
+const MaxPartNumber = 10000
+
 func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, reader io.Reader, size int64) (*PartInfo, error) {
 	if err := fs.validateBucketName(bucket); err != nil {
 		return nil, err
+	}
+	if partNumber < 1 || partNumber > MaxPartNumber {
+		return nil, &S3Error{
+			Code:    "InvalidArgument",
+			Message: fmt.Sprintf("Part number must be an integer between 1 and %d, inclusive.", MaxPartNumber),
+		}
 	}
 
 	if _, err := fs.objectPath(bucket, key); err != nil {

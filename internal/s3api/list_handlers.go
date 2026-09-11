@@ -5,25 +5,16 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/salvatorecorvaglia/stiva/internal/httpx"
 	"github.com/salvatorecorvaglia/stiva/internal/storage"
 )
 
 const iso8601Millis = "2006-01-02T15:04:05.000Z"
 
-// maxKeysFromQuery reads a bounded max-keys style parameter.
+// maxKeysFromQuery reads a bounded max-keys style parameter. The bound itself
+// lives in httpx so the console applies the same one.
 func maxKeysFromQuery(raw string, def int) int {
-	if raw == "" {
-		return def
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil || v <= 0 {
-		return def
-	}
-	// S3 caps page size at 1000 regardless of what the caller asks for.
-	if v > 1000 {
-		return 1000
-	}
-	return v
+	return httpx.MaxKeys(raw, def)
 }
 
 // handleListObjects dispatches GET /<bucket> to the V1 or V2 listing shape.

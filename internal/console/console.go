@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,6 +30,15 @@ const (
 	errInvalidRequest   = "invalid request"
 	contentTypeHeader   = "Content-Type"
 	errMissingKey       = "missing key parameter"
+
+	// maxJSONRequestBody bounds the JSON body accepted by the console API.
+	// These handlers decoded straight from r.Body with no ceiling, unlike their
+	// S3-API counterparts, so a caller could force unbounded decoder
+	// allocation — on /api/login, without authenticating at all.
+	maxJSONRequestBody = 1 << 20 // 1MB
+	// maxCompleteParts bounds the parts array accepted when completing a
+	// multipart upload, matching the S3 limit on parts per upload.
+	maxCompleteParts = storage.MaxPartNumber
 
 	// defaultPresignExpiry is used when the caller does not specify one.
 	defaultPresignExpiry = time.Hour
@@ -346,7 +356,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		AccessKey string `json:"accessKey"`
 		SecretKey string `json:"secretKey"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
 		return
 	}
@@ -418,7 +428,7 @@ func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 		return
 	}
@@ -530,13 +540,10 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 		delimiter = "/"
 	}
 
-	maxKeysStr := r.URL.Query().Get("maxKeys")
-	maxKeys := 1000
-	if maxKeysStr != "" {
-		if mk, err := strconv.Atoi(maxKeysStr); err == nil && mk > 0 {
-			maxKeys = mk
-		}
-	}
+	// Clamped to the same ceiling the S3 API applies. This used to accept any
+	// positive value, so a single console request could ask the engine to
+	// accumulate an unbounded number of objects in memory.
+	maxKeys := httpx.MaxKeys(r.URL.Query().Get("maxKeys"), httpx.MaxPageSize)
 
 	continuationToken := r.URL.Query().Get("continuationToken")
 
@@ -736,6 +743,33 @@ func (h *Handler) deleteObject(w http.ResponseWriter, r *http.Request, bucket st
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": key})
 }
 
+// writeStorageError renders an engine error for a console caller.
+//
+// Engine errors routinely carry filesystem paths ("failed to create object
+// directory: mkdir /data/buckets/..."), and the console passed err.Error()
+// straight through on every mutating endpoint. The S3 side is explicit that
+// internal error text must never reach a caller; this brings the console into
+// line. A *storage.S3Error describes a caller-facing condition and its message
+// is safe to return; anything else is logged and replaced with fallback.
+func writeStorageError(w http.ResponseWriter, err error, fallback string) {
+	var s3Err *storage.S3Error
+	if errors.As(err, &s3Err) {
+		status := http.StatusBadRequest
+		switch s3Err.Code {
+		case "NoSuchBucket", "NoSuchKey", "NoSuchUpload", "NoSuchLifecycleConfiguration":
+			status = http.StatusNotFound
+		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists", "BucketNotEmpty":
+			status = http.StatusConflict
+		case "EntityTooLarge":
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(w, status, map[string]string{"error": s3Err.Message})
+		return
+	}
+	slog.Error("[Console] Internal error", "error", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fallback})
+}
+
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set(contentTypeHeader, "application/json")
 	// API responses describe account state and must not be cached by browsers
@@ -750,7 +784,7 @@ func (h *Handler) initiateMultipart(w http.ResponseWriter, r *http.Request, buck
 		Key         string `json:"key"`
 		ContentType string `json:"contentType"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
 		return
 	}
@@ -774,45 +808,113 @@ func (h *Handler) initiateMultipart(w http.ResponseWriter, r *http.Request, buck
 	})
 }
 
+// uploadPart streams a single multipart chunk to the engine.
+//
+// Like uploadObject, it reads the multipart body part-by-part rather than
+// calling ParseMultipartForm, which spooled the whole chunk into the *OS* temp
+// directory — ignoring STIVA_DATA_DIR — before any of it reached storage. That
+// fix was applied to uploadObject but not here, even though parts are the
+// larger of the two by design.
+//
+// Streaming means the metadata fields are only visible if they precede the file
+// part. The console sends them in that order; a client that does not is told so
+// explicitly rather than having its upload silently misfiled.
 func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, bucket string) {
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	mr, err := r.MultipartReader()
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to parse upload"})
 		return
 	}
-	if r.MultipartForm != nil {
-		defer func() { _ = r.MultipartForm.RemoveAll() }()
+
+	var (
+		uploadID   = r.URL.Query().Get("uploadId")
+		key        = r.URL.Query().Get("key")
+		partNumber int
+		partInfo   *storage.PartInfo
+	)
+	if v := r.URL.Query().Get("partNumber"); v != "" {
+		partNumber, _ = strconv.Atoi(v)
 	}
 
-	uploadID := r.FormValue("uploadId")
-	key := r.FormValue("key")
-	partNumberStr := r.FormValue("partNumber")
-
-	partNumber, err := strconv.Atoi(partNumberStr)
-	if err != nil || partNumber < 1 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid part number"})
-		return
+	readField := func(part *multipart.Part) (string, error) {
+		buf, err := io.ReadAll(io.LimitReader(part, 4096))
+		part.Close()
+		return string(buf), err
 	}
 
-	file, _, err := r.FormFile("file")
-	if err != nil {
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to parse upload"})
+			return
+		}
+
+		switch part.FormName() {
+		case "uploadId":
+			v, err := readField(part)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
+				return
+			}
+			if uploadID == "" {
+				uploadID = v
+			}
+
+		case "key":
+			v, err := readField(part)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
+				return
+			}
+			if key == "" {
+				key = v
+			}
+
+		case "partNumber":
+			v, err := readField(part)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
+				return
+			}
+			if partNumber == 0 {
+				partNumber, _ = strconv.Atoi(v)
+			}
+
+		case "file":
+			if partNumber < 1 || partNumber > storage.MaxPartNumber {
+				part.Close()
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("part number must be between 1 and %d, and must be sent before the file part", storage.MaxPartNumber),
+				})
+				return
+			}
+			if uploadID == "" || key == "" {
+				part.Close()
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "uploadId and key must be sent before the file part",
+				})
+				return
+			}
+
+			// Size is unknown when streaming, so pass -1 and let the engine
+			// record whatever was actually written.
+			partInfo, err = h.engine.UploadPart(r.Context(), bucket, key, uploadID, partNumber, part, -1)
+			part.Close()
+			if err != nil {
+				writeStorageError(w, err, "failed to upload part")
+				return
+			}
+
+		default:
+			part.Close()
+		}
+	}
+
+	if partInfo == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no file chunk provided"})
-		return
-	}
-	defer file.Close()
-
-	seeker, ok := file.(io.Seeker)
-	var size int64
-	if ok {
-		size, _ = seeker.Seek(0, io.SeekEnd)
-		_, _ = seeker.Seek(0, io.SeekStart)
-	} else {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid file stream"})
-		return
-	}
-
-	partInfo, err := h.engine.UploadPart(r.Context(), bucket, key, uploadID, partNumber, file, size)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -831,8 +933,15 @@ func (h *Handler) completeMultipart(w http.ResponseWriter, r *http.Request, buck
 			ETag       string `json:"etag"`
 		} `json:"parts"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
+		return
+	}
+
+	if len(req.Parts) > maxCompleteParts {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("too many parts: at most %d are allowed", maxCompleteParts),
+		})
 		return
 	}
 
@@ -862,7 +971,7 @@ func (h *Handler) abortMultipart(w http.ResponseWriter, r *http.Request, bucket 
 		UploadID string `json:"uploadId"`
 		Key      string `json:"key"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
 		return
 	}
@@ -1016,7 +1125,7 @@ func (h *Handler) handleGetLifecycle(w http.ResponseWriter, _ *http.Request, buc
 
 func (h *Handler) handlePutLifecycle(w http.ResponseWriter, r *http.Request, bucket string) {
 	var req storage.LifecycleConfiguration
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
