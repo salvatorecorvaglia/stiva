@@ -53,6 +53,7 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 	engine.SetWebhookSecret(cfg.WebhookSecret)
 	engine.SetMaxObjectSize(cfg.MaxObjectSize)
+	engine.SetDisableMinPartSize(cfg.DisableMinPartSize)
 
 	// Set temporary directory for auth hashing
 	auth.TempDir = filepath.Join(cfg.DataDir, "tmp")

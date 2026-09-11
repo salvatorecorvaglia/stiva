@@ -188,12 +188,11 @@ func TestMultipartSSECCompleteRequiresKey(t *testing.T) {
 // TestCompleteMultipartRejectsDuplicateParts covers the audit finding that
 // duplicate part numbers were accepted and concatenated twice.
 func TestCompleteMultipartRejectsDuplicateParts(t *testing.T) {
-	t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", "true")
-
 	fs, err := storage.NewFilesystemEngine(t.TempDir(), nil, "")
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
+	fs.SetDisableMinPartSize(true)
 	defer fs.Close()
 	if err := fs.CreateBucket("dupes"); err != nil {
 		t.Fatalf("create bucket: %v", err)

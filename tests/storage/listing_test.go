@@ -387,3 +387,100 @@ func TestListMultipartUploadsPaginationAdvances(t *testing.T) {
 		t.Fatalf("unexpected page3: %+v", page3)
 	}
 }
+
+// TestListObjectsPrefixWithEarlierMarker is the regression test for a listing
+// bug that returned an empty page.
+//
+// When StartAfter (or the V1 marker) was set, the seek key was built from it
+// alone and Prefix was ignored. The cursor therefore landed wherever the marker
+// pointed — possibly before the prefix — and the loop's prefix check breaks on
+// the first non-matching key, so the scan ended immediately and reported no
+// objects at all even though matching keys existed further on.
+func TestListObjectsPrefixWithEarlierMarker(t *testing.T) {
+	fs := newListEngine(t, "testbucket",
+		"apple.txt", "banana.txt", "photos/a.jpg", "photos/b.jpg", "zebra.txt")
+
+	out, err := fs.ListObjects(&storage.ListObjectsInput{
+		Bucket:     "testbucket",
+		Prefix:     "photos/",
+		StartAfter: "a", // sorts before the prefix
+		MaxKeys:    100,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	var got []string
+	for _, o := range out.Objects {
+		got = append(got, o.Key)
+	}
+	want := []string{"photos/a.jpg", "photos/b.jpg"}
+	if len(got) != len(want) {
+		t.Fatalf("keys = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("keys = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestListObjectsPrefixWithMarkerInsideRange covers the other half: a marker
+// that sorts *after* the prefix must still skip what it names, rather than the
+// prefix seek dragging the cursor back to the start of the range.
+func TestListObjectsPrefixWithMarkerInsideRange(t *testing.T) {
+	fs := newListEngine(t, "testbucket",
+		"photos/a.jpg", "photos/b.jpg", "photos/c.jpg")
+
+	out, err := fs.ListObjects(&storage.ListObjectsInput{
+		Bucket:     "testbucket",
+		Prefix:     "photos/",
+		StartAfter: "photos/a.jpg",
+		MaxKeys:    100,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	var got []string
+	for _, o := range out.Objects {
+		got = append(got, o.Key)
+	}
+	want := []string{"photos/b.jpg", "photos/c.jpg"}
+	if len(got) != len(want) {
+		t.Fatalf("keys = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("keys = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestListObjectsPrefixWithEarlierMarkerAndDelimiter exercises the same seek
+// logic on the delimiter path, where common prefixes are rolled up.
+func TestListObjectsPrefixWithEarlierMarkerAndDelimiter(t *testing.T) {
+	fs := newListEngine(t, "testbucket",
+		"apple.txt", "photos/2023/a.jpg", "photos/2024/b.jpg")
+
+	out, err := fs.ListObjects(&storage.ListObjectsInput{
+		Bucket:     "testbucket",
+		Prefix:     "photos/",
+		Delimiter:  "/",
+		StartAfter: "a",
+		MaxKeys:    100,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	want := []string{"photos/2023/", "photos/2024/"}
+	if len(out.CommonPrefixes) != len(want) {
+		t.Fatalf("common prefixes = %v, want %v", out.CommonPrefixes, want)
+	}
+	for i := range want {
+		if out.CommonPrefixes[i] != want[i] {
+			t.Fatalf("common prefixes = %v, want %v", out.CommonPrefixes, want)
+		}
+	}
+}

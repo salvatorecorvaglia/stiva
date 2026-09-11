@@ -20,6 +20,21 @@ import (
 	"github.com/salvatorecorvaglia/stiva/internal/storage"
 )
 
+// publicReadKey marks a request served from a public bucket without any
+// signature, so handlers can withhold the parts of the API that should only
+// answer to an authenticated caller.
+type publicReadKeyType struct{}
+
+var publicReadKey publicReadKeyType
+
+// isPublicRead reports whether this request skipped signature verification
+// because the bucket is public. A request that never went through the router
+// (an internal or test call) is treated as signed.
+func isPublicRead(r *http.Request) bool {
+	v, _ := r.Context().Value(publicReadKey).(bool)
+	return v
+}
+
 type logTask struct {
 	targetBucket string
 	targetPrefix string
@@ -282,7 +297,9 @@ func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, buck
 		}
 	}
 
-	if !bypassAuth {
+	if bypassAuth {
+		r = r.WithContext(context.WithValue(r.Context(), publicReadKey, true))
+	} else {
 		if err := rt.verifier.Verify(r); err != nil {
 			slog.Warn("[S3] Auth failed", "method", r.Method, "path", r.URL.Path, "error", err)
 			var authErr *auth.AuthError

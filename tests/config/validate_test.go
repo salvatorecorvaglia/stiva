@@ -165,3 +165,35 @@ func TestEnvBoolAcceptsCommonSpellings(t *testing.T) {
 		}
 	}
 }
+
+// TestDisableMinPartSizeReadsCommonSpellings covers the one documented
+// environment variable that bypassed config.Load entirely: it was read with a
+// bare os.Getenv deep inside CompleteMultipartUpload and compared against the
+// exact string "true", so it was never validated and silently ignored the
+// 1/yes/on spellings every other flag accepts.
+func TestDisableMinPartSizeReadsCommonSpellings(t *testing.T) {
+	for _, v := range []string{"1", "t", "true", "TRUE", "y", "yes", "on", "On"} {
+		t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", v)
+		if !config.Load().DisableMinPartSize {
+			t.Errorf("STIVA_DISABLE_MIN_PART_SIZE=%q should enable the flag", v)
+		}
+	}
+	for _, v := range []string{"0", "f", "false", "no", "off", ""} {
+		t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", v)
+		if config.Load().DisableMinPartSize {
+			t.Errorf("STIVA_DISABLE_MIN_PART_SIZE=%q should leave the flag off", v)
+		}
+	}
+}
+
+// TestDisableMinPartSizeRejectsGarbage confirms the flag now participates in
+// startup validation like every other boolean, rather than quietly defaulting.
+func TestDisableMinPartSizeRejectsGarbage(t *testing.T) {
+	t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", "enabled")
+	cfg := config.Load()
+	if err := cfg.Validate(); err == nil {
+		t.Error("STIVA_DISABLE_MIN_PART_SIZE=enabled should fail validation")
+	} else if !strings.Contains(err.Error(), "STIVA_DISABLE_MIN_PART_SIZE") {
+		t.Errorf("error should name the offending variable, got: %v", err)
+	}
+}

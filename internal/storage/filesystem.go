@@ -81,6 +81,11 @@ type FilesystemEngine struct {
 	mu       sync.Mutex
 	locks    map[string]*uploadLock
 
+	// disableMinPartSize turns off the 5MB minimum part size on
+	// CompleteMultipartUpload. It is threaded in from configuration rather
+	// than read from the environment mid-request.
+	disableMinPartSize bool
+
 	// maxObjectSize caps the bytes PutObject/UploadPart will write for a
 	// single object/part, independent of the SigV4 layer's own payload-size
 	// check (which a client sending UNSIGNED-PAYLOAD bypasses entirely).
@@ -173,6 +178,13 @@ func (fs *FilesystemEngine) SetWebhookSecret(secret string) {
 // single object/part. Zero (the default) disables the cap.
 func (fs *FilesystemEngine) SetMaxObjectSize(n int64) {
 	fs.maxObjectSize = n
+}
+
+// SetDisableMinPartSize turns off the S3 rule requiring every multipart part
+// except the last to be at least 5MB. Like the other setters here it must be
+// called before the engine serves traffic.
+func (fs *FilesystemEngine) SetDisableMinPartSize(v bool) {
+	fs.disableMinPartSize = v
 }
 
 // Close closes the underlying metadata store and stops workers.
@@ -886,15 +898,23 @@ func (fs *FilesystemEngine) ListObjects(input *ListObjectsInput) (*ListObjectsOu
 
 	bucketPrefix := input.Bucket + "\x00"
 
+	// Seek to whichever of the prefix and the marker sorts later.
+	//
+	// The marker used to win outright whenever it was set, so a marker that
+	// sorted before the prefix — an ordinary start-after/marker value, since
+	// callers choose it freely — put the cursor ahead of keys the prefix
+	// filter then rejected. The scan breaks on the first non-matching key, so
+	// the whole page came back empty even with matching keys further on.
 	seekKey := bucketPrefix
-	if startAfter != "" {
-		if input.Delimiter != "" && strings.HasSuffix(startAfter, input.Delimiter) {
-			seekKey = bucketPrefix + startAfter + "\xff"
-		} else {
-			seekKey = bucketPrefix + startAfter + "\x00"
-		}
-	} else if input.Prefix != "" {
+	if input.Prefix != "" {
 		seekKey = bucketPrefix + input.Prefix
+	}
+	if startAfter != "" {
+		afterKey := bucketPrefix + startAfter + "\x00"
+		if input.Delimiter != "" && strings.HasSuffix(startAfter, input.Delimiter) {
+			afterKey = bucketPrefix + startAfter + "\xff"
+		}
+		seekKey = advanceToken(seekKey, afterKey)
 	}
 
 	isTruncated := false

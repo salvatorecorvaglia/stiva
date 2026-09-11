@@ -334,8 +334,6 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		uploadedParts[p.PartNumber] = p
 	}
 
-	disableMinSize := os.Getenv("STIVA_DISABLE_MIN_PART_SIZE") == "true"
-
 	for i, part := range parts {
 		uPart, exists := uploadedParts[part.PartNumber]
 		if !exists {
@@ -349,7 +347,7 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		}
 
 		// Enforce minimum part size of 5MB for all parts except the last one
-		if !disableMinSize && i < len(parts)-1 {
+		if !fs.disableMinPartSize && i < len(parts)-1 {
 			if uPart.Size < 5*1024*1024 {
 				return nil, &S3Error{
 					Code:    "EntityTooSmall",

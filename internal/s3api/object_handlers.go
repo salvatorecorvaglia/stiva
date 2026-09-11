@@ -170,7 +170,18 @@ func (rt *Router) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		w.Header().Set(amzSSECAlgorithmHeader, info.SSECustomerAlgorithm)
 		w.Header().Set(amzSSECKeyMD5Header, info.SSECustomerKeyMD5)
 	}
-	applyResponseHeaderOverrides(w, r.URL.Query())
+	// Content is caller-supplied, so never let a browser sniff it into
+	// something executable.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	// The response-header overrides let a caller restate an object's
+	// Content-Type and Content-Disposition. On an unauthenticated public-bucket
+	// read that turns any stored object into arbitrary HTML served from this
+	// origin, so they are honoured only for signed requests — which is also
+	// where S3 supports them.
+	if !isPublicRead(r) {
+		applyResponseHeaderOverrides(w, r.URL.Query())
+	}
 
 	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
 		quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
@@ -226,6 +237,8 @@ func (rt *Router) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 // this, a presigned link always renders inline per the object's stored
 // Content-Type — including in a browser tab, where there is otherwise no way
 // to force a download for a URL that isn't same-origin with the requester.
+//
+// Callers must gate this on the request being signed: see handleGetObject.
 func applyResponseHeaderOverrides(w http.ResponseWriter, query url.Values) {
 	overrides := map[string]string{
 		"response-content-disposition": "Content-Disposition",
@@ -336,6 +349,7 @@ func (rt *Router) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 		w.Header().Set(amzSSECAlgorithmHeader, info.SSECustomerAlgorithm)
 		w.Header().Set(amzSSECKeyMD5Header, info.SSECustomerKeyMD5)
 	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
 		quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
 		if ifMatch != "*" && ifMatch != info.ETag && ifMatch != quotedETag {

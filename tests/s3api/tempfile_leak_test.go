@@ -35,8 +35,12 @@ func signPut(r *http.Request, creds *auth.Credentials, region string, now time.T
 	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n", r.Host, payloadHash, amzDate)
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 
+	// The canonical query string is not the raw one: AWS percent-encodes each
+	// key and value (so a value containing "/" becomes "%2F") and sorts them.
+	// Use the same helper the verifier does.
 	canonicalRequest := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
-		r.Method, r.URL.EscapedPath(), r.URL.RawQuery, canonicalHeaders, signedHeaders, payloadHash)
+		r.Method, r.URL.EscapedPath(), auth.GetCanonicalQueryString(r.URL.Query()),
+		canonicalHeaders, signedHeaders, payloadHash)
 
 	scope := fmt.Sprintf("%s/%s/s3/aws4_request", datestamp, region)
 	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s",

@@ -27,12 +27,13 @@ import (
 // setupTestEngine creates a temporary FilesystemEngine for testing.
 func setupTestEngine(t *testing.T) *storage.FilesystemEngine {
 	t.Helper()
-	t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", "true")
 	tmpDir := t.TempDir()
 	engine, err := storage.NewFilesystemEngine(tmpDir, nil, "")
 	if err != nil {
 		t.Fatalf("failed to create engine: %v", err)
 	}
+	// Most tests here use small multipart parts.
+	engine.SetDisableMinPartSize(true)
 	t.Cleanup(func() { engine.Close() })
 	return engine
 }
@@ -1155,7 +1156,6 @@ func TestOutboundMirroring(t *testing.T) {
 		os.Unsetenv("STIVA_SYNC_REGION")
 	}()
 
-	t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", "true")
 	tmpDir := t.TempDir()
 	syncCfg := syncConfigFromEnv()
 	engine, err := storage.NewFilesystemEngine(tmpDir, syncCfg, "")
@@ -1442,8 +1442,8 @@ func TestFlatNamespacePathConflicts(t *testing.T) {
 
 func TestMultipartConstraintsValidation(t *testing.T) {
 	engine := setupTestEngine(t)
-	// Clear the disable flag to force enforcement
-	t.Setenv("STIVA_DISABLE_MIN_PART_SIZE", "false")
+	// Re-enable the 5MB minimum so this test can exercise enforcement.
+	engine.SetDisableMinPartSize(false)
 
 	bucket := "multipart-validation-bucket"
 	engine.CreateBucket(bucket)

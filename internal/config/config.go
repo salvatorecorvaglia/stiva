@@ -68,6 +68,10 @@ type Config struct {
 	// (a client sending UNSIGNED-PAYLOAD bypasses the SigV4 layer's own
 	// size check entirely). Zero disables the cap.
 	MaxObjectSize int64
+	// DisableMinPartSize turns off the S3 rule that every multipart part
+	// except the last must be at least 5MB. Useful for development and
+	// testing; it should not be set in production.
+	DisableMinPartSize bool
 	// TrustProxy specifies whether to trust proxy headers like X-Forwarded-For.
 	TrustProxy bool
 	// TrustedProxyHops is the number of reverse proxies in front of Stiva. The
@@ -278,6 +282,13 @@ func Load() *Config {
 		MetricsToken:   envOrDefault("STIVA_METRICS_TOKEN", ""),
 		MaxObjectSize:  int64Var("STIVA_MAX_OBJECT_SIZE", 5*1024*1024*1024), // 5GiB, the S3 single-PUT maximum
 		TrustProxy:     boolVar("STIVA_TRUST_PROXY"),
+
+		// Read through boolVar like every other flag. This was the one
+		// documented variable read directly with os.Getenv, deep in
+		// CompleteMultipartUpload and compared against the exact string
+		// "true" — so it was never validated and silently ignored the
+		// 1/yes/on spellings accepted everywhere else.
+		DisableMinPartSize: boolVar("STIVA_DISABLE_MIN_PART_SIZE"),
 
 		TrustedProxyHops: intVar("STIVA_TRUSTED_PROXY_HOPS", 1),
 	}

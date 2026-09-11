@@ -11,8 +11,7 @@ import (
 // handleListBuckets handles GET / (ListBuckets).
 func (rt *Router) handleListBuckets(w http.ResponseWriter, _ *http.Request) {
 	buckets, err := rt.engine.ListBuckets()
-	if err != nil {
-		writeS3Error(w, "InternalError", err.Error(), "/")
+	if handleStorageError(w, err, "/") {
 		return
 	}
 
@@ -65,8 +64,7 @@ func (rt *Router) handleDeleteBucket(w http.ResponseWriter, _ *http.Request, buc
 // handleHeadBucket handles HEAD /<bucket> (HeadBucket).
 func (rt *Router) handleHeadBucket(w http.ResponseWriter, _ *http.Request, bucket string) {
 	exists, err := rt.engine.BucketExists(bucket)
-	if err != nil {
-		writeS3Error(w, "InternalError", err.Error(), "/"+bucket)
+	if handleStorageError(w, err, "/"+bucket) {
 		return
 	}
 	if !exists {
@@ -80,8 +78,7 @@ func (rt *Router) handleHeadBucket(w http.ResponseWriter, _ *http.Request, bucke
 // handleGetBucketLocation handles GET /<bucket>?location (GetBucketLocation).
 func (rt *Router) handleGetBucketLocation(w http.ResponseWriter, _ *http.Request, bucket string) {
 	exists, err := rt.engine.BucketExists(bucket)
-	if err != nil {
-		writeS3Error(w, "InternalError", err.Error(), "/"+bucket)
+	if handleStorageError(w, err, "/"+bucket) {
 		return
 	}
 	if !exists {

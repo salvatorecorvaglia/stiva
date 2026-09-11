@@ -395,7 +395,7 @@ func (h *Handler) handleBuckets(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listBuckets(w http.ResponseWriter, _ *http.Request) {
 	buckets, err := h.engine.ListBuckets()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to list buckets")
 		return
 	}
 
@@ -440,7 +440,7 @@ func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.engine.CreateBucket(req.Name); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to create bucket")
 		return
 	}
 
@@ -507,7 +507,7 @@ func (h *Handler) handleBucketObjects(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteBucket(w http.ResponseWriter, _ *http.Request, name string) {
 	if err := h.engine.DeleteBucket(name); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to delete bucket")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": name})
@@ -518,7 +518,7 @@ func (h *Handler) handleSetBucketPublic(w http.ResponseWriter, r *http.Request, 
 	public := publicStr == "true"
 
 	if err := h.engine.SetBucketPublic(bucket, public); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to update bucket access")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"bucket": bucket, "public": public})
@@ -527,7 +527,7 @@ func (h *Handler) handleSetBucketPublic(w http.ResponseWriter, r *http.Request, 
 func (h *Handler) handleGetBucketPublic(w http.ResponseWriter, _ *http.Request, bucket string) {
 	public, err := h.engine.IsBucketPublic(bucket)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to read bucket access")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"public": public})
@@ -562,7 +562,7 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 		ContinuationToken: continuationToken,
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to list objects")
 		return
 	}
 
@@ -736,7 +736,7 @@ func (h *Handler) deleteObject(w http.ResponseWriter, r *http.Request, bucket st
 	}
 
 	if _, _, err := h.engine.DeleteObject(bucket, key, ""); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to delete object")
 		return
 	}
 
@@ -798,7 +798,7 @@ func (h *Handler) initiateMultipart(w http.ResponseWriter, r *http.Request, buck
 
 	info, err := h.engine.CreateMultipartUpload(bucket, req.Key, req.ContentType)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to start multipart upload")
 		return
 	}
 
@@ -955,7 +955,7 @@ func (h *Handler) completeMultipart(w http.ResponseWriter, r *http.Request, buck
 
 	info, err := h.engine.CompleteMultipartUpload(r.Context(), bucket, req.Key, req.UploadID, s3Parts)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to complete multipart upload")
 		return
 	}
 
@@ -978,7 +978,7 @@ func (h *Handler) abortMultipart(w http.ResponseWriter, r *http.Request, bucket 
 
 	err := h.engine.AbortMultipartUpload(bucket, req.Key, req.UploadID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to abort multipart upload")
 		return
 	}
 
@@ -1055,7 +1055,8 @@ func (h *Handler) handlePresignObject(w http.ResponseWriter, r *http.Request, bu
 		extraParams,
 	)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("[Console] Failed to build presigned URL", "bucket", bucket, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate presigned URL"})
 		return
 	}
 
@@ -1117,7 +1118,7 @@ func isValidConsoleOrigin(origin string, requestHost string) bool {
 func (h *Handler) handleGetLifecycle(w http.ResponseWriter, _ *http.Request, bucket string) {
 	lc, err := h.engine.GetBucketLifecycle(bucket)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to read lifecycle configuration")
 		return
 	}
 	writeJSON(w, http.StatusOK, lc)
@@ -1131,7 +1132,7 @@ func (h *Handler) handlePutLifecycle(w http.ResponseWriter, r *http.Request, buc
 	}
 
 	if err := h.engine.PutBucketLifecycle(bucket, &req); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to update lifecycle configuration")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "lifecycle configuration updated"})
@@ -1139,7 +1140,7 @@ func (h *Handler) handlePutLifecycle(w http.ResponseWriter, r *http.Request, buc
 
 func (h *Handler) handleDeleteLifecycle(w http.ResponseWriter, _ *http.Request, bucket string) {
 	if err := h.engine.DeleteBucketLifecycle(bucket); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeStorageError(w, err, "failed to delete lifecycle configuration")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "lifecycle configuration deleted"})
