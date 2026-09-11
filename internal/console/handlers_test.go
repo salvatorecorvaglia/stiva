@@ -401,3 +401,66 @@ func TestForeignOriginIsRejected(t *testing.T) {
 		t.Error("foreign origin was echoed back in Access-Control-Allow-Origin")
 	}
 }
+
+// TestDownloadSupportsRangeRequests covers the console download endpoint,
+// which always wrote the whole body from the start. Seeking in the audio and
+// video previews therefore did nothing.
+func TestDownloadSupportsRangeRequests(t *testing.T) {
+	h, engine, token := newHandlerFixture(t)
+	if err := engine.CreateBucket("ranged"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	body := "0123456789abcdefghij"
+	if _, err := engine.PutObject(context.Background(), "ranged", "clip.bin",
+		strings.NewReader(body), int64(len(body)), "application/octet-stream"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/api/buckets/ranged/objects/download?key=clip.bin", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Range", "bytes=5-9")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206 (body: %s)", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "56789" {
+		t.Errorf("body = %q, want %q", got, "56789")
+	}
+	if cr := w.Header().Get("Content-Range"); cr != "bytes 5-9/20" {
+		t.Errorf("Content-Range = %q, want bytes 5-9/20", cr)
+	}
+	if w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("ranged download lost the nosniff header")
+	}
+
+	// A plain request must still return the whole object.
+	w = do(t, h, http.MethodGet, "/api/buckets/ranged/objects/download?key=clip.bin", token, nil)
+	if w.Code != http.StatusOK || w.Body.String() != body {
+		t.Errorf("full download = %d %q", w.Code, w.Body.String())
+	}
+}
+
+// TestListingReportsContentType covers the field the preview logic needs so it
+// can stop guessing the file type from the object key's extension.
+func TestListingReportsContentType(t *testing.T) {
+	h, engine, token := newHandlerFixture(t)
+	if err := engine.CreateBucket("typed"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	// No extension at all: the extension heuristic has nothing to work with.
+	if _, err := engine.PutObject(context.Background(), "typed", "screenshot",
+		strings.NewReader("\x89PNG\r\n"), 6, "image/png"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	w := do(t, h, http.MethodGet, "/api/buckets/typed/objects", token, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list = %d (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"contentType":"image/png"`) {
+		t.Errorf("listing does not report the stored content type: %s", w.Body.String())
+	}
+}

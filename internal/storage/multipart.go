@@ -433,7 +433,15 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		out = &cipher.StreamWriter{S: stream, W: out}
 	}
 
-	compressed := isCompressibleContentType(meta.ContentType)
+	// The assembled length is known from the parts, so the same size rule
+	// applies here as in PutObject. Multipart uploads are large by
+	// construction, so in practice this leaves them seekable.
+	var expectedSize int64
+	for _, part := range parts {
+		expectedSize += uploadedParts[part.PartNumber].Size
+	}
+
+	compressed := shouldCompress(meta.ContentType, expectedSize)
 	if compressed {
 		gw := gzipWriterPool.Get().(*gzip.Writer)
 		gw.Reset(out)

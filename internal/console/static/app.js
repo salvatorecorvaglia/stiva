@@ -663,7 +663,7 @@
             });
 
             tr.querySelector('.preview-link').addEventListener('click', () => {
-                showPreview(item.key, item.size);
+                showPreview(item.key, item.size, item.contentType);
             });
 
             tr.querySelector('.share-btn').addEventListener('click', () => {
@@ -1159,7 +1159,34 @@
             .catch(() => showToast('Failed to copy link', 'error'));
     });
 
-    async function showPreview(key, size) {
+    // Maps a stored Content-Type to the preview kind. Falls back to the file
+    // extension, which used to be the only signal — so an image saved without
+    // an extension, or a .txt holding JSON, was previewed by its name rather
+    // than by what the server actually recorded.
+    function previewKind(contentType, filename) {
+        const ct = (contentType || '').split(';')[0].trim().toLowerCase();
+        if (ct && ct !== 'application/octet-stream') {
+            if (ct.startsWith('image/')) return 'image';
+            if (ct.startsWith('video/')) return 'video';
+            if (ct.startsWith('audio/')) return 'audio';
+            if (ct === 'application/pdf') return 'pdf';
+            if (ct.startsWith('text/')) return 'text';
+            if (['application/json', 'application/xml', 'application/javascript',
+                 'application/x-javascript', 'application/yaml', 'application/x-yaml',
+                 'application/x-sh'].includes(ct)) return 'text';
+        }
+
+        const ext = '.' + filename.split('.').pop().toLowerCase();
+        if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico'].includes(ext)) return 'image';
+        if (['.mp4', '.webm', '.ogg', '.mov'].includes(ext)) return 'video';
+        if (['.mp3', '.wav', '.m4a', '.aac'].includes(ext)) return 'audio';
+        if (ext === '.pdf') return 'pdf';
+        if (['.txt', '.json', '.js', '.ts', '.go', '.html', '.css', '.md', '.log', '.env',
+             '.yml', '.yaml', '.xml', '.ini', '.conf', '.sh', '.py'].includes(ext)) return 'text';
+        return 'none';
+    }
+
+    async function showPreview(key, size, contentType) {
         const filename = key.split('/').pop();
         previewTitle.textContent = `Preview: ${filename}`;
         previewFileSize.textContent = formatSize(size);
@@ -1201,21 +1228,22 @@
             currentPreviewBlobURL = URL.createObjectURL(blob);
             const blobURL = currentPreviewBlobURL;
 
+            const kind = previewKind(contentType, filename);
             const ext = '.' + filename.split('.').pop().toLowerCase();
 
-            if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico'].includes(ext)) {
+            if (kind === 'image') {
                 previewContentContainer.innerHTML = `<img src="${blobURL}" style="max-width: 100%; max-height: 60vh; object-fit: contain; border-radius: 6px; border: 1px solid var(--border);">`;
-            } else if (['.mp4', '.webm', '.ogg', '.mov'].includes(ext)) {
+            } else if (kind === 'video') {
                 previewContentContainer.innerHTML = `<video src="${blobURL}" controls autoplay style="max-width: 100%; max-height: 60vh; border-radius: 6px; border: 1px solid var(--border);"></video>`;
-            } else if (['.mp3', '.wav', '.ogg', '.m4a', '.aac'].includes(ext)) {
+            } else if (kind === 'audio') {
                 previewContentContainer.innerHTML = `
                     <div style="padding: 2rem; width: 100%; display: flex; justify-content: center; background: rgba(255, 255, 255, 0.03); border-radius: 6px; border: 1px solid var(--border);">
                         <audio src="${blobURL}" controls autoplay style="width: 100%; max-width: 400px;"></audio>
                     </div>
                 `;
-            } else if (ext === '.pdf') {
+            } else if (kind === 'pdf') {
                 previewContentContainer.innerHTML = `<iframe src="${blobURL}" sandbox="allow-scripts" style="width: 100%; height: 60vh; border: none; border-radius: 6px; background: white;"></iframe>`;
-            } else if (['.txt', '.json', '.js', '.ts', '.go', '.html', '.css', '.md', '.log', '.env', '.yml', '.yaml', '.xml', '.ini', '.conf', '.sh', '.py'].includes(ext)) {
+            } else if (kind === 'text') {
                 const isTruncated = size > 256 * 1024;
                 let text = await blob.slice(0, 256 * 1024).text();
                 let escapedText = escapeHtml(text);

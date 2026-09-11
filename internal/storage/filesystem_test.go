@@ -1869,3 +1869,67 @@ func TestGracefulShutdown(t *testing.T) {
 	engine.triggerWebhook("Put", info)
 	engine.MirrorSync("shutdown-bucket", "test.txt", "PUT")
 }
+
+// TestCompressionIsSizeAware covers the rule that keeps large objects
+// seekable. A compressed object's reader is a gzip stream, so every Range
+// request against one has to decompress from byte zero to reach the offset —
+// O(n) per request, on exactly the large text and log files where ranged reads
+// matter most.
+func TestCompressionIsSizeAware(t *testing.T) {
+	engine := setupTestEngine(t)
+	bucket := "compress-policy"
+	if err := engine.CreateBucket(bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	small := strings.Repeat("a", 1024)
+	large := strings.Repeat("a", maxCompressibleSize+1)
+
+	tests := []struct {
+		name           string
+		key            string
+		body           string
+		size           int64
+		contentType    string
+		wantCompressed bool
+	}{
+		{"small text is compressed", "small.txt", small, int64(len(small)), "text/plain", true},
+		{"large text is not", "large.txt", large, int64(len(large)), "text/plain", false},
+		{"unknown size is not", "stream.txt", small, -1, "text/plain", false},
+		{"binary is never compressed", "blob.bin", small, int64(len(small)), "application/octet-stream", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := engine.PutObject(context.Background(), bucket, tc.key,
+				strings.NewReader(tc.body), tc.size, tc.contentType)
+			if err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			if info.Compressed != tc.wantCompressed {
+				t.Errorf("Compressed = %v, want %v", info.Compressed, tc.wantCompressed)
+			}
+
+			// Whatever the policy chose, the bytes must round-trip.
+			rc, _, err := engine.GetObject(context.Background(), bucket, tc.key, "")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			defer rc.Close()
+			got, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if string(got) != tc.body {
+				t.Errorf("round-trip mismatch: got %d bytes, want %d", len(got), len(tc.body))
+			}
+
+			// An uncompressed object must be seekable, which is what lets
+			// GetObject range requests avoid decompressing from the start.
+			_, isSeekable := rc.(io.ReadSeeker)
+			if isSeekable != !tc.wantCompressed {
+				t.Errorf("seekable = %v, want %v", isSeekable, !tc.wantCompressed)
+			}
+		})
+	}
+}

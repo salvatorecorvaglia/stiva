@@ -587,6 +587,7 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 		Size         int64  `json:"size"`
 		LastModified string `json:"lastModified"`
 		ETag         string `json:"etag"`
+		ContentType  string `json:"contentType,omitempty"`
 		IsPrefix     bool   `json:"isPrefix"`
 	}
 
@@ -607,6 +608,7 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 			Size:         obj.Size,
 			LastModified: obj.LastModified.UTC().Format("2006-01-02T15:04:05.000Z"),
 			ETag:         obj.ETag,
+			ContentType:  obj.ContentType,
 			IsPrefix:     false,
 		})
 	}
@@ -739,7 +741,19 @@ func (h *Handler) downloadObject(w http.ResponseWriter, r *http.Request, bucket 
 	// Content is user-supplied: never let the browser sniff it into something
 	// executable, and never render it inline in this origin.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	// Serve through ServeContent when the object is seekable, so Range
+	// requests and conditional headers work. Without it the whole body was
+	// always written from the start, which is why seeking in the console's
+	// audio and video previews did nothing. A compressed object's reader is
+	// not seekable and still falls back to a straight copy.
+	if rs, ok := reader.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, filename, info.LastModified, rs)
+		return
+	}
+
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	w.Header().Set("Accept-Ranges", "none")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, reader)
 }

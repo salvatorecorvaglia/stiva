@@ -445,7 +445,7 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 		}
 	}()
 
-	compressed := isCompressibleContentType(contentType)
+	compressed := shouldCompress(contentType, size)
 
 	if compressed {
 		gw := gzipWriterPool.Get().(*gzip.Writer)
@@ -1050,6 +1050,30 @@ func (w *readCloserWrapper) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// maxCompressibleSize is the largest object Stiva will gzip on write.
+//
+// A compressed object cannot be served with a seekable reader, so every Range
+// request against one has to decompress from byte zero to reach the requested
+// offset — O(n) per request, on exactly the large text and log files where
+// ranged reads are most useful. Below this threshold the whole object is cheap
+// to decompress anyway; above it, keeping the object seekable is worth more
+// than the disk saved.
+//
+// This only affects newly written objects. Existing ones carry Compressed in
+// their metadata and continue to be read back correctly either way.
+const maxCompressibleSize = 8 << 20 // 8MiB
+
+// shouldCompress reports whether an object of this type and size is worth
+// gzipping. A size of -1 means the length is not known up front (a streamed or
+// chunked upload), which is characteristic of large uploads, so those are left
+// uncompressed and seekable.
+func shouldCompress(contentType string, size int64) bool {
+	if !isCompressibleContentType(contentType) {
+		return false
+	}
+	return size >= 0 && size <= maxCompressibleSize
 }
 
 func isCompressibleContentType(contentType string) bool {
