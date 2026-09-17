@@ -1,0 +1,41 @@
+services:
+  stiva:
+    image: salvatorecorvaglia/stiva:latest
+    container_name: stiva
+    ports:
+      - "${STIVA_S3_PORT:-9000}:${STIVA_S3_PORT:-9000}"   # S3 API
+      - "${STIVA_CONSOLE_PORT:-9001}:${STIVA_CONSOLE_PORT:-9001}"   # Web Console
+    volumes:
+      - ./data:/data
+    environment:
+      - STIVA_ACCESS_KEY=${STIVA_ACCESS_KEY:-stiva}
+      - STIVA_SECRET_KEY=${STIVA_SECRET_KEY:-stiva123}
+      - STIVA_DATA_DIR=${STIVA_DATA_DIR:-/data}
+      - STIVA_REGION=${STIVA_REGION:-us-east-1}
+      # The port variables must be passed into the container too. Without them
+      # the published mapping followed STIVA_S3_PORT while the server kept
+      # listening on the image default, so custom ports silently did nothing.
+      - STIVA_S3_PORT=${STIVA_S3_PORT:-9000}
+      - STIVA_CONSOLE_PORT=${STIVA_CONSOLE_PORT:-9001}
+      # Set a stable secret so console sessions survive a restart.
+      - STIVA_JWT_SECRET=${STIVA_JWT_SECRET:-}
+    healthcheck:
+      # The console serves the SPA on / and requires no credentials for it.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
+             "http://127.0.0.1:${STIVA_CONSOLE_PORT:-9001}/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    # Drop privileges the object server never needs.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          # Raise these for production workloads; they exist so a runaway
+          # process cannot take the host down with it.
+          memory: 2G

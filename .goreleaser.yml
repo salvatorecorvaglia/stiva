@@ -1,0 +1,87 @@
+# ================================================================
+# GoReleaser configuration for Stiva
+# ================================================================
+# Docs: https://goreleaser.com/customization/
+# ================================================================
+
+version: 2
+
+project_name: stiva
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: stiva
+    main: ./cmd/stiva
+    binary: stiva
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -w -s
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: git
+  format: "{{ .Message }}"
+  groups:
+    - title: "Features"
+      regexp: '^.*?feat(\(.+\))?\!?:.+$'
+      order: 0
+    - title: "Fixed"
+      regexp: '^.*?fix(\(.+\))?\!?:.+$'
+      order: 1
+    - title: "Documentation"
+      regexp: '^.*?docs(\(.+\))?\!?:.+$'
+      order: 2
+    - title: "Tests"
+      regexp: '^.*?test(\(.+\))?\!?:.+$'
+      order: 3
+    - title: "Maintenance"
+      regexp: '^.*?(refactor|perf|build)(\(.+\))?\!?:.+$'
+      order: 4
+    - title: "Other"
+      order: 999
+  filters:
+    exclude:
+      - "^chore:"
+      - "^ci:"
+      - "^style:"
+
+release:
+  github:
+    owner: salvatorecorvaglia
+    name: stiva
+  draft: false
+  prerelease: auto
+  name_template: "Stiva v{{ .Version }}"

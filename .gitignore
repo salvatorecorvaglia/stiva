@@ -1,0 +1,92 @@
+# Binaries & Go build output
+/stiva
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# Test binary & output
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Go workspace & Tool caches
+go.work
+go.work.sum
+.golangci-cache/
+
+# Vendor (if not committed)
+# vendor/
+
+# Data directory & Databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Temp files & Logs
+RELEASE_NOTES.md
+*.tmp
+*.bak
+*.log
+*.pid
+
+# Environment
+.env
+.env.*
+.env.local
+!env.example
+!.env.example
+
+# GitHub Actions local runner
+.act
+
+# IDE / Editor files
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes
+
+# AI Tools & Agents
+.openai/
+.chatgpt/
+gpt-config.json
+openai.config.json
+.anthropic/
+.claude/
+claude.config.json
+claude-settings.json
+.prompts/
+.prompt-cache/
+.ai/
+.gemini/
+.antigravity/
+.antigravitycli/
+.copilot/
+.codex/
+.cagent/
+.cursor/
+.windsurf/
+.cline/
+CLAUDE.md

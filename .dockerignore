@@ -1,0 +1,50 @@
+# Keeps local secrets, data, and VCS history out of the build context so
+# they can't end up baked into cached/pushed builder-stage layers, and keeps
+# the context small.
+
+.git/
+.github/
+
+# Local data & secrets
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/stiva
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test output
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Tool caches
+.golangci-cache/
+
+# IDE / Editor files
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docs (unused by the build)
+*.md
+!README.md
