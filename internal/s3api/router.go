@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -43,12 +44,14 @@ type logTask struct {
 
 // RouterOptions configures an S3 API Router.
 type RouterOptions struct {
-	Engine           storage.Engine
+	Engine           storage.DataStore
 	Creds            *auth.Credentials
 	Region           string
 	Domain           string
 	TrustProxy       bool
 	TrustedProxyHops int
+	// Metrics receives request counters. Nil selects storage.GlobalMetrics.
+	Metrics *storage.MetricsTracker
 	// LogFlushInterval controls how often buffered access logs are written.
 	// Zero selects defaultLogFlushInterval.
 	LogFlushInterval time.Duration
@@ -56,17 +59,23 @@ type RouterOptions struct {
 
 // Router handles S3 API request routing and dispatching.
 type Router struct {
-	engine           storage.Engine
+	engine           storage.DataStore
 	verifier         *auth.SigV4Verifier
 	region           string
 	domain           string
 	trustProxy       bool
 	trustedProxyHops int
 	logFlushInterval time.Duration
+	metrics          *storage.MetricsTracker
 	logChan          chan logTask
-	logWG            sync.WaitGroup
-	activeReqs       sync.WaitGroup
-	closeOnce        sync.Once
+	// stopLogs tells the log worker to flush and exit. logChan itself is
+	// never closed: a request still running after Shutdown's deadline may
+	// yet log, and a send on a closed channel panics, whereas a send to a
+	// full channel is simply dropped (see logAccess).
+	stopLogs   chan struct{}
+	logWG      sync.WaitGroup
+	activeReqs inflightCounter
+	closeOnce  sync.Once
 }
 
 // defaultLogFlushInterval is how often buffered access log lines are flushed.
@@ -83,7 +92,13 @@ func NewRouter(opts RouterOptions) *Router {
 		flush = defaultLogFlushInterval
 	}
 
+	metrics := opts.Metrics
+	if metrics == nil {
+		metrics = storage.GlobalMetrics
+	}
+
 	rt := &Router{
+		metrics:          metrics,
 		engine:           opts.Engine,
 		verifier:         auth.NewSigV4Verifier(opts.Creds),
 		region:           opts.Region,
@@ -92,6 +107,7 @@ func NewRouter(opts RouterOptions) *Router {
 		trustedProxyHops: hops,
 		logFlushInterval: flush,
 		logChan:          make(chan logTask, 1000),
+		stopLogs:         make(chan struct{}),
 	}
 	rt.startLogWorkers()
 	return rt
@@ -122,14 +138,39 @@ func (w *metricsResponseWriter) Write(b []byte) (int, error) {
 
 // ReadFrom preserves the sendfile path when the underlying writer supports it.
 func (w *metricsResponseWriter) ReadFrom(src io.Reader) (int64, error) {
+	src, sent := unwrapFileBacked(src)
+	var n int64
+	var err error
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
-		n, err := rf.ReadFrom(src)
-		w.bytesWritten += n
-		return n, err
+		n, err = rf.ReadFrom(src)
+	} else {
+		n, err = io.Copy(w.ResponseWriter, src)
 	}
-	n, err := io.Copy(w.ResponseWriter, src)
 	w.bytesWritten += n
+	if sent != nil {
+		sent(n)
+	}
 	return n, err
+}
+
+// unwrapFileBacked replaces a plain object's reader — bare, or inside the
+// io.LimitedReader that http.ServeContent wraps it in — with its underlying
+// *os.File, the only source net/http will send with sendfile. The returned
+// function must be told how many bytes were sent, to keep the outer limit and
+// the download metrics right; it is nil when src was left as it was.
+func unwrapFileBacked(src io.Reader) (io.Reader, func(int64)) {
+	switch s := src.(type) {
+	case *io.LimitedReader:
+		if fb, ok := s.R.(storage.FileBacked); ok {
+			return &io.LimitedReader{R: fb.BackingFile(), N: s.N}, func(n int64) {
+				s.N -= n
+				fb.CountDownloaded(n)
+			}
+		}
+	case storage.FileBacked:
+		return s.BackingFile(), s.CountDownloaded
+	}
+	return src, nil
 }
 
 func (w *metricsResponseWriter) Flush() {
@@ -153,42 +194,58 @@ func (w *metricsResponseWriter) Unwrap() http.ResponseWriter {
 
 // ServeHTTP implements the http.Handler interface for the S3 API.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	rt.activeReqs.Add(1)
-	defer rt.activeReqs.Done()
+	rt.activeReqs.add()
+	defer rt.activeReqs.done()
 
-	// The SigV4 layer may replace r.Body with a reader backed by a temp file
-	// (auth.HashPayload spools bodies over 2MiB, and decodeStreamingPayload
-	// does the same for aws-chunked uploads). That reader deletes its file on
-	// Close, but net/http only closes the *original* body it captured when it
-	// read the request — never the replacement — so without this every signed
-	// request over 2MiB left a file behind for good. Closing here covers the
-	// rejected-signature path too, where the body is spooled before the
-	// signature is compared. Close is idempotent and safe on the unreplaced
-	// body.
+	// The SigV4 layer may replace r.Body (with a buffered copy, or a reader
+	// that verifies the payload as it streams). net/http only closes the
+	// *original* body it captured, never a replacement, so close whatever
+	// r.Body is now. Close is idempotent and safe on the unreplaced body.
 	defer func() {
 		if r.Body != nil {
 			_ = r.Body.Close()
 		}
 	}()
 
-	start := time.Now()
-	mrw := &metricsResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-	storage.GlobalMetrics.IncRequests()
+	// One ID per request, shared by the x-amz-request-id header, any error
+	// body (writeS3Error reads it back from the header) and the access log.
+	w.Header().Set(requestIDHeader, newRequestID())
 
 	// Resolved once here and threaded through: this used to be computed twice
 	// per request, once for routing and again for logging.
 	bucket, key := rt.resolveBucketAndKey(r)
 
+	if isHealthCheck(r, bucket, key) {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	start := time.Now()
+	mrw := &metricsResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	rt.metrics.IncRequests()
+
 	rt.serveHTTPInternal(mrw, r, bucket, key)
 
 	if mrw.statusCode >= 400 {
-		storage.GlobalMetrics.IncErrors()
+		rt.metrics.IncErrors()
 	}
 
-	rt.logAccess(r, bucket, key, mrw.statusCode, mrw.bytesWritten, time.Since(start))
+	rt.logAccess(r, bucket, key, w.Header().Get(requestIDHeader), mrw.statusCode, mrw.bytesWritten, time.Since(start))
 }
 
-func (rt *Router) logAccess(r *http.Request, bucket, key string, statusCode int, bytesSent int64, duration time.Duration) {
+// healthBucket is the path of the liveness probe. It is not a valid bucket
+// name (S3 bucket names allow no underscore), so it can never shadow one.
+const healthBucket = "_health"
+
+// isHealthCheck reports whether this is the unauthenticated liveness probe:
+// GET or HEAD of exactly /_health, path-style. With virtual-host routing the
+// same path is an ordinary object key and resolves with a non-empty key.
+func isHealthCheck(r *http.Request, bucket, key string) bool {
+	return bucket == healthBucket && key == "" && !strings.HasSuffix(r.URL.Path, "/") &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead)
+}
+
+func (rt *Router) logAccess(r *http.Request, bucket, key, requestID string, statusCode int, bytesSent int64, duration time.Duration) {
 	if bucket == "" {
 		return
 	}
@@ -205,45 +262,12 @@ func (rt *Router) logAccess(r *http.Request, bucket, key string, statusCode int,
 		return // Skip to avoid infinite loop
 	}
 
-	owner := "stiva"
-	timeStr := time.Now().Format("02/Jan/2006:15:04:05 -0700")
 	// Reading the leftmost X-Forwarded-For entry let any caller forge the
 	// source address recorded here; httpx.ClientIP reads from the trusted end.
 	remoteIP := httpx.ClientIP(r, rt.trustProxy, rt.trustedProxyHops)
+	requester := auth.AccessKeyFromAuthHeader(r.Header.Get("Authorization"))
 
-	requester := "-"
-	if ak := auth.AccessKeyFromAuthHeader(r.Header.Get("Authorization")); ak != "" {
-		requester = ak
-	}
-
-	requestID := "stiva"
-	var operation string
-	if key != "" {
-		operation = "REST." + r.Method + ".OBJECT"
-	} else {
-		operation = "REST." + r.Method + ".BUCKET"
-	}
-
-	reqURI := fmt.Sprintf("%s %s %s", r.Method, r.URL.RequestURI(), r.Proto)
-
-	errCode := "-"
-	if statusCode >= 400 {
-		errCode = http.StatusText(statusCode)
-	}
-
-	referrer := r.Referer()
-	if referrer == "" {
-		referrer = "-"
-	}
-
-	userAgent := r.UserAgent()
-	if userAgent == "" {
-		userAgent = "-"
-	}
-
-	logLine := fmt.Sprintf("%s %s [%s] %s %s %s %s %s \"%s\" %d %s %d - %d %d \"%s\" \"%s\" -\n",
-		owner, bucket, timeStr, remoteIP, requester, requestID, operation, key, reqURI, statusCode, errCode, bytesSent, duration.Milliseconds(), duration.Milliseconds(), referrer, userAgent,
-	)
+	logLine := formatAccessLogLine(r, bucket, key, remoteIP, requester, requestID, statusCode, bytesSent, duration, time.Now())
 
 	task := logTask{
 		targetBucket: targetBucket,
@@ -257,10 +281,91 @@ func (rt *Router) logAccess(r *http.Request, bucket, key string, statusCode int,
 	}
 }
 
+// formatAccessLogLine renders one entry in the S3 server access log format.
+//
+// Almost every field is caller-controlled — the key, the access key named in
+// the Authorization header (present even when authentication failed), a
+// forwarded client address, the request URI, Referer and User-Agent — and
+// they used to be written verbatim. A newline in any of them forged extra
+// log entries, and a quote or space shifted every following field. Bare
+// fields are percent-encoded (as S3 does for keys) and quoted fields escape
+// quotes, backslashes and control characters, so each entry stays one line
+// with a fixed set of fields.
+func formatAccessLogLine(r *http.Request, bucket, key, remoteIP, requester, requestID string, statusCode int, bytesSent int64, duration time.Duration, now time.Time) string {
+	operation := "REST." + r.Method + ".BUCKET"
+	if key != "" {
+		operation = "REST." + r.Method + ".OBJECT"
+	}
+
+	errCode := ""
+	if statusCode >= 400 {
+		errCode = http.StatusText(statusCode)
+	}
+
+	const owner = "stiva"
+	return fmt.Sprintf("%s %s [%s] %s %s %s %s %s \"%s\" %d %s %d - %d %d \"%s\" \"%s\" -\n",
+		owner,
+		escapeLogToken(bucket),
+		now.Format("02/Jan/2006:15:04:05 -0700"),
+		escapeLogToken(remoteIP),
+		escapeLogToken(requester),
+		escapeLogToken(requestID),
+		escapeLogToken(operation),
+		escapeLogToken(key),
+		escapeLogQuoted(r.Method+" "+r.URL.RequestURI()+" "+r.Proto),
+		statusCode,
+		escapeLogToken(errCode),
+		bytesSent,
+		duration.Milliseconds(),
+		duration.Milliseconds(),
+		escapeLogQuoted(orDash(r.Referer())),
+		escapeLogQuoted(orDash(r.UserAgent())),
+	)
+}
+
+// escapeLogToken renders a bare (unquoted) access log field: "-" when empty,
+// otherwise percent-encoding every byte that could end or split the field.
+func escapeLogToken(s string) string {
+	if s == "" {
+		return "-"
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= ' ' || c >= 0x7f || c == '"' || c == '\\' || c == '%' {
+			fmt.Fprintf(&b, "%%%02X", c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// escapeLogQuoted renders the inside of a double-quoted access log field,
+// escaping the quote, the backslash and control characters as \xHH.
+func escapeLogQuoted(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < ' ' || c == 0x7f || c == '"' || c == '\\' {
+			fmt.Fprintf(&b, "\\x%02X", c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
 func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	// Set common S3 response headers
 	w.Header().Set("Server", "Stiva")
-	w.Header().Set("x-amz-request-id", "stiva")
 
 	// Apply CORS headers on all matching requests (preflight or normal)
 	if bucket != "" {
@@ -280,7 +385,7 @@ func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, buck
 
 	// Authenticate the request (bypass for OPTIONS or public bucket object reads)
 	bypassAuth := false
-	if bucket != "" && key != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+	if isAnonymousReadCandidate(r, bucket, key) {
 		if public, err := rt.engine.IsBucketPublic(bucket); err == nil && public {
 			bypassAuth = true
 		}
@@ -299,6 +404,19 @@ func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, buck
 			}
 			return
 		}
+
+		// A large signed or aws-chunked body is verified as it is read, with
+		// any failure arriving in place of io.EOF. Object and part uploads
+		// read to the end before committing, so they take it as a stream.
+		// Anything else may stop early (an XML decoder can) and so must see
+		// the whole body verified first; none of it accepts more than
+		// maxXMLRequestBody anyway.
+		if auth.IsDeferred(r.Body) && !isObjectUpload(r, key) {
+			if err := readVerifiedBody(r); err != nil {
+				handleStorageError(w, err, r.URL.Path)
+				return
+			}
+		}
 	}
 
 	if bucket != "" && !storage.IsValidBucketName(bucket) {
@@ -306,7 +424,9 @@ func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	slog.Info("[S3] Request received", "method", r.Method, "path", r.URL.Path, "bucket", bucket, "key", key)
+	// Debug, not Info: an Info line per request is a synchronous log write on
+	// the hot path and floods the logs of any busy server.
+	slog.Debug("[S3] Request received", "method", r.Method, "path", r.URL.Path, "bucket", bucket, "key", key)
 
 	// Route based on path structure and method
 	if bucket == "" {
@@ -323,6 +443,41 @@ func (rt *Router) serveHTTPInternal(w http.ResponseWriter, r *http.Request, buck
 
 	// Object-level operations
 	rt.handleObjectOps(w, r, bucket, key)
+}
+
+// isObjectUpload reports whether the request streams its body into an object
+// or part (PutObject, UploadPart), as opposed to sending a configuration or
+// command document.
+func isObjectUpload(r *http.Request, key string) bool {
+	return key != "" && r.Method == http.MethodPut && r.Header.Get("x-amz-copy-source") == ""
+}
+
+// readVerifiedBody reads a verify-as-you-read body in full, so every
+// integrity check has run before the handler sees any of it, and swaps in the
+// verified bytes.
+func readVerifiedBody(r *http.Request) error {
+	data, err := io.ReadAll(io.LimitReader(r.Body, maxXMLRequestBody+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxXMLRequestBody {
+		return &storage.S3Error{Code: "MaxMessageLengthExceeded", Message: "Your request was too big."}
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return nil
+}
+
+// isAnonymousReadCandidate reports whether a request is of the only kind a
+// public bucket serves without a signature: GET or HEAD of an object's current
+// version. It used to be any GET or HEAD of a key, which also exposed ListParts
+// (?uploadId=) and every old or deleted version (?versionId=) to anyone.
+func isAnonymousReadCandidate(r *http.Request, bucket, key string) bool {
+	if bucket == "" || key == "" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		return false
+	}
+	q := r.URL.Query()
+	return !q.Has("versionId") && !q.Has("uploadId")
 }
 
 func (rt *Router) resolveBucketAndKey(r *http.Request) (string, string) {
@@ -649,11 +804,25 @@ func (rt *Router) startLogWorkers() {
 
 		for {
 			select {
-			case task, ok := <-rt.logChan:
-				if !ok {
-					flushAll()
-					return
+			case <-rt.stopLogs:
+				// Take whatever is already queued, then flush and exit.
+				for {
+					select {
+					case task := <-rt.logChan:
+						key := task.targetBucket + "\x00" + task.targetPrefix
+						blog, exists := buffers[key]
+						if !exists {
+							blog = &bufferedLog{lastCreated: time.Now().UTC()}
+							buffers[key] = blog
+						}
+						blog.lines = append(blog.lines, task.logLine)
+					default:
+						flushAll()
+						return
+					}
 				}
+
+			case task := <-rt.logChan:
 
 				key := task.targetBucket + "\x00" + task.targetPrefix
 				blog, exists := buffers[key]
@@ -680,12 +849,76 @@ func (rt *Router) startLogWorkers() {
 	}()
 }
 
-// Close drains in-flight requests and flushes buffered access logs. It is safe
-// to call more than once; a second call previously panicked on a closed channel.
-func (rt *Router) Close() {
+// Shutdown waits for in-flight requests, then flushes buffered access logs.
+// It is safe to call more than once; only the first call does any work.
+//
+// The wait for requests is bounded by ctx. It used to be unconditional, so one
+// slow download held server shutdown open however short its timeout. Requests
+// still running past the deadline are left to finish on their own; their
+// access log entries are dropped rather than written.
+func (rt *Router) Shutdown(ctx context.Context) error {
+	var err error
 	rt.closeOnce.Do(func() {
-		rt.activeReqs.Wait()
-		close(rt.logChan)
+		if waitErr := rt.activeReqs.waitIdle(ctx); waitErr != nil {
+			err = fmt.Errorf("S3 API requests still in flight at the shutdown deadline: %w", waitErr)
+		}
+		close(rt.stopLogs)
 		rt.logWG.Wait()
 	})
+	return err
+}
+
+// inflightCounter counts in-flight requests and lets a caller wait, with a
+// deadline, for the count to reach zero.
+//
+// A sync.WaitGroup can't do this: giving up on Wait leaves it pending, and a
+// straggler's Done followed by any later Add then panics ("WaitGroup is
+// reused before previous Wait has returned").
+type inflightCounter struct {
+	mu   sync.Mutex
+	n    int
+	idle chan struct{} // closed when n reaches zero; nil while nobody waits
+}
+
+func (c *inflightCounter) add() {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+}
+
+func (c *inflightCounter) done() {
+	c.mu.Lock()
+	c.n--
+	if c.n == 0 && c.idle != nil {
+		close(c.idle)
+		c.idle = nil
+	}
+	c.mu.Unlock()
+}
+
+// waitIdle returns once no request is in flight, or with ctx's error if that
+// comes first.
+func (c *inflightCounter) waitIdle(ctx context.Context) error {
+	c.mu.Lock()
+	if c.n == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.idle == nil {
+		c.idle = make(chan struct{})
+	}
+	idle := c.idle
+	c.mu.Unlock()
+
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close is Shutdown with no deadline.
+func (rt *Router) Close() {
+	_ = rt.Shutdown(context.Background())
 }

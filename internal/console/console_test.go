@@ -36,7 +36,7 @@ func TestConsoleEndpoints(t *testing.T) {
 		t.Fatalf("failed to create bucket: %v", err)
 	}
 
-	token, err := GenerateToken("access")
+	token, err := handler.tokens.generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("failed to generate token: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestPresignObjectDownloadOverride(t *testing.T) {
 		t.Fatalf("failed to create bucket: %v", err)
 	}
 
-	token, err := GenerateToken("access")
+	token, err := handler.tokens.generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("failed to generate token: %v", err)
 	}
@@ -250,6 +250,13 @@ func TestPresignObjectDownloadOverride(t *testing.T) {
 	if !strings.Contains(disposition, "attachment") || !strings.Contains(disposition, "report.txt") {
 		t.Errorf("response-content-disposition = %q, want attachment with filename report.txt", disposition)
 	}
+
+	// The link has to actually work, not just look right: this exact URL used
+	// to fail with SignatureDoesNotMatch because of the space in the
+	// disposition value.
+	if err := auth.NewSigV4Verifier(creds).Verify(httptest.NewRequest(http.MethodGet, resp.URL, nil)); err != nil {
+		t.Errorf("share link failed signature verification: %v", err)
+	}
 }
 
 // TestPresignObjectIgnoresXForwardedProtoWhenNotTrusted guards against a gap
@@ -275,7 +282,7 @@ func TestPresignObjectIgnoresXForwardedProtoWhenNotTrusted(t *testing.T) {
 	if err := engine.CreateBucket("xfp-bucket"); err != nil {
 		t.Fatalf("failed to create bucket: %v", err)
 	}
-	token, err := GenerateToken("access")
+	token, err := newSessionTokens(testJWTSecret).generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("failed to generate token: %v", err)
 	}
@@ -305,7 +312,7 @@ func TestPresignObjectIgnoresXForwardedProtoWhenNotTrusted(t *testing.T) {
 
 	untrusted := NewHandler(Options{
 		Engine: engine, Creds: creds, S3Port: 9000, Region: "us-east-1",
-		LoginRateLimit: 100, APIRateLimit: 1000, TrustProxy: false,
+		LoginRateLimit: 100, APIRateLimit: 1000, TrustProxy: false, JWTSecret: testJWTSecret,
 	})
 	if url := presignedURL(untrusted); !strings.HasPrefix(url, "http://") {
 		t.Errorf("with TrustProxy=false, X-Forwarded-Proto must be ignored; got URL %q, want http:// scheme", url)
@@ -313,7 +320,7 @@ func TestPresignObjectIgnoresXForwardedProtoWhenNotTrusted(t *testing.T) {
 
 	trusted := NewHandler(Options{
 		Engine: engine, Creds: creds, S3Port: 9000, Region: "us-east-1",
-		LoginRateLimit: 100, APIRateLimit: 1000, TrustProxy: true,
+		LoginRateLimit: 100, APIRateLimit: 1000, TrustProxy: true, JWTSecret: testJWTSecret,
 	})
 	if url := presignedURL(trusted); !strings.HasPrefix(url, "https://") {
 		t.Errorf("with TrustProxy=true, X-Forwarded-Proto should be honored; got URL %q, want https:// scheme", url)
@@ -342,7 +349,7 @@ func TestGetConfigReportsActualS3Port(t *testing.T) {
 		LoginRateLimit: 100, APIRateLimit: 1000,
 	})
 
-	token, err := GenerateToken("access")
+	token, err := handler.tokens.generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("failed to generate token: %v", err)
 	}
@@ -414,5 +421,27 @@ func TestConsoleRateLimiting(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+// TestConsoleHealthEndpoint covers the liveness probe the container
+// healthcheck uses: 200 without a session, and nothing else exposed.
+func TestConsoleHealthEndpoint(t *testing.T) {
+	engine, err := storage.NewFilesystemEngine(t.TempDir(), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	handler := NewHandler(Options{Engine: engine, Creds: auth.NewCredentials("a", "s"), LoginRateLimit: 5, APIRateLimit: 60})
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(method, "/_health", nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("%s /_health = %d, want 200", method, w.Code)
+		}
+		if w.Body.Len() != 0 {
+			t.Errorf("%s /_health returned a body: %q", method, w.Body.String())
+		}
 	}
 }

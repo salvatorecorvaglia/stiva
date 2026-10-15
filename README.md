@@ -142,6 +142,8 @@ Stiva is configured exclusively via environment variables. You can find a baseli
 | **`STIVA_TRUST_PROXY`** | `false` | Trusts `X-Forwarded-For` proxy headers from reverse proxies (Nginx/Caddy/Cloudflare). |
 | **`STIVA_LOGIN_RATE_LIMIT`**| `5` | Maximum console login attempts allowed per minute per IP address. |
 | **`STIVA_API_RATE_LIMIT`**  | `60` | Maximum console API requests allowed per minute per IP address. |
+| **`STIVA_MULTIPART_EXPIRY`** | `7d` | How long an incomplete multipart upload is kept before the background sweep aborts it (e.g. `36h`, `7d`, `2d12h`; minimum `1h`). |
+| **`STIVA_CONSOLE_ALLOWED_ORIGINS`** | *None* | Comma-separated origins (e.g. `https://admin.example.com,http://localhost:5173`) allowed to call the console API besides the console's own. Needed when a reverse proxy rewrites `Host`, or for a local frontend dev server. |
 | **`STIVA_METRICS_TOKEN`** | *None* | Bearer token required to scrape `/metrics`. If empty, requires a console JWT session. |
 | **`STIVA_MAX_OBJECT_SIZE`** | `5368709120` (5GiB) | Maximum size in bytes accepted for a single object or multipart part, enforced by the storage engine regardless of signing mode. `0` disables the cap. |
 | **`STIVA_LOG_LEVEL`** | `info` | Logging verbosity level (`debug`, `info`, `warn`, `error`). |

@@ -39,31 +39,42 @@ const webhookWorkerCount = 10
 
 func (fs *FilesystemEngine) initWebhookDispatcher() {
 	fs.webhookQueue = make(chan webhookTask, webhookQueueSize)
+	ctx := fs.dispatchContext()
 	for i := 0; i < webhookWorkerCount; i++ {
 		fs.webhookWG.Add(1)
 		go func() {
 			defer fs.webhookWG.Done()
 			for task := range fs.webhookQueue {
+				// Past the shutdown deadline the rest of the queue is
+				// abandoned rather than delivered.
+				if ctx.Err() != nil {
+					fs.Metrics().IncWebhookDropped()
+					continue
+				}
 				fs.sendWebhookEvent(task.url, task.payload)
 			}
 		}()
 	}
 }
 
-// StopWebhookDispatcher halts webhook processing, flushes remaining notifications, and waits for workers to terminate.
+// StopWebhookDispatcher halts webhook processing, flushes remaining
+// notifications, and waits for workers to terminate. It waits as long as that
+// takes; use Shutdown to bound it.
 func (fs *FilesystemEngine) StopWebhookDispatcher() {
+	fs.beginWebhookStop()
+	fs.webhookWG.Wait()
+}
+
+// beginWebhookStop refuses new events and closes the queue so the workers exit
+// once it is drained. It is idempotent.
+func (fs *FilesystemEngine) beginWebhookStop() {
 	fs.webhookMu.Lock()
+	defer fs.webhookMu.Unlock()
 	if atomic.SwapInt32(&fs.isWebhookShuttingDown, 1) == 1 {
-		fs.webhookMu.Unlock()
 		return
 	}
-
-	q := fs.webhookQueue
-	fs.webhookMu.Unlock()
-
-	if q != nil {
-		close(q)
-		fs.webhookWG.Wait()
+	if fs.webhookQueue != nil {
+		close(fs.webhookQueue)
 	}
 }
 
@@ -103,7 +114,7 @@ func (fs *FilesystemEngine) triggerWebhook(eventName string, info *ObjectInfo) {
 	select {
 	case fs.webhookQueue <- task:
 	default:
-		GlobalMetrics.IncWebhookDropped()
+		fs.Metrics().IncWebhookDropped()
 		slog.Warn("[Webhook] Webhook queue full, dropping event", "event", eventName, "bucket", info.Bucket, "key", info.Key)
 	}
 }
@@ -127,12 +138,14 @@ func (fs *FilesystemEngine) sendWebhookEvent(url string, payload WebhookPayload)
 	// blocks until the retry chain finishes instead of reporting a clean
 	// shutdown while a scheduled retry (and its outbound HTTP call) is still
 	// pending.
+	ctx := fs.dispatchContext()
 	var attempt func(n int)
 	attempt = func(n int) {
-		if fs.deliverWebhook(url, data) {
+		if fs.deliverWebhook(ctx, url, data) {
 			return
 		}
 		if atomic.LoadInt32(&fs.isWebhookShuttingDown) == 1 {
+			fs.Metrics().IncWebhookDropped()
 			slog.Warn("[Webhook] Dispatcher shutting down, abandoning retry", "event", payload.EventName)
 			return
 		}
@@ -143,17 +156,21 @@ func (fs *FilesystemEngine) sendWebhookEvent(url string, payload WebhookPayload)
 		}
 		backoff := webhookBaseBackoff << n
 		fs.webhookWG.Add(1)
-		time.AfterFunc(backoff, func() {
+		go func() {
 			defer fs.webhookWG.Done()
+			if !sleepCtx(ctx, backoff) {
+				fs.Metrics().IncWebhookDropped()
+				return
+			}
 			attempt(n + 1)
-		})
+		}()
 	}
 	attempt(0)
 }
 
 // deliverWebhook performs a single delivery attempt, reporting success.
-func (fs *FilesystemEngine) deliverWebhook(url string, data []byte) bool {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(data))
+func (fs *FilesystemEngine) deliverWebhook(ctx context.Context, url string, data []byte) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		slog.Error("[Webhook] Failed to create request", "error", err)
 		return true // Unrecoverable: do not retry a malformed URL.

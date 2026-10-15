@@ -63,7 +63,15 @@ VOLUME ["/data"]
 # Run as non-root user
 USER stiva
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget --quiet --tries=1 --spider "http://127.0.0.1:${STIVA_CONSOLE_PORT}/" || exit 1
+# Probes the unauthenticated /_health endpoint on both servers. The old check
+# only fetched the console's index page over plain HTTP, so it never noticed a
+# dead S3 API and always failed once TLS was enabled. Each port is tried over
+# HTTP, then HTTPS; certificate verification is skipped because the
+# self-signed mode (STIVA_TLS_ENABLED without a cert) is a supported setup.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD sh -c 'for port in "$STIVA_S3_PORT" "$STIVA_CONSOLE_PORT"; do \
+        wget -q -T 3 --tries=1 --spider "http://127.0.0.1:$port/_health" || \
+        wget -q -T 3 --tries=1 --spider --no-check-certificate "https://127.0.0.1:$port/_health" || exit 1; \
+    done'
 
 ENTRYPOINT ["./stiva"]

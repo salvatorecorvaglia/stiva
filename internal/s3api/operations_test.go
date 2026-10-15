@@ -2,8 +2,11 @@ package s3api
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"hash/crc32"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -282,5 +285,149 @@ func TestHeadObjectIfMatchPreconditionFailed(t *testing.T) {
 
 	if w.Code != http.StatusPreconditionFailed {
 		t.Errorf("If-Match mismatch on HEAD: status = %d, want 412", w.Code)
+	}
+}
+
+// TestCreateMultipartUploadDeclaresSSEC covers the handler side of fixing an
+// upload's SSE-C mode at creation: the headers on CreateMultipartUpload used
+// to be ignored entirely, so a client following the S3 protocol (key sent on
+// create and on every part) had its mode decided by a race between parts.
+func TestCreateMultipartUploadDeclaresSSEC(t *testing.T) {
+	rt, eng := newOpsRouter(t)
+	putObjects(t, eng, "enc")
+
+	key := strings.Repeat("k", 32)
+	sum := md5.Sum([]byte(key))
+	setSSEC := func(r *http.Request) {
+		r.Header.Set(amzSSECAlgorithmHeader, "AES256")
+		r.Header.Set("x-amz-server-side-encryption-customer-key", base64.StdEncoding.EncodeToString([]byte(key)))
+		r.Header.Set(amzSSECKeyMD5Header, base64.StdEncoding.EncodeToString(sum[:]))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/enc/obj?uploads", nil)
+	setSSEC(req)
+	w := httptest.NewRecorder()
+	rt.handleObjectOps(w, req, "enc", "obj")
+	if w.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get(amzSSECAlgorithmHeader) != "AES256" {
+		t.Error("CreateMultipartUpload response is missing the SSE-C algorithm header")
+	}
+	var created InitiateMultipartUploadResult
+	if err := xml.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// A part without the key must now be refused.
+	part := httptest.NewRequest(http.MethodPut,
+		"/enc/obj?partNumber=1&uploadId="+created.UploadId, strings.NewReader("data"))
+	w = httptest.NewRecorder()
+	rt.handleObjectOps(w, part, "enc", "obj")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("plaintext part on an SSE-C upload: status %d, want 400", w.Code)
+	}
+
+	part = httptest.NewRequest(http.MethodPut,
+		"/enc/obj?partNumber=1&uploadId="+created.UploadId, strings.NewReader("data"))
+	setSSEC(part)
+	w = httptest.NewRecorder()
+	rt.handleObjectOps(w, part, "enc", "obj")
+	if w.Code != http.StatusOK {
+		t.Fatalf("part with the declared key: status %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPutBucketVersioningCannotDisable checks the S3 surface of refusing to
+// return a versioned bucket to unversioned: a 400 with S3's error code, not a
+// 500 from an unmapped code.
+func TestPutBucketVersioningCannotDisable(t *testing.T) {
+	rt, eng := newOpsRouter(t)
+	putObjects(t, eng, "ver")
+	if err := eng.SetBucketVersioning("ver", "Enabled"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/ver?versioning",
+		strings.NewReader(`<VersioningConfiguration><Status></Status></VersioningConfiguration>`))
+	w := httptest.NewRecorder()
+	rt.handleBucketOps(w, req, "ver")
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "IllegalVersioningConfigurationException") {
+		t.Fatalf("status %d body %s; want 400 IllegalVersioningConfigurationException", w.Code, w.Body.String())
+	}
+}
+
+// TestPutObjectVerifiesContentChecksums is the regression test for integrity
+// headers being ignored. Clients send Content-MD5 or x-amz-checksum-* (boto3
+// sends a CRC32 on every upload over plain HTTP) so the server can refuse a
+// body corrupted in transit; Stiva stored it anyway.
+func TestPutObjectVerifiesContentChecksums(t *testing.T) {
+	body := "integrity matters"
+	md5sum := md5.Sum([]byte(body))
+	crc := crc32.ChecksumIEEE([]byte(body))
+	crcBytes := []byte{byte(crc >> 24), byte(crc >> 16), byte(crc >> 8), byte(crc)}
+	b64 := base64.StdEncoding.EncodeToString
+
+	cases := []struct {
+		name       string
+		header     string
+		value      string
+		wantStatus int
+		wantCode   string
+	}{
+		{"matching Content-MD5", "Content-MD5", b64(md5sum[:]), http.StatusOK, ""},
+		{"wrong Content-MD5", "Content-MD5", b64(make([]byte, 16)), http.StatusBadRequest, "BadDigest"},
+		{"malformed Content-MD5", "Content-MD5", "not-base64!", http.StatusBadRequest, "InvalidDigest"},
+		{"matching CRC32", "x-amz-checksum-crc32", b64(crcBytes), http.StatusOK, ""},
+		{"wrong CRC32", "x-amz-checksum-crc32", b64([]byte{0, 0, 0, 0}), http.StatusBadRequest, "BadDigest"},
+		{"malformed CRC32", "x-amz-checksum-crc32", b64([]byte{1}), http.StatusBadRequest, "InvalidRequest"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, eng := newOpsRouter(t)
+			putObjects(t, eng, "sums")
+
+			req := httptest.NewRequest(http.MethodPut, "/sums/obj", strings.NewReader(body))
+			req.Header.Set(tc.header, tc.value)
+			w := httptest.NewRecorder()
+			rt.handleObjectOps(w, req, "sums", "obj")
+
+			if w.Code != tc.wantStatus || !strings.Contains(w.Body.String(), tc.wantCode) {
+				t.Fatalf("status %d body %s; want %d %s", w.Code, w.Body.String(), tc.wantStatus, tc.wantCode)
+			}
+			_, err := eng.HeadObject(context.Background(), "sums", "obj", "")
+			if stored := err == nil; stored != (tc.wantStatus == http.StatusOK) {
+				t.Errorf("object stored = %v, want %v", stored, tc.wantStatus == http.StatusOK)
+			}
+		})
+	}
+}
+
+// TestUploadPartVerifiesContentMD5 covers the same check for multipart parts,
+// where a corrupted part would otherwise be assembled into the final object.
+func TestUploadPartVerifiesContentMD5(t *testing.T) {
+	rt, eng := newOpsRouter(t)
+	putObjects(t, eng, "parts")
+	up, err := eng.CreateMultipartUpload(context.Background(), "parts", "big", "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/parts/big?partNumber=1&uploadId="+up.UploadID, strings.NewReader("part data"))
+	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(make([]byte, 16)))
+	w := httptest.NewRecorder()
+	rt.handleObjectOps(w, req, "parts", "big")
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "BadDigest") {
+		t.Fatalf("status %d body %s; want 400 BadDigest", w.Code, w.Body.String())
+	}
+	parts, err := eng.ListParts("parts", "big", up.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 0 {
+		t.Errorf("a part with a bad Content-MD5 was recorded: %+v", parts)
 	}
 }

@@ -469,7 +469,7 @@ func TestMultipartUpload(t *testing.T) {
 	engine.CreateBucket("multi-bucket")
 
 	// Create multipart upload
-	upload, err := engine.CreateMultipartUpload("multi-bucket", "large-file.bin", "application/octet-stream")
+	upload, err := engine.CreateMultipartUpload(context.Background(), "multi-bucket", "large-file.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload failed: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestAbortMultipartUpload(t *testing.T) {
 	engine := setupTestEngine(t)
 	engine.CreateBucket("abort-bucket")
 
-	upload, err := engine.CreateMultipartUpload("abort-bucket", "aborted.txt", "text/plain")
+	upload, err := engine.CreateMultipartUpload(context.Background(), "abort-bucket", "aborted.txt", "text/plain")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload failed: %v", err)
 	}
@@ -651,7 +651,7 @@ func TestConcurrentUploadPartLocking(t *testing.T) {
 	engine := setupTestEngine(t)
 	engine.CreateBucket("concurrency-bucket")
 
-	upload, err := engine.CreateMultipartUpload("concurrency-bucket", "concurrent.bin", "application/octet-stream")
+	upload, err := engine.CreateMultipartUpload(context.Background(), "concurrency-bucket", "concurrent.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload failed: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestMultipartUploadETagFormat(t *testing.T) {
 	engine := setupTestEngine(t)
 	engine.CreateBucket("etag-bucket")
 
-	upload, err := engine.CreateMultipartUpload("etag-bucket", "file.bin", "application/octet-stream")
+	upload, err := engine.CreateMultipartUpload(context.Background(), "etag-bucket", "file.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload failed: %v", err)
 	}
@@ -734,7 +734,7 @@ func TestCleanExpiredMultipartUploads(t *testing.T) {
 	engine := setupTestEngine(t)
 	engine.CreateBucket("cleanup-bucket")
 
-	upload, err := engine.CreateMultipartUpload("cleanup-bucket", "file.bin", "application/octet-stream")
+	upload, err := engine.CreateMultipartUpload(context.Background(), "cleanup-bucket", "file.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload failed: %v", err)
 	}
@@ -766,7 +766,7 @@ func TestCleanExpiredMultipartUploads(t *testing.T) {
 	}
 
 	// Run cleanup
-	err = engine.CleanExpiredMultipartUploads(24 * time.Hour)
+	err = engine.CleanExpiredMultipartUploads(context.Background(), 24*time.Hour)
 	if err != nil {
 		t.Fatalf("CleanExpiredMultipartUploads failed: %v", err)
 	}
@@ -1051,7 +1051,7 @@ func TestStorageCompression(t *testing.T) {
 	}
 
 	// Verify that the file size on disk is actually smaller than the original size (or at least compressed)
-	path, err := engine.objectPath(bucket, "compressed.txt")
+	path, err := engine.dataPath(getInfo)
 	if err != nil {
 		t.Fatalf("failed to resolve path: %v", err)
 	}
@@ -1397,45 +1397,32 @@ func TestDeleteBucketVersionedEmptiness(t *testing.T) {
 	}
 }
 
+// TestFlatNamespacePathConflicts used to pin down a limitation of storing
+// keys as filesystem paths: "a" and "a/b" could not both exist. In S3 they are
+// simply two keys, and with the blob layout they now coexist in either order
+// (see also TestKeysThatCollidedOnDiskNowCoexist).
 func TestFlatNamespacePathConflicts(t *testing.T) {
 	engine := setupTestEngine(t)
 	bucket := "conflict-bucket"
-	engine.CreateBucket(bucket)
-
-	// Put object 'a'
-	_, err := engine.PutObject(context.Background(), bucket, "a", bytes.NewReader([]byte("file-a")), 6, "text/plain")
-	if err != nil {
-		t.Fatalf("failed to PutObject 'a': %v", err)
+	if err := engine.CreateBucket(bucket); err != nil {
+		t.Fatal(err)
 	}
 
-	// Attempting to put object 'a/b' should conflict (directory-file conflict)
-	_, err = engine.PutObject(context.Background(), bucket, "a/b", bytes.NewReader([]byte("file-b")), 6, "text/plain")
-	if err == nil {
-		t.Fatal("expected conflict error when uploading 'a/b' because 'a' is a file")
+	for _, key := range []string{"a", "a/b", "c/d", "c"} {
+		if _, err := engine.PutObject(context.Background(), bucket, key, strings.NewReader("file-"+key), int64(len("file-"+key)), "text/plain"); err != nil {
+			t.Fatalf("PutObject %q: %v", key, err)
+		}
 	}
-	var s3Err *S3Error
-	ok := errors.As(err, &s3Err)
-	if !ok || s3Err.Code != "InvalidRequest" {
-		t.Errorf("expected S3Error with code 'InvalidRequest', got %v", err)
-	}
-
-	// Clean up 'a'
-	engine.DeleteObject(bucket, "a", "")
-
-	// Put object 'a/b' (now should succeed)
-	_, err = engine.PutObject(context.Background(), bucket, "a/b", bytes.NewReader([]byte("file-b")), 6, "text/plain")
-	if err != nil {
-		t.Fatalf("failed to PutObject 'a/b': %v", err)
-	}
-
-	// Attempting to put object 'a' should conflict (file-directory conflict)
-	_, err = engine.PutObject(context.Background(), bucket, "a", bytes.NewReader([]byte("file-a")), 6, "text/plain")
-	if err == nil {
-		t.Fatal("expected conflict error when uploading 'a' because 'a/b' exists as a sub-path")
-	}
-	ok = errors.As(err, &s3Err)
-	if !ok || s3Err.Code != "InvalidRequest" {
-		t.Errorf("expected S3Error with code 'InvalidRequest', got %v", err)
+	for _, key := range []string{"a", "a/b", "c/d", "c"} {
+		r, _, err := engine.GetObject(context.Background(), bucket, key, "")
+		if err != nil {
+			t.Fatalf("GetObject %q: %v", key, err)
+		}
+		got, _ := io.ReadAll(r)
+		r.Close()
+		if string(got) != "file-"+key {
+			t.Errorf("%q reads %q", key, got)
+		}
 	}
 }
 
@@ -1447,7 +1434,7 @@ func TestMultipartConstraintsValidation(t *testing.T) {
 	bucket := "multipart-validation-bucket"
 	engine.CreateBucket(bucket)
 
-	upload, err := engine.CreateMultipartUpload(bucket, "large.bin", "application/octet-stream")
+	upload, err := engine.CreateMultipartUpload(context.Background(), bucket, "large.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload failed: %v", err)
 	}
@@ -1582,7 +1569,7 @@ func TestBucketLifecycleAndLogging(t *testing.T) {
 	}
 
 	// Execute CleanExpiredObjects
-	err = engine.CleanExpiredObjects()
+	err = engine.CleanExpiredObjects(context.Background())
 	if err != nil {
 		t.Fatalf("CleanExpiredObjects failed: %v", err)
 	}

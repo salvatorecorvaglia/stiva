@@ -68,7 +68,7 @@ func TestConcurrentUploadPartSamePartNumberKeepsContentAndETagConsistent(t *test
 	engine := setupTestEngine(t)
 	engine.CreateBucket("race-bucket-mp")
 
-	info, err := engine.CreateMultipartUpload("race-bucket-mp", "big.bin", "application/octet-stream")
+	info, err := engine.CreateMultipartUpload(context.Background(), "race-bucket-mp", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}

@@ -33,7 +33,7 @@ func newHandlerFixture(t *testing.T) (*Handler, *storage.FilesystemEngine, strin
 		LoginRateLimit: 1000,
 		APIRateLimit:   10000,
 	})
-	token, err := GenerateToken("access")
+	token, err := h.tokens.generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("token: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestAbortMultipartUpload(t *testing.T) {
 	if err := engine.CreateBucket("aborts"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	up, err := engine.CreateMultipartUpload("aborts", "big.bin", "application/octet-stream")
+	up, err := engine.CreateMultipartUpload(context.Background(), "aborts", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("initiate: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestMetricsRequiresAuthorization(t *testing.T) {
 		APIRateLimit:   10000,
 		MetricsToken:   "s3cr3t-metrics-token",
 	})
-	token, err := GenerateToken("access")
+	token, err := h.tokens.generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("token: %v", err)
 	}
@@ -359,10 +359,15 @@ func TestMetricsRequiresAuthorization(t *testing.T) {
 	}
 }
 
-// TestConsoleOriginCheck pins which cross-origin callers the console answers.
-// Note that any localhost origin is accepted regardless of port or scheme,
-// which is deliberate for local development but worth seeing stated.
+// TestConsoleOriginCheck pins which cross-origin callers the console answers:
+// its own origin, plus whatever STIVA_CONSOLE_ALLOWED_ORIGINS lists.
+//
+// Any localhost origin, on any port or scheme, used to be accepted as well.
+// That let any other web app running on the operator's machine (a dev server,
+// a local tool, a compromised page served from localhost) call the console API
+// cross-origin. Local development setups now list their origin explicitly.
 func TestConsoleOriginCheck(t *testing.T) {
+	allowed := []string{"http://localhost:5173", "https://admin.example.com"}
 	tests := []struct {
 		origin, host string
 		want         bool
@@ -372,12 +377,17 @@ func TestConsoleOriginCheck(t *testing.T) {
 		{"https://evil.example.com", "console.example.com", false},
 		{"https://console.example.com.evil.com", "console.example.com", false},
 		{"http://localhost:5173", "console.example.com", true},
-		{"http://127.0.0.1:8080", "console.example.com", true},
+		{"http://LOCALHOST:5173", "console.example.com", true},
+		{"https://admin.example.com", "console.example.com", true},
+		{"http://localhost:3000", "console.example.com", false},
+		{"http://127.0.0.1:8080", "console.example.com", false},
+		{"http://localhost:9001", "localhost:9001", true},
+		{"null", "console.example.com", false},
 		{"", "console.example.com", false},
 		{"://bad", "console.example.com", false},
 	}
 	for _, tc := range tests {
-		if got := isValidConsoleOrigin(tc.origin, tc.host); got != tc.want {
+		if got := isValidConsoleOrigin(tc.origin, tc.host, allowed); got != tc.want {
 			t.Errorf("isValidConsoleOrigin(%q, %q) = %v, want %v", tc.origin, tc.host, got, tc.want)
 		}
 	}

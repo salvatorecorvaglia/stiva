@@ -5,9 +5,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for the Stiva server.
@@ -78,6 +80,14 @@ type Config struct {
 	// client address is read that many entries from the right of
 	// X-Forwarded-For, so caller-supplied entries cannot be trusted.
 	TrustedProxyHops int
+	// MultipartExpiry is how long an incomplete multipart upload may sit
+	// before the background sweep aborts it. It was a hardcoded 24 hours,
+	// which cut off slow uploads of very large objects partway through.
+	MultipartExpiry time.Duration
+	// ConsoleAllowedOrigins lists exact origins (scheme://host[:port]),
+	// normalized to lower case with no trailing slash, that may call the
+	// console API cross-origin in addition to the console's own origin.
+	ConsoleAllowedOrigins []string
 
 	// invalidEnvVars records environment variables Load() could not parse
 	// (e.g. STIVA_TLS_ENABLED=enabled) so Validate() can fail startup on them
@@ -141,6 +151,16 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("STIVA_TRUSTED_PROXY_HOPS must be at least 1"))
 	}
 
+	for _, origin := range c.ConsoleAllowedOrigins {
+		if err := validateOrigin(origin); err != nil {
+			errs = append(errs, fmt.Errorf("STIVA_CONSOLE_ALLOWED_ORIGINS: %w", err))
+		}
+	}
+
+	if c.MultipartExpiry < minMultipartExpiry {
+		errs = append(errs, fmt.Errorf("STIVA_MULTIPART_EXPIRY must be at least %v (got %v)", minMultipartExpiry, c.MultipartExpiry))
+	}
+
 	if c.MaxObjectSize < 0 {
 		errs = append(errs, errors.New("STIVA_MAX_OBJECT_SIZE must not be negative (0 disables the cap)"))
 	}
@@ -172,6 +192,61 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// defaultMultipartExpiry is how long an incomplete multipart upload is kept
+// when STIVA_MULTIPART_EXPIRY is not set.
+const defaultMultipartExpiry = 7 * 24 * time.Hour
+
+// minMultipartExpiry keeps the sweep from aborting uploads that are still
+// actively receiving parts.
+const minMultipartExpiry = time.Hour
+
+// parseDuration extends time.ParseDuration with a leading day count ("7d",
+// "2d12h"), the unit operators reach for first and Go does not provide.
+func parseDuration(raw string) (time.Duration, error) {
+	days, rest, ok := strings.Cut(raw, "d")
+	if !ok {
+		return time.ParseDuration(raw)
+	}
+	n, err := strconv.Atoi(days)
+	if err != nil {
+		return 0, fmt.Errorf("invalid day count %q", days)
+	}
+	total := time.Duration(n) * 24 * time.Hour
+	if rest != "" {
+		extra, err := time.ParseDuration(rest)
+		if err != nil {
+			return 0, err
+		}
+		total += extra
+	}
+	return total, nil
+}
+
+// parseOriginList splits a comma-separated origin list, normalizing each entry
+// the way browsers serialize an Origin header: lower case, no trailing slash.
+func parseOriginList(raw string) []string {
+	var origins []string
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(o)), "/")
+		if o != "" {
+			origins = append(origins, o)
+		}
+	}
+	return origins
+}
+
+// validateOrigin accepts only a bare http(s) origin — no path, query,
+// wildcard or credentials — since it is compared exactly against the Origin
+// header a browser sends.
+func validateOrigin(origin string) error {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return fmt.Errorf("%q is not an origin of the form scheme://host[:port]", origin)
+	}
+	return nil
 }
 
 // minJWTSecretLen is the shortest console signing secret we accept. HS256 with
@@ -248,6 +323,19 @@ func Load() *Config {
 		return i
 	}
 
+	durationVar := func(key string, defaultVal time.Duration) time.Duration {
+		raw := strings.TrimSpace(os.Getenv(key))
+		if raw == "" {
+			return defaultVal
+		}
+		d, err := parseDuration(raw)
+		if err != nil {
+			invalid = append(invalid, fmt.Sprintf("%s=%q is not a valid duration (e.g. 36h, 7d)", key, raw))
+			return defaultVal
+		}
+		return d
+	}
+
 	cfg := &Config{
 		AccessKey:      envOrDefault("STIVA_ACCESS_KEY", "stiva"),
 		SecretKey:      envOrDefault("STIVA_SECRET_KEY", "stiva123"),
@@ -284,20 +372,12 @@ func Load() *Config {
 		DisableMinPartSize: boolVar("STIVA_DISABLE_MIN_PART_SIZE"),
 
 		TrustedProxyHops: intVar("STIVA_TRUSTED_PROXY_HOPS", 1),
+		MultipartExpiry:  durationVar("STIVA_MULTIPART_EXPIRY", defaultMultipartExpiry),
+
+		ConsoleAllowedOrigins: parseOriginList(os.Getenv("STIVA_CONSOLE_ALLOWED_ORIGINS")),
 	}
 	cfg.invalidEnvVars = invalid
 	return cfg
-}
-
-// envBool accepts the usual truthy spellings rather than only the exact string
-// "true", which silently ignored values like "1", "TRUE" and "yes".
-func envBool(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
-	case "1", "t", "true", "y", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }
 
 func envOrDefault(key, defaultVal string) string {

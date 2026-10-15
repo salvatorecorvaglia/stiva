@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +12,96 @@ import (
 
 func (fs *FilesystemEngine) bucketPath(name string) string {
 	return filepath.Join(fs.dataDir, "buckets", name)
+}
+
+// maxKeyLength is the S3 limit on an object key, in bytes.
+const maxKeyLength = 1024
+
+// Object data layout.
+//
+// Each object version is stored in its own file, named by a random blob ID:
+//
+//	<dataDir>/blobs/<bucket>/<id[0:2]>/<id[2:4]>/<id>
+//
+// and its metadata records the ID. Object keys used to be paths on the
+// filesystem (<dataDir>/buckets/<bucket>/<key>[.<versionID>]), which meant a
+// key could not be both a file and a directory ("a" and "a/b", or a "photos/"
+// folder marker), keys differing only in case overwrote each other on
+// case-insensitive filesystems, a key segment could not exceed a filename's
+// length, and "<key>.<versionID>" could collide with a real key. Objects
+// written that way have no blob ID and are still read from their old path;
+// they move to the blob layout when overwritten.
+
+// blobDir is where a bucket's object data lives in the blob layout.
+func (fs *FilesystemEngine) blobDir(bucket string) string {
+	return filepath.Join(fs.dataDir, "blobs", bucket)
+}
+
+// newBlobID returns a random 128-bit blob ID as 32 hex digits.
+func newBlobID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("failed to generate blob ID: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// isBlobID reports whether id has the form newBlobID produces, so a blob ID
+// read from metadata can never steer a path outside the blob directory.
+func isBlobID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
+}
+
+func (fs *FilesystemEngine) blobPath(bucket, id string) string {
+	return filepath.Join(fs.blobDir(bucket), id[0:2], id[2:4], id)
+}
+
+// dataPath returns where an object version's data is stored: its blob, or,
+// for data written before the blob layout, its old key-derived path.
+func (fs *FilesystemEngine) dataPath(info *ObjectInfo) (string, error) {
+	if info.BlobID == "" {
+		return fs.objectPathWithVersion(info.Bucket, info.Key, info.VersionID)
+	}
+	if !isBlobID(info.BlobID) {
+		return "", fmt.Errorf("invalid blob ID %q in metadata", info.BlobID)
+	}
+	return fs.blobPath(info.Bucket, info.BlobID), nil
+}
+
+// newBlob allocates a blob for a new object version and creates its
+// directory, returning the blob's ID and path.
+func (fs *FilesystemEngine) newBlob(bucket string) (id, path string, err error) {
+	id, err = newBlobID()
+	if err != nil {
+		return "", "", err
+	}
+	path = fs.blobPath(bucket, id)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return "", "", fmt.Errorf("failed to create blob directory: %w", err)
+	}
+	return id, path, nil
+}
+
+// validateNewKey checks a key an object is about to be written under.
+//
+// Both rules used to hold only as side effects of keys being filesystem
+// paths. Length: the S3 limit is 1,024 bytes. NUL: metadata keys join the
+// bucket, key and version ID with NUL bytes, so a key containing one could
+// alias another key's version records ("a\x00v1" is version v1 of "a");
+// filenames cannot contain NUL, which is the only reason that was never
+// reachable before.
+func validateNewKey(key string) error {
+	if len(key) > maxKeyLength {
+		return &S3Error{Code: "KeyTooLongError", Message: "Your key is too long."}
+	}
+	if strings.IndexByte(key, 0) >= 0 {
+		return &S3Error{Code: "InvalidArgument", Message: "Object keys cannot contain NUL characters."}
+	}
+	return nil
 }
 
 func hasPathTraversal(s string) bool {
@@ -194,50 +286,27 @@ func isRelTraversal(rel string) bool {
 	return rel == ".." || strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, "..\\") || hasPathTraversal(rel)
 }
 
-func (fs *FilesystemEngine) checkPathConflict(objPath string, bucket string) error {
-	bucketDir := filepath.Clean(fs.bucketPath(bucket))
-	cleanObjPath := filepath.Clean(objPath)
-	bucketPrefix := bucketDir + string(filepath.Separator)
-	if !strings.HasPrefix(cleanObjPath, bucketPrefix) {
-		return errors.New(errInvalidKeyTraversal)
+// requireBucket checks a bucket name is valid and the bucket exists: the
+// preamble of nearly every bucket-scoped engine operation.
+func (fs *FilesystemEngine) requireBucket(name string) error {
+	if err := fs.validateBucketName(name); err != nil {
+		return err
 	}
-	rel, err := filepath.Rel(bucketDir, cleanObjPath)
-	if err != nil || filepath.IsAbs(rel) || isRelTraversal(rel) {
-		return errors.New(errInvalidKeyTraversal)
+	return fs.bucketMustExist(name)
+}
+
+// bucketMustExist reports NoSuchBucket for a bucket that does not exist. It is
+// requireBucket without the name check, for operations that must run other
+// checks in between to report errors in S3's order.
+func (fs *FilesystemEngine) bucketMustExist(name string) error {
+	exists, err := fs.metadata.BucketExists(name)
+	if err != nil {
+		return err
 	}
-
-	// Check if the proposed object path is already a directory (file-directory conflict)
-	fi, err := os.Stat(cleanObjPath)
-	if err == nil && fi.IsDir() {
-		return &S3Error{Code: "InvalidRequest", Message: "Object key name conflicts with an existing directory path."}
+	if !exists {
+		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
-
-	// Check if any parent path is a regular file (directory-file conflict)
-	dir := filepath.Dir(cleanObjPath)
-	for dir != bucketDir {
-		cleanDir := filepath.Clean(dir)
-		if !strings.HasPrefix(cleanDir, bucketPrefix) {
-			break
-		}
-		checkRel, err := filepath.Rel(bucketDir, cleanDir)
-		if err != nil || filepath.IsAbs(checkRel) || isRelTraversal(checkRel) {
-			break
-		}
-
-		s, err := os.Stat(cleanDir)
-		if err == nil && !s.IsDir() {
-			return &S3Error{Code: "InvalidRequest", Message: "Parent path conflicts with an existing object."}
-		}
-
-		parent := filepath.Dir(cleanDir)
-		if parent == cleanDir {
-			break
-		}
-		dir = parent
-	}
-	// A Stat error above means the path simply isn't there, which is exactly
-	// the no-conflict case this reports.
-	return nil //nolint:nilerr // intentional: a missing parent path is not a conflict
+	return nil
 }
 
 func (fs *FilesystemEngine) validateBucketName(name string) error {

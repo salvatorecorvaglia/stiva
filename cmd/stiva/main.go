@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,7 +20,7 @@ import (
 )
 
 var (
-	version = "1.0.0"
+	version = "1.1.0"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -91,14 +92,26 @@ func run() error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	<-sigCh
-	slog.Info("Shutdown signal received")
+	// A server that dies on its own is as much a reason to stop as a signal.
+	// It used to be logged and ignored, leaving the process running (and
+	// looking healthy to a supervisor) with one of its two servers gone.
+	var serveErr error
+	select {
+	case <-sigCh:
+		slog.Info("Shutdown signal received")
+	case serveErr = <-srv.Errors():
+		slog.Error("Server failed, shutting down", "error", serveErr)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
-		return fmt.Errorf("shutdown error: %w", err)
+	shutdownErr := srv.Shutdown(ctx)
+	if serveErr != nil {
+		return errors.Join(serveErr, shutdownErr)
+	}
+	if shutdownErr != nil {
+		return fmt.Errorf("shutdown error: %w", shutdownErr)
 	}
 
 	slog.Info("[Server] Stiva stopped")

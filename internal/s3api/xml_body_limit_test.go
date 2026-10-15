@@ -58,7 +58,7 @@ func TestSSECValidationErrorsUseSpecificCodes(t *testing.T) {
 // TestPutBucketVersioningRejectsOversizedBody guards against unbounded
 // xml.Decoder allocation. Several subresource PUT handlers used to decode
 // r.Body directly with no size limit; a request whose payload hash is
-// UNSIGNED-PAYLOAD (or any mode auth.HashPayload doesn't size-check) could
+// UNSIGNED-PAYLOAD (or any mode the SigV4 layer doesn't size-check) could
 // send an arbitrarily large body and force the decoder to keep allocating.
 // This sends a body padded well past the configured limit and asserts the
 // handler rejects it as malformed (truncated) rather than decoding the whole

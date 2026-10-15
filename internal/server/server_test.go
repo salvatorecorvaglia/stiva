@@ -171,3 +171,59 @@ func TestServerStartPortConflict(t *testing.T) {
 		t.Error("Expected error when starting server with conflicting port, got nil")
 	}
 }
+
+// TestServeErrorIsReported is the regression test for a listener failing
+// after startup being logged and otherwise ignored: the process kept running
+// with one of its two servers dead. The error now reaches Errors(), which
+// main selects on alongside the shutdown signal.
+func TestServeErrorIsReported(t *testing.T) {
+	cfg := &config.Config{
+		AccessKey: "testkey", SecretKey: "testsecret", DataDir: t.TempDir(),
+		S3Port: 0, ConsolePort: 0, Region: "us-east-1",
+	}
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Kill the S3 listener out from under its server.
+	srv.s3Listener.Close()
+
+	select {
+	case err := <-srv.Errors():
+		if err == nil {
+			t.Fatal("Errors() delivered a nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a dead listener was never reported on Errors()")
+	}
+}
+
+// TestShutdownStopsCleanupWorker: Shutdown must not return while the
+// background cleanup worker can still be using the engine it is about to
+// close.
+func TestShutdownStopsCleanupWorker(t *testing.T) {
+	cfg := &config.Config{
+		AccessKey: "testkey", SecretKey: "testsecret", DataDir: t.TempDir(),
+		S3Port: 0, ConsolePort: 0, Region: "us-east-1",
+	}
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-srv.cleanupDone:
+	default:
+		t.Fatal("Shutdown returned while the cleanup worker was still running")
+	}
+}

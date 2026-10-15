@@ -14,7 +14,7 @@ const maxDeleteObjectsPerRequest = 1000
 
 // maxXMLRequestBody bounds the XML body accepted by subresource/config PUT
 // endpoints and batch delete, so a client that skips real payload signing
-// (UNSIGNED-PAYLOAD, or any body-size mode not covered by auth.HashPayload's
+// (UNSIGNED-PAYLOAD, or any body-size mode not covered by the SigV4 layer's
 // checks) cannot force unbounded xml.Decoder allocation.
 const maxXMLRequestBody = 2 << 20 // 2MB
 

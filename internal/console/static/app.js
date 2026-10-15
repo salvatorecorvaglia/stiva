@@ -5,6 +5,11 @@
 (function () {
     'use strict';
 
+    const {
+        apiErrorMessage, escapeHtml, formatSize, objectKeyFor, partSizeFor,
+        previewKind, retryDelay, validateFolderName,
+    } = window.StivaLib;
+
     // ---- State ----
     let token = localStorage.getItem('stiva_token') || '';
     let currentBucket = '';
@@ -56,6 +61,10 @@
     const uploadProgress = $('#upload-progress');
     const uploadProgressFill = $('#upload-progress-fill');
     const uploadPercent = $('#upload-percent');
+    const uploadFileName = $('#upload-file-name');
+    const uploadCancelBtn = $('#upload-cancel-btn');
+    const uploadFolderBtn = $('#upload-folder-btn');
+    const folderInput = $('#folder-input');
 
     const searchInput = $('#search-input');
     const paginationContainer = $('#pagination-container');
@@ -93,11 +102,21 @@
         }
 
         const resp = await fetch(path, opts);
-        if (resp.status === 401) {
+        // A 401 from /api/login means wrong credentials, not an expired
+        // session. Treating it as expiry threw here, and the login form then
+        // reported "Connection failed. Is the server running?" for a typo'd
+        // password.
+        if (resp.status === 401 && path !== '/api/login') {
             logout();
             throw new Error('Session expired');
         }
         return resp;
+    }
+
+    // errorFrom reads the server's explanation out of a failed response.
+    async function errorFrom(resp, fallback) {
+        const text = await resp.text().catch(() => '');
+        return apiErrorMessage(resp.status, text, fallback);
     }
 
     // Wraps the try/await/if-ok/else-toast pattern repeated across nearly
@@ -186,6 +205,18 @@
         bucketPublicToggle.addEventListener('change', async () => {
             if (!currentBucket) return;
             const publicVal = bucketPublicToggle.checked;
+            // Opening a bucket to anonymous reads is the one irreversible-in-
+            // effect setting here (anything read meanwhile is out), so it is
+            // confirmed rather than applied on a single click.
+            if (publicVal) {
+                const ok = await confirmPremium(
+                    `Make "${currentBucket}" public? Anyone who knows or guesses an object's URL will be able to download it without credentials.`,
+                    { title: 'Make Bucket Public', confirmLabel: 'Make Public', warning: 'Objects in this bucket will be readable by anyone.' });
+                if (!ok) {
+                    bucketPublicToggle.checked = false;
+                    return;
+                }
+            }
             await apiAction('POST', `/api/buckets/${currentBucket}/public?public=${publicVal}`, {
                 successMsg: 'Bucket public access updated',
                 errorMsg: 'Failed to update public access',
@@ -255,6 +286,7 @@
 
         try {
             const resp = await api('GET', '/api/buckets');
+            if (!resp.ok) throw new Error(await errorFrom(resp, 'Failed to load buckets'));
             const buckets = await resp.json();
 
             bucketsGrid.innerHTML = '';
@@ -271,7 +303,7 @@
         } catch (err) {
             bucketsGrid.innerHTML = '';
             bucketCount.textContent = 'Failed to load buckets';
-            showToast('Failed to load buckets', 'error');
+            showToast(err.message || 'Failed to load buckets', 'error');
         }
     }
 
@@ -295,7 +327,7 @@
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
             </div>
-            <div class="bucket-card-name">${escapeHtml(bucket.name)}</div>
+            <div class="bucket-card-name">${escapeHtml(bucket.name)}${bucket.isPublic ? ' <span class="public-badge">Public</span>' : ''}</div>
             <div class="bucket-card-meta">
                 <span>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
@@ -337,12 +369,12 @@
             <div class="bucket-card-header">
                 <div class="skeleton skeleton-icon"></div>
             </div>
-            <div class="bucket-card-name" style="margin-top: 1rem;">
+            <div class="bucket-card-name skeleton-gap-lg">
                 <div class="skeleton skeleton-title"></div>
             </div>
-            <div class="bucket-card-meta" style="margin-top: 0.5rem; display: flex; gap: 1.5rem;">
-                <div class="skeleton skeleton-meta" style="width: 80px;"></div>
-                <div class="skeleton skeleton-meta" style="width: 70px;"></div>
+            <div class="bucket-card-meta skeleton-gap-sm">
+                <div class="skeleton skeleton-meta skeleton-w-80"></div>
+                <div class="skeleton skeleton-meta skeleton-w-70"></div>
             </div>
         `;
         return card;
@@ -438,6 +470,7 @@
             }
 
             const resp = await api('GET', `/api/buckets/${currentBucket}/objects?${params}`);
+            if (!resp.ok) throw new Error(await errorFrom(resp, 'Failed to load objects'));
             const data = await resp.json();
             // Hide the folder placeholder: it used to appear as a stray file
             // inside every folder created from the console.
@@ -465,7 +498,7 @@
                 objectsTbody.innerHTML = '';
                 objectsTableContainer.style.display = 'none';
                 objectsEmpty.style.display = 'block';
-                showToast('Failed to load objects', 'error');
+                showToast(err.message || 'Failed to load objects', 'error');
             }
         }
     }
@@ -597,8 +630,19 @@
                 </td>
                 <td>—</td>
                 <td>—</td>
-                <td></td>
+                <td>
+                    <div class="file-actions">
+                        <button class="btn-icon btn-danger delete-folder-btn" title="Delete folder" aria-label="Delete folder ${escapeHtml(displayName)}">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                        </button>
+                    </div>
+                </td>
             `;
+
+            // Folders could not be deleted from the console at all.
+            tr.querySelector('.delete-folder-btn').addEventListener('click', () => {
+                deleteFolder(item.key, displayName);
+            });
 
             tr.querySelector('.folder-link').addEventListener('click', () => {
                 currentPrefix = item.key;
@@ -695,11 +739,11 @@
             <td>
                 <div class="file-name">
                     <div class="skeleton skeleton-file-icon"></div>
-                    <div class="skeleton skeleton-text" style="width: 140px; height: 1.2rem;"></div>
+                    <div class="skeleton skeleton-text skeleton-w-140 skeleton-tall"></div>
                 </div>
             </td>
-            <td><div class="skeleton skeleton-text" style="width: 60px;"></div></td>
-            <td><div class="skeleton skeleton-text" style="width: 120px;"></div></td>
+            <td><div class="skeleton skeleton-text skeleton-w-60"></div></td>
+            <td><div class="skeleton skeleton-text skeleton-w-120"></div></td>
             <td></td>
         `;
         return tr;
@@ -773,13 +817,23 @@
     // ---- File Upload ----
 
     uploadBtn.addEventListener('click', () => fileInput.click());
+    uploadFolderBtn.addEventListener('click', () => folderInput.click());
 
-    fileInput.addEventListener('change', (e) => {
-        if (e.target.files.length > 0) {
-            uploadFiles(Array.from(e.target.files));
-            fileInput.value = '';
-        }
-    });
+    // Each file with its path relative to what was chosen: just its name for
+    // a single file, "folder/sub/name" for a file inside a chosen folder.
+    const filesFromInput = (input) => Array.from(input.files).map((file) => ({
+        file,
+        relPath: file.webkitRelativePath || file.name,
+    }));
+
+    for (const input of [fileInput, folderInput]) {
+        input.addEventListener('change', () => {
+            if (input.files.length > 0) {
+                uploadFiles(filesFromInput(input));
+                input.value = '';
+            }
+        });
+    }
 
     // Drag and drop
     const objectsViewEl = objectsView;
@@ -800,226 +854,354 @@
         e.preventDefault();
         dropZone.style.display = 'none';
         objectsTableContainer.classList.remove('drag-over');
-        if (e.dataTransfer.files.length > 0) {
-            uploadFiles(Array.from(e.dataTransfer.files));
+
+        // Dropped folders used to upload nothing, or flatten to bare file
+        // names. Walk them through the entries API to keep their structure.
+        // The entries must be taken synchronously, inside the event.
+        const items = e.dataTransfer.items;
+        const entries = items ? Array.from(items).map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean) : [];
+        if (entries.length > 0) {
+            collectEntries(entries)
+                .then((list) => { if (list.length > 0) uploadFiles(list); })
+                .catch((err) => showToast(`Could not read the dropped items: ${err.message}`, 'error'));
+        } else if (e.dataTransfer.files.length > 0) {
+            uploadFiles(Array.from(e.dataTransfer.files).map((file) => ({ file, relPath: file.name })));
         }
     });
 
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
-    const MULTIPART_THRESHOLD = 10 * 1024 * 1024; // 10MB
-
-    async function uploadFiles(files) {
-        for (let i = 0; i < files.length; i++) {
-            const file = files[i];
-            const key = currentPrefix + file.name;
-
-            uploadProgress.style.display = 'block';
-            uploadPercent.textContent = `0% (1/${files.length})`;
-
-            try {
-                if (file.size >= MULTIPART_THRESHOLD) {
-                    await uploadLargeFile(file, key, i + 1, files.length);
-                } else {
-                    await uploadSmallFile(file, key, i + 1, files.length);
+    // collectEntries flattens dropped files and folders into {file, relPath}.
+    async function collectEntries(entries) {
+        const out = [];
+        async function walk(entry, path) {
+            if (entry.isFile) {
+                const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+                out.push({ file, relPath: path + file.name });
+            } else if (entry.isDirectory) {
+                const reader = entry.createReader();
+                // readEntries returns a directory in batches; read until empty.
+                for (;;) {
+                    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+                    if (batch.length === 0) break;
+                    for (const child of batch) {
+                        await walk(child, path + entry.name + '/');
+                    }
                 }
-                showToast(`"${file.name}" uploaded successfully`, 'success');
-            } catch (err) {
-                showToast(`Failed to upload "${file.name}": ${err.message}`, 'error');
             }
         }
-
-        uploadProgress.style.display = 'none';
-        uploadProgressFill.style.width = '0%';
-        resetPagination();
-        loadObjects();
+        for (const entry of entries) {
+            await walk(entry, '');
+        }
+        return out;
     }
 
-    async function uploadSmallFile(file, key, index, total) {
-        const formData = new FormData();
-        formData.append('file', file);
+    const MULTIPART_THRESHOLD = 10 * 1024 * 1024; // 10MB
+    const PART_ATTEMPTS = 3;
+    const PART_CONCURRENCY = 3;
 
-        await new Promise((resolve, reject) => {
+    // The upload in progress, if any: whether it was cancelled, and its
+    // in-flight requests so Cancel can abort them.
+    let activeUpload = null;
+
+    class UploadCancelled extends Error {}
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    uploadCancelBtn.addEventListener('click', () => {
+        if (!activeUpload) return;
+        activeUpload.cancelled = true;
+        activeUpload.xhrs.forEach((xhr) => xhr.abort());
+    });
+
+    function setUploadProgress(pct, index, total, name) {
+        uploadProgressFill.style.width = pct + '%';
+        uploadPercent.textContent = `${pct}% (${index}/${total})`;
+        uploadFileName.textContent = name;
+    }
+
+    async function uploadFiles(items) {
+        if (activeUpload) {
+            showToast('Another upload is still in progress', 'info');
+            return;
+        }
+        const upload = { cancelled: false, xhrs: new Set() };
+        activeUpload = upload;
+        uploadProgress.style.display = 'block';
+
+        let uploaded = 0;
+        try {
+            for (let i = 0; i < items.length && !upload.cancelled; i++) {
+                const { file, relPath } = items[i];
+                const key = objectKeyFor(currentPrefix, relPath);
+                setUploadProgress(0, i + 1, items.length, relPath);
+                try {
+                    if (file.size >= MULTIPART_THRESHOLD) {
+                        await uploadLargeFile(upload, file, key, i + 1, items.length, relPath);
+                    } else {
+                        await uploadSmallFile(upload, file, key, i + 1, items.length, relPath);
+                    }
+                    uploaded++;
+                } catch (err) {
+                    if (err instanceof UploadCancelled || upload.cancelled) break;
+                    showToast(`Failed to upload "${relPath}": ${err.message}`, 'error');
+                }
+            }
+        } finally {
+            activeUpload = null;
+            uploadProgress.style.display = 'none';
+            uploadProgressFill.style.width = '0%';
+            // One summary rather than a toast per file, which a folder of
+            // hundreds of files turned into an unreadable stack.
+            if (upload.cancelled) {
+                showToast(`Upload cancelled (${uploaded} of ${items.length} file${items.length !== 1 ? 's' : ''} uploaded)`, 'info');
+            } else if (uploaded > 0) {
+                showToast(items.length === 1
+                    ? `"${items[0].relPath}" uploaded successfully`
+                    : `${uploaded} of ${items.length} files uploaded`, uploaded === items.length ? 'success' : 'info');
+            }
+            resetPagination();
+            loadObjects();
+        }
+    }
+
+    // sendForm POSTs multipart form data as part of an upload, reporting
+    // progress, and rejects with the server's own error message (the status
+    // is attached, for deciding whether a retry can help) or UploadCancelled.
+    function sendForm(upload, url, formData, onProgress) {
+        return new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
-            // The key travels in the query string: the server streams the
-            // multipart body straight to storage and so cannot rely on a form
-            // field that arrives after the file part.
-            xhr.open('POST', `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(key)}`);
+            upload.xhrs.add(xhr);
+            xhr.open('POST', url);
             xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-
             xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    const pct = Math.round((e.loaded / e.total) * 100);
-                    uploadProgressFill.style.width = pct + '%';
-                    uploadPercent.textContent = `${pct}% (${index}/${total})`;
-                }
+                if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
             };
-
+            const fail = (status, text) => {
+                const err = new Error(apiErrorMessage(status, text, 'Upload failed'));
+                err.status = status;
+                reject(err);
+            };
             xhr.onload = () => {
+                upload.xhrs.delete(xhr);
                 if (xhr.status >= 200 && xhr.status < 300) {
-                    resolve();
+                    resolve(xhr.responseText);
+                } else if (xhr.status === 401) {
+                    logout();
+                    fail(401, '{"error":"Session expired"}');
                 } else {
-                    reject(new Error('Upload failed'));
+                    fail(xhr.status, xhr.responseText);
                 }
             };
-
-            xhr.onerror = () => reject(new Error('Upload failed'));
+            xhr.onerror = () => {
+                upload.xhrs.delete(xhr);
+                fail(0, '');
+            };
+            xhr.onabort = () => {
+                upload.xhrs.delete(xhr);
+                reject(new UploadCancelled('Upload cancelled'));
+            };
             xhr.send(formData);
         });
     }
 
-    async function uploadLargeFile(file, key, index, total) {
+    async function uploadSmallFile(upload, file, key, index, total, name) {
+        const formData = new FormData();
+        formData.append('file', file);
+        // The key travels in the query string: the server streams the
+        // multipart body straight to storage and so cannot rely on a form
+        // field that arrives after the file part.
+        await sendForm(upload, `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(key)}`, formData,
+            (loaded, size) => setUploadProgress(Math.round((loaded / size) * 100), index, total, name));
+    }
+
+    async function uploadLargeFile(upload, file, key, index, total, name) {
+        const partSize = partSizeFor(file.size);
+        if (!partSize) {
+            throw new Error('This file is larger than S3 allows (10,000 parts of 5 GiB)');
+        }
+
         const initResp = await api('POST', `/api/buckets/${currentBucket}/multipart/initiate`, {
             key,
             contentType: file.type || 'application/octet-stream'
         });
         if (!initResp.ok) {
-            const data = await initResp.json();
-            throw new Error(data.error || 'Failed to initiate multipart upload');
+            throw new Error(await errorFrom(initResp, 'Failed to start the upload'));
         }
         const { uploadId } = await initResp.json();
 
-        const numChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const numParts = Math.ceil(file.size / partSize);
+        const partProgress = new Array(numParts + 1).fill(0);
         const results = [];
-        const activeUploads = new Map();
-        const chunkProgress = new Array(numChunks + 1).fill(0);
-
         const updateProgress = () => {
-            const totalUploaded = chunkProgress.reduce((sum, val) => sum + val, 0);
-            const pct = Math.min(Math.round((totalUploaded / file.size) * 100), 99);
-            uploadProgressFill.style.width = pct + '%';
-            uploadPercent.textContent = `${pct}% (${index}/${total})`;
+            const sent = partProgress.reduce((sum, val) => sum + val, 0);
+            setUploadProgress(Math.min(Math.round((sent / file.size) * 100), 99), index, total, name);
         };
 
-        const uploadChunk = async (partNum) => {
-            const start = (partNum - 1) * CHUNK_SIZE;
-            const end = Math.min(start + CHUNK_SIZE, file.size);
-            const blob = file.slice(start, end);
-            const chunkSize = end - start;
+        // A part is retried with backoff when the failure is one a retry can
+        // fix (network error, server error, timeout, rate limit). One dropped
+        // request used to abort the whole upload.
+        const uploadPart = async (partNum) => {
+            const start = (partNum - 1) * partSize;
+            const end = Math.min(start + partSize, file.size);
+            for (let attempt = 0; ; attempt++) {
+                if (upload.cancelled) throw new UploadCancelled('Upload cancelled');
 
-            const formData = new FormData();
-            formData.append('uploadId', uploadId);
-            formData.append('key', key);
-            formData.append('partNumber', partNum.toString());
-            formData.append('file', blob);
+                const formData = new FormData();
+                formData.append('uploadId', uploadId);
+                formData.append('key', key);
+                formData.append('partNumber', partNum.toString());
+                formData.append('file', file.slice(start, end));
 
-            return new Promise((resolve, reject) => {
-                const xhr = new XMLHttpRequest();
-                activeUploads.set(partNum, xhr);
-
-                xhr.open('POST', `/api/buckets/${currentBucket}/multipart/upload-part`);
-                xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-
-                xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) {
-                        chunkProgress[partNum] = e.loaded;
-                        updateProgress();
+                try {
+                    const text = await sendForm(upload, `/api/buckets/${currentBucket}/multipart/upload-part`, formData,
+                        (loaded) => { partProgress[partNum] = loaded; updateProgress(); });
+                    partProgress[partNum] = end - start;
+                    updateProgress();
+                    return JSON.parse(text);
+                } catch (err) {
+                    if (err instanceof UploadCancelled) throw err;
+                    const retryable = !err.status || err.status >= 500 || err.status === 408 || err.status === 429;
+                    if (!retryable || attempt + 1 >= PART_ATTEMPTS) {
+                        throw new Error(`Part ${partNum} of ${numParts}: ${err.message}`);
                     }
-                };
-
-                xhr.onload = () => {
-                    activeUploads.delete(partNum);
-                    if (xhr.status >= 200 && xhr.status < 300) {
-                        try {
-                            const res = JSON.parse(xhr.responseText);
-                            chunkProgress[partNum] = chunkSize;
-                            updateProgress();
-                            resolve(res);
-                        } catch (e) {
-                            reject(new Error(`Part ${partNum} response parse error`));
-                        }
-                    } else {
-                        reject(new Error(`Part ${partNum} failed with status ${xhr.status}`));
-                    }
-                };
-
-                xhr.onerror = () => {
-                    activeUploads.delete(partNum);
-                    reject(new Error(`Network error on part ${partNum}`));
-                };
-
-                xhr.send(formData);
-            });
+                    partProgress[partNum] = 0;
+                    updateProgress();
+                    await sleep(retryDelay(attempt));
+                }
+            }
         };
 
-        const chunkIndices = Array.from({ length: numChunks }, (_, i) => i + 1);
-        
+        const queue = Array.from({ length: numParts }, (_, i) => i + 1);
         try {
-            const uploadQueue = async () => {
-                while (chunkIndices.length > 0) {
-                    const partNum = chunkIndices.shift();
-                    const partResult = await uploadChunk(partNum);
-                    results.push(partResult);
+            const worker = async () => {
+                while (queue.length > 0) {
+                    results.push(await uploadPart(queue.shift()));
                 }
             };
-
-            const workers = Array.from({ length: Math.min(3, numChunks) }, () => uploadQueue());
-            await Promise.all(workers);
+            await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, numParts) }, worker));
 
             results.sort((a, b) => a.partNumber - b.partNumber);
-
             const completeResp = await api('POST', `/api/buckets/${currentBucket}/multipart/complete`, {
                 uploadId,
                 key,
                 parts: results.map(p => ({ partNumber: p.partNumber, etag: p.etag }))
             });
-
             if (!completeResp.ok) {
-                const data = await completeResp.json();
-                throw new Error(data.error || 'Failed to complete multipart upload');
+                throw new Error(await errorFrom(completeResp, 'Failed to complete the upload'));
             }
-
-            uploadProgressFill.style.width = '100%';
-            uploadPercent.textContent = `100% (${index}/${total})`;
+            setUploadProgress(100, index, total, name);
         } catch (err) {
-            activeUploads.forEach(xhr => xhr.abort());
-            
-            await api('POST', `/api/buckets/${currentBucket}/multipart/abort`, {
-                uploadId,
-                key
-            }).catch(() => {});
-            
+            // Stop the other workers and discard the parts already stored.
+            queue.length = 0;
+            upload.xhrs.forEach(xhr => xhr.abort());
+            await api('POST', `/api/buckets/${currentBucket}/multipart/abort`, { uploadId, key }).catch(() => {});
             throw err;
         }
     }
 
-    // Fetches through the console's own /objects/download endpoint (same
-    // origin, authenticated with the session token) rather than a presigned
-    // S3-API URL. The presigned URL points at a different port by default,
-    // and browsers ignore the <a download> attribute for cross-origin URLs —
-    // the file would just navigate/render inline instead of downloading. The
-    // console endpoint also always sets Content-Disposition: attachment.
+    // Downloads go through a short-lived, single-use link on the console's
+    // own origin, which the browser then downloads natively. The object used
+    // to be fetched whole into memory and saved from a blob, which failed on
+    // large files; and a presigned S3-API URL is on another port, where
+    // browsers ignore <a download>.
     async function downloadObject(key) {
         try {
-            const resp = await api('GET', `/api/buckets/${currentBucket}/objects/download?key=${encodeURIComponent(key)}`);
+            const resp = await api('POST', `/api/buckets/${currentBucket}/objects/download-link`, { key });
             if (!resp.ok) {
-                throw new Error('Failed to download file');
+                throw new Error(await errorFrom(resp, 'Download failed'));
             }
-            const blob = await resp.blob();
-            const blobURL = URL.createObjectURL(blob);
-
+            const { url } = await resp.json();
             const a = document.createElement('a');
-            a.href = blobURL;
+            a.href = url;
             a.download = key.split('/').pop();
             document.body.appendChild(a);
             a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(blobURL);
+            a.remove();
         } catch (err) {
             showToast('Failed to download: ' + err.message, 'error');
         }
+    }
+
+    // ---- Bulk delete ----
+
+    const BATCH_DELETE_SIZE = 1000;
+
+    // listAllKeys returns every object key under prefix, across pages.
+    async function listAllKeys(prefix) {
+        const keys = [];
+        let continuation = '';
+        for (;;) {
+            const params = new URLSearchParams({ prefix, recursive: '1', maxKeys: String(BATCH_DELETE_SIZE) });
+            if (continuation) params.set('continuationToken', continuation);
+            const resp = await api('GET', `/api/buckets/${currentBucket}/objects?${params}`);
+            if (!resp.ok) throw new Error(await errorFrom(resp, 'Failed to list the folder'));
+            const data = await resp.json();
+            keys.push(...data.items.filter((item) => !item.isPrefix).map((item) => item.key));
+            if (!data.isTruncated) return keys;
+            continuation = data.nextContinuationToken;
+        }
+    }
+
+    // deleteKeys deletes keys in batches, one request per 1,000 keys — the
+    // console used to send one DELETE per object — and reports the outcome.
+    async function deleteKeys(keys) {
+        let deleted = 0;
+        const failures = [];
+        for (let i = 0; i < keys.length; i += BATCH_DELETE_SIZE) {
+            const resp = await api('POST', `/api/buckets/${currentBucket}/objects/delete`, {
+                keys: keys.slice(i, i + BATCH_DELETE_SIZE),
+            });
+            if (!resp.ok) throw new Error(await errorFrom(resp, 'Delete failed'));
+            const data = await resp.json();
+            deleted += data.deleted.length;
+            failures.push(...data.errors);
+        }
+        return { deleted, failures };
+    }
+
+    function reportDeletion({ deleted, failures }) {
+        if (deleted > 0) showToast(`Deleted ${deleted} object${deleted !== 1 ? 's' : ''}`, 'success');
+        if (failures.length > 0) {
+            showToast(`Failed to delete ${failures.length} object${failures.length !== 1 ? 's' : ''}: ${failures[0].error}`, 'error');
+        }
+    }
+
+    async function deleteFolder(prefix, name) {
+        let keys;
+        try {
+            keys = await listAllKeys(prefix);
+        } catch (err) {
+            showToast(err.message, 'error');
+            return;
+        }
+        const ok = await confirmPremium(
+            `Delete the folder "${name}" and the ${keys.length} object${keys.length !== 1 ? 's' : ''} in it?`);
+        if (!ok) return;
+        try {
+            reportDeletion(await deleteKeys(keys));
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+        loadObjects();
     }
 
     // ---- Create Folder ----
 
     createFolderBtn.addEventListener('click', () => {
         openModal('create-folder-modal');
+        $('#new-folder-error').style.display = 'none';
         $('#new-folder-name').value = '';
         $('#new-folder-name').focus();
     });
 
     $('#confirm-create-folder').addEventListener('click', async () => {
         const name = $('#new-folder-name').value.trim();
-        if (!name) return;
+        // Names were not checked at all, so "a/b" or ".." produced keys that
+        // did not match the folder the user asked for.
+        const problem = validateFolderName(name);
+        const folderError = $('#new-folder-error');
+        folderError.textContent = problem;
+        folderError.style.display = problem ? 'block' : 'none';
+        if (problem) return;
 
         const key = currentPrefix + name + '/';
 
@@ -1159,33 +1341,6 @@
             .catch(() => showToast('Failed to copy link', 'error'));
     });
 
-    // Maps a stored Content-Type to the preview kind. Falls back to the file
-    // extension, which used to be the only signal — so an image saved without
-    // an extension, or a .txt holding JSON, was previewed by its name rather
-    // than by what the server actually recorded.
-    function previewKind(contentType, filename) {
-        const ct = (contentType || '').split(';')[0].trim().toLowerCase();
-        if (ct && ct !== 'application/octet-stream') {
-            if (ct.startsWith('image/')) return 'image';
-            if (ct.startsWith('video/')) return 'video';
-            if (ct.startsWith('audio/')) return 'audio';
-            if (ct === 'application/pdf') return 'pdf';
-            if (ct.startsWith('text/')) return 'text';
-            if (['application/json', 'application/xml', 'application/javascript',
-                 'application/x-javascript', 'application/yaml', 'application/x-yaml',
-                 'application/x-sh'].includes(ct)) return 'text';
-        }
-
-        const ext = '.' + filename.split('.').pop().toLowerCase();
-        if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico'].includes(ext)) return 'image';
-        if (['.mp4', '.webm', '.ogg', '.mov'].includes(ext)) return 'video';
-        if (['.mp3', '.wav', '.m4a', '.aac'].includes(ext)) return 'audio';
-        if (ext === '.pdf') return 'pdf';
-        if (['.txt', '.json', '.js', '.ts', '.go', '.html', '.css', '.md', '.log', '.env',
-             '.yml', '.yaml', '.xml', '.ini', '.conf', '.sh', '.py'].includes(ext)) return 'text';
-        return 'none';
-    }
-
     async function showPreview(key, size, contentType) {
         const filename = key.split('/').pop();
         previewTitle.textContent = `Preview: ${filename}`;
@@ -1194,9 +1349,9 @@
         const maxPreviewSize = 10 * 1024 * 1024; // 10MB
         if (size > maxPreviewSize) {
             previewContentContainer.innerHTML = `
-                <div style="padding: 3rem 1.5rem; text-align: center; background: rgba(255, 255, 255, 0.02); border-radius: 6px; border: 1px solid var(--border); width: 100%;">
-                    <div style="font-size: 3rem; margin-bottom: 1rem; opacity: 0.5;">⚠️</div>
-                    <p style="margin-bottom: 1.5rem; color: var(--text-secondary);">This file is too large to preview (${formatSize(size)}). Preview limit is 10 MB.</p>
+                <div class="preview-notice">
+                    <div class="preview-notice-icon">⚠️</div>
+                    <p class="preview-notice-text">This file is too large to preview (${formatSize(size)}). Preview limit is 10 MB.</p>
                     <button id="preview-download-btn" class="btn btn-primary">Download File</button>
                 </div>
             `;
@@ -1207,7 +1362,7 @@
             return;
         }
 
-        previewContentContainer.innerHTML = '<div style="color: var(--text-secondary); padding: 2rem;">Loading preview...</div>';
+        previewContentContainer.innerHTML = '<div class="preview-status">Loading preview...</div>';
         openModal('preview-modal');
 
         try {
@@ -1232,17 +1387,17 @@
             const ext = '.' + filename.split('.').pop().toLowerCase();
 
             if (kind === 'image') {
-                previewContentContainer.innerHTML = `<img src="${blobURL}" style="max-width: 100%; max-height: 60vh; object-fit: contain; border-radius: 6px; border: 1px solid var(--border);">`;
+                previewContentContainer.innerHTML = `<img src="${blobURL}" class="preview-media" alt="">`;
             } else if (kind === 'video') {
-                previewContentContainer.innerHTML = `<video src="${blobURL}" controls autoplay style="max-width: 100%; max-height: 60vh; border-radius: 6px; border: 1px solid var(--border);"></video>`;
+                previewContentContainer.innerHTML = `<video src="${blobURL}" class="preview-media" controls autoplay></video>`;
             } else if (kind === 'audio') {
                 previewContentContainer.innerHTML = `
-                    <div style="padding: 2rem; width: 100%; display: flex; justify-content: center; background: rgba(255, 255, 255, 0.03); border-radius: 6px; border: 1px solid var(--border);">
-                        <audio src="${blobURL}" controls autoplay style="width: 100%; max-width: 400px;"></audio>
+                    <div class="preview-audio-wrap">
+                        <audio src="${blobURL}" class="preview-audio" controls autoplay></audio>
                     </div>
                 `;
             } else if (kind === 'pdf') {
-                previewContentContainer.innerHTML = `<iframe src="${blobURL}" sandbox="allow-scripts" style="width: 100%; height: 60vh; border: none; border-radius: 6px; background: white;"></iframe>`;
+                previewContentContainer.innerHTML = `<iframe src="${blobURL}" class="preview-frame" sandbox="allow-scripts" title="PDF preview"></iframe>`;
             } else if (kind === 'text') {
                 const isTruncated = size > 256 * 1024;
                 let text = await blob.slice(0, 256 * 1024).text();
@@ -1251,13 +1406,13 @@
                     escapedText += '\n\n--- [TRUNCATED] File is larger than 256 KB. Showing the first 256 KB. ---';
                 }
                 previewContentContainer.innerHTML = `
-                    <pre style="width: 100%; text-align: left; padding: 1.25rem; background: var(--input-bg); border-radius: 6px; overflow: auto; max-height: 60vh; font-family: monospace; white-space: pre-wrap; font-size: 0.875rem; border: 1px solid var(--border); margin: 0; color: var(--text);">${escapedText}</pre>
+                    <pre class="preview-text">${escapedText}</pre>
                 `;
             } else {
                 previewContentContainer.innerHTML = `
-                    <div style="padding: 3rem 1.5rem; text-align: center; background: rgba(255, 255, 255, 0.02); border-radius: 6px; border: 1px solid var(--border); width: 100%;">
-                        <div style="font-size: 3rem; margin-bottom: 1rem; opacity: 0.5;">📄</div>
-                        <p style="margin-bottom: 1.5rem; color: var(--text-secondary);">No preview available for this file type (${ext}).</p>
+                    <div class="preview-notice">
+                        <div class="preview-notice-icon">📄</div>
+                        <p class="preview-notice-text">No preview available for this file type (${ext}).</p>
                         <button id="preview-download-btn" class="btn btn-primary">Download File</button>
                     </div>
                 `;
@@ -1266,7 +1421,7 @@
                 });
             }
         } catch (err) {
-            previewContentContainer.innerHTML = `<div style="color: var(--danger); padding: 2rem;">Error loading preview: ${escapeHtml(err.message)}</div>`;
+            previewContentContainer.innerHTML = `<div class="preview-status preview-status-error">Error loading preview: ${escapeHtml(err.message)}</div>`;
         }
     }
 
@@ -1396,29 +1551,11 @@
             const originalHTML = batchDeleteBtn.innerHTML;
             batchDeleteBtn.textContent = 'Deleting...';
 
-            const results = [];
             try {
-                const batchSize = 5;
-                for (let i = 0; i < keys.length; i += batchSize) {
-                    const chunk = keys.slice(i, i + batchSize);
-                    const chunkPromises = chunk.map(key =>
-                        api('DELETE', `/api/buckets/${currentBucket}/objects?key=${encodeURIComponent(key)}`)
-                    );
-                    const chunkResults = await Promise.all(chunkPromises);
-                    results.push(...chunkResults);
-                }
-                const succeeded = results.filter(r => r.ok).length;
-                const failed = results.length - succeeded;
-
-                if (succeeded > 0) {
-                    showToast(`Successfully deleted ${succeeded} object(s)`, 'success');
-                }
-                if (failed > 0) {
-                    showToast(`Failed to delete ${failed} object(s)`, 'error');
-                }
+                reportDeletion(await deleteKeys(keys));
                 loadObjects();
             } catch (err) {
-                showToast('An error occurred during batch deletion', 'error');
+                showToast(err.message, 'error');
                 loadObjects();
             } finally {
                 batchDeleteBtn.disabled = false;
@@ -1429,13 +1566,22 @@
 
     // ---- Utilities ----
 
-    function confirmPremium(message) {
+    // confirmPremium asks for confirmation in the app's dialog. The wording
+    // defaults to deletion, the usual case.
+    function confirmPremium(message, {
+        title = 'Confirm Deletion',
+        confirmLabel = 'Delete',
+        warning = 'Warning: This action is permanent and cannot be undone.',
+    } = {}) {
         return new Promise((resolve) => {
             const modal = document.getElementById('delete-modal');
             const msgEl = document.getElementById('delete-modal-msg');
             const confirmBtn = document.getElementById('confirm-delete-btn');
-            
+
             msgEl.textContent = message;
+            document.getElementById('delete-modal-title').textContent = title;
+            document.getElementById('delete-modal-warning').textContent = warning;
+            confirmBtn.textContent = confirmLabel;
             openModal('delete-modal');
             
             const handleConfirm = () => {
@@ -1469,29 +1615,6 @@
             });
             modal.addEventListener('click', handleOverlayClick);
         });
-    }
-
-    function formatSize(bytes) {
-        if (bytes === 0) return '0 B';
-        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        const size = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
-        return `${size} ${units[i]}`;
-    }
-
-    // Escapes for element text *and* quoted-attribute contexts. The previous
-    // textContent -> innerHTML round-trip relied on the HTML serializer, which
-    // escapes only & < > and leaves quotes intact. Since this value is
-    // interpolated into double-quoted attributes (data-key, aria-label, ...),
-    // an object key containing a double quote could close the attribute early
-    // and append an inline event handler.
-    function escapeHtml(str) {
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
     }
 
     // ---- Init ----

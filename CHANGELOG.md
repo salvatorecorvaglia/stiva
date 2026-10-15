@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-15
+
+### Added
+
+- Configurable incomplete multipart upload expiry through `STIVA_MULTIPART_EXPIRY` (default: seven days; minimum: one hour).
+- Console API origin allowlist through `STIVA_CONSOLE_ALLOWED_ORIGINS` for reverse proxies and local frontend development.
+- Console folder uploads with preserved directory structure, upload cancellation, recursive folder deletion, and batch object deletion.
+- Short-lived, single-use console download links that let browsers stream large files without buffering them in memory.
+- Unauthenticated `/_health` endpoints on both the S3 API and console servers.
+- Verification of upload `Content-MD5` and S3 checksum headers, plus signed and unsigned AWS streaming checksum trailers.
+
+### Changed
+
+- Store new object data in independent blob files, supporting overlapping keys such as `a` and `a/b`, folder markers, and keys differing only in case. Existing objects remain readable in the legacy layout and move to blobs when overwritten.
+- Stream large signed and AWS chunked uploads through integrity verification instead of spooling the entire payload to temporary files.
+- Use file-backed downloads for uncompressed, unencrypted objects to enable sendfile transfers.
+- Run multipart and lifecycle cleanup at startup and hourly, and bound replication and webhook shutdown by the shutdown deadline.
+- Update release workflow runners to Ubuntu 24.04.
+
+### Fixed
+
+- Require SigV4 signatures to cover the Host header and correctly encode spaces in presigned URL query parameters.
+- Invalidate console sessions after access or secret key rotation and isolate session signing state per handler.
+- Correct object and version listing pagination, including delimiter prefixes and deleted version markers.
+- Preserve objects written before versioning was enabled as null versions, handle suspended versioning correctly, and keep replication consistent when deleting versions.
+- Coordinate concurrent bucket creation, object commits, and deletion to prevent missing data and inconsistent metadata.
+- Validate lifecycle filters and reject unsupported conditions instead of expiring more objects than intended.
+- Correct encrypted range seeking, repeated pooled gzip reader closure, and multipart upload metrics after restart.
+- Improve S3 conditional request handling, SSE-C response headers, and propagation of upload integrity and storage errors.
+- Show actionable console upload and download errors and distinguish invalid login credentials from expired sessions.
+- Keep Docker Compose data in the mounted `/data` volume and probe both servers over HTTP or HTTPS for container health.
+- Report listener failures and wait for background cleanup before closing storage during shutdown.
+
 ## [1.0.0] - 2026-09-23
 
 ### Added

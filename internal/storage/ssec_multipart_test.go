@@ -43,7 +43,7 @@ func TestMultipartSSECKeyIsNeverPersisted(t *testing.T) {
 	params := ssecParamsForKey(customerKey)
 	ctx := context.WithValue(context.Background(), SSECContextKey, params)
 
-	up, err := fs.CreateMultipartUpload("secure", "secret.bin", "application/octet-stream")
+	up, err := fs.CreateMultipartUpload(ctx, "secure", "secret.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("create mpu: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestMultipartSSECRoundTrip(t *testing.T) {
 	params := ssecParamsForKey(bytes.Repeat([]byte{0x11}, 32))
 	ctx := context.WithValue(context.Background(), SSECContextKey, params)
 
-	up, err := fs.CreateMultipartUpload("secure", "big.bin", "application/octet-stream")
+	up, err := fs.CreateMultipartUpload(ctx, "secure", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("create mpu: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestMultipartSSECCompleteRequiresKey(t *testing.T) {
 	params := ssecParamsForKey(bytes.Repeat([]byte{0x22}, 32))
 	ctx := context.WithValue(context.Background(), SSECContextKey, params)
 
-	up, err := fs.CreateMultipartUpload("secure", "k.bin", "application/octet-stream")
+	up, err := fs.CreateMultipartUpload(ctx, "secure", "k.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("create mpu: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestCompleteMultipartRejectsDuplicateParts(t *testing.T) {
 		t.Fatalf("create bucket: %v", err)
 	}
 
-	up, err := fs.CreateMultipartUpload("dupes", "d.bin", "application/octet-stream")
+	up, err := fs.CreateMultipartUpload(context.Background(), "dupes", "d.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("create mpu: %v", err)
 	}
@@ -220,4 +220,53 @@ func TestCompleteMultipartRejectsDuplicateParts(t *testing.T) {
 	if !errors.As(err, &s3Err) || s3Err.Code != "InvalidPartOrder" {
 		t.Errorf("expected InvalidPartOrder, got %v", err)
 	}
+}
+
+// TestMultipartSSECModeIsFixedAtCreate is the regression test for an upload's
+// SSE-C mode being decided by whichever part arrived first. Parts sent in
+// parallel could then mix encrypted and plaintext data in one object. The
+// mode is now set by CreateMultipartUpload, as in S3.
+func TestMultipartSSECModeIsFixedAtCreate(t *testing.T) {
+	fs, err := NewFilesystemEngine(t.TempDir(), nil, "")
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	defer fs.Close()
+	if err := fs.CreateBucket("secure"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	sseCtx := context.WithValue(context.Background(), SSECContextKey, ssecParamsForKey(bytes.Repeat([]byte{0x44}, 32)))
+	plainCtx := context.Background()
+	body := strings.Repeat("z", 16)
+
+	assertInvalid := func(t *testing.T, err error) {
+		t.Helper()
+		var s3Err *S3Error
+		if !errors.As(err, &s3Err) || s3Err.Code != "InvalidArgument" {
+			t.Fatalf("err = %v, want InvalidArgument", err)
+		}
+	}
+
+	t.Run("plain upload rejects an encrypted first part", func(t *testing.T) {
+		up, err := fs.CreateMultipartUpload(plainCtx, "secure", "plain.bin", "application/octet-stream")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = fs.UploadPart(sseCtx, "secure", "plain.bin", up.UploadID, 1, strings.NewReader(body), int64(len(body)))
+		assertInvalid(t, err)
+	})
+
+	t.Run("encrypted upload rejects a plaintext first part", func(t *testing.T) {
+		up, err := fs.CreateMultipartUpload(sseCtx, "secure", "enc.bin", "application/octet-stream")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = fs.UploadPart(plainCtx, "secure", "enc.bin", up.UploadID, 1, strings.NewReader(body), int64(len(body)))
+		assertInvalid(t, err)
+
+		if _, err := fs.UploadPart(sseCtx, "secure", "enc.bin", up.UploadID, 1, strings.NewReader(body), int64(len(body))); err != nil {
+			t.Fatalf("part with the declared key: %v", err)
+		}
+	})
 }

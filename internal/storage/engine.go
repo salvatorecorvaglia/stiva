@@ -72,16 +72,41 @@ type LifecycleConfiguration struct {
 }
 
 type LifecycleRule struct {
-	ID                             string                          `json:"id" xml:"ID"`
-	Status                         string                          `json:"status" xml:"Status"` // "Enabled" or "Disabled"
+	ID     string `json:"id" xml:"ID"`
+	Status string `json:"status" xml:"Status"` // "Enabled" or "Disabled"
+	// Prefix is the deprecated rule-level prefix that predates <Filter>. S3
+	// still accepts it and older clients still send it; it used to be dropped
+	// on decode, which widened the rule to the whole bucket.
+	Prefix                         string                          `json:"prefix,omitempty" xml:"Prefix,omitempty"`
 	Filter                         LifecycleFilter                 `json:"filter" xml:"Filter"`
 	Expiration                     *LifecycleExpiration            `json:"expiration,omitempty" xml:"Expiration"`
 	NoncurrentVersionExpiration    *NoncurrentVersionExpiration    `json:"noncurrentVersionExpiration,omitempty" xml:"NoncurrentVersionExpiration"`
 	AbortIncompleteMultipartUpload *AbortIncompleteMultipartUpload `json:"abortIncompleteMultipartUpload,omitempty" xml:"AbortIncompleteMultipartUpload"`
 }
 
+// LifecycleFilter mirrors the S3 <Filter> element. Only prefix matching is
+// evaluated; the other conditions are decoded solely so that a rule using them
+// can be rejected instead of silently applying to every object.
 type LifecycleFilter struct {
-	Prefix string `json:"prefix" xml:"Prefix"`
+	Prefix                string                `json:"prefix" xml:"Prefix"`
+	Tag                   *LifecycleTag         `json:"tag,omitempty" xml:"Tag,omitempty"`
+	And                   *LifecycleAndOperator `json:"and,omitempty" xml:"And,omitempty"`
+	ObjectSizeGreaterThan *int64                `json:"objectSizeGreaterThan,omitempty" xml:"ObjectSizeGreaterThan,omitempty"`
+	ObjectSizeLessThan    *int64                `json:"objectSizeLessThan,omitempty" xml:"ObjectSizeLessThan,omitempty"`
+}
+
+// LifecycleAndOperator mirrors <Filter><And>, which combines several conditions.
+type LifecycleAndOperator struct {
+	Prefix                string         `json:"prefix,omitempty" xml:"Prefix,omitempty"`
+	Tags                  []LifecycleTag `json:"tags,omitempty" xml:"Tag,omitempty"`
+	ObjectSizeGreaterThan *int64         `json:"objectSizeGreaterThan,omitempty" xml:"ObjectSizeGreaterThan,omitempty"`
+	ObjectSizeLessThan    *int64         `json:"objectSizeLessThan,omitempty" xml:"ObjectSizeLessThan,omitempty"`
+}
+
+// LifecycleTag is an object tag condition in a lifecycle filter.
+type LifecycleTag struct {
+	Key   string `json:"key" xml:"Key"`
+	Value string `json:"value" xml:"Value"`
 }
 
 type LifecycleExpiration struct {
@@ -121,6 +146,10 @@ type ObjectInfo struct {
 	SSECustomerAlgorithm string    `json:"sseCustomerAlgorithm,omitempty"`
 	SSECustomerKeyMD5    string    `json:"sseCustomerKeyMD5,omitempty"`
 	Compressed           bool      `json:"compressed,omitempty"`
+	// BlobID names the file holding this version's data (see blobPath).
+	// Empty for data written before the blob layout, which is still found
+	// at its old key-derived path.
+	BlobID string `json:"blobId,omitempty"`
 }
 
 // CopySource identifies the source of a CopyObject operation.
@@ -173,13 +202,16 @@ type CompletePart struct {
 	ETag       string
 }
 
-// Engine is the interface that all storage backends must implement.
-type Engine interface {
-	// Bucket operations
+// BucketStore creates, removes and enumerates buckets.
+type BucketStore interface {
 	CreateBucket(name string) error
 	DeleteBucket(name string) error
 	BucketExists(name string) (bool, error)
 	ListBuckets() ([]BucketInfo, error)
+}
+
+// BucketConfigStore reads and writes per-bucket settings.
+type BucketConfigStore interface {
 	PutBucketCORS(bucket string, cors *CORSConfiguration) error
 	GetBucketCORS(bucket string) (*CORSConfiguration, error)
 	DeleteBucketCORS(bucket string) error
@@ -187,21 +219,30 @@ type Engine interface {
 	GetBucketVersioning(bucket string) (string, error)
 	SetBucketPublic(bucket string, public bool) error
 	IsBucketPublic(bucket string) (bool, error)
+	PutBucketLifecycle(bucket string, lc *LifecycleConfiguration) error
+	GetBucketLifecycle(bucket string) (*LifecycleConfiguration, error)
+	DeleteBucketLifecycle(bucket string) error
+	PutBucketLogging(bucket string, logging *BucketLoggingStatus) error
+	GetBucketLogging(bucket string) (*BucketLoggingStatus, error)
+}
 
-	// Object operations
+// ObjectStore reads, writes and lists objects.
+type ObjectStore interface {
 	PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error)
 	GetObject(ctx context.Context, bucket, key, versionID string) (io.ReadCloser, *ObjectInfo, error)
 	HeadObject(ctx context.Context, bucket, key, versionID string) (*ObjectInfo, error)
 	DeleteObject(bucket, key, versionID string) (isDeleteMarker bool, delVersionID string, err error)
 	CopyObject(ctx context.Context, src CopySource, dstBucket, dstKey string) (*ObjectInfo, error)
-
-	// List operations
 	ListObjects(input *ListObjectsInput) (*ListObjectsOutput, error)
 	ListObjectVersions(input *ListVersionsInput) (*ListVersionsOutput, error)
 	CountObjects(bucket string) (int, error)
+}
 
-	// Multipart upload operations
-	CreateMultipartUpload(bucket, key, contentType string) (*MultipartUploadInfo, error)
+// MultipartStore runs multipart uploads.
+type MultipartStore interface {
+	// CreateMultipartUpload fixes the upload's SSE-C mode from the key in ctx,
+	// if any; every part and the completion must then present the same key.
+	CreateMultipartUpload(ctx context.Context, bucket, key, contentType string) (*MultipartUploadInfo, error)
 	UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, reader io.Reader, size int64) (*PartInfo, error)
 	// CompleteMultipartUpload requires the SSE-C customer key in ctx when the
 	// upload was created with SSE-C, because the key is never persisted.
@@ -209,16 +250,37 @@ type Engine interface {
 	AbortMultipartUpload(bucket, key, uploadID string) error
 	ListMultipartUploads(bucket, prefix, keyMarker, uploadIDMarker string, maxUploads int) ([]MultipartUploadInfo, bool, error)
 	ListParts(bucket, key, uploadID string) ([]PartInfo, error)
+}
 
-	// Lifecycle
-	PutBucketLifecycle(bucket string, lc *LifecycleConfiguration) error
-	GetBucketLifecycle(bucket string) (*LifecycleConfiguration, error)
-	DeleteBucketLifecycle(bucket string) error
-	PutBucketLogging(bucket string, logging *BucketLoggingStatus) error
-	GetBucketLogging(bucket string) (*BucketLoggingStatus, error)
-	CleanExpiredObjects() error
-	CleanExpiredMultipartUploads(cutoff time.Duration) error
+// Maintainer covers what only the server itself runs: background sweeps,
+// system settings, and shutdown.
+type Maintainer interface {
+	// The cleanup sweeps stop between items once ctx is cancelled.
+	CleanExpiredObjects(ctx context.Context) error
+	CleanExpiredMultipartUploads(ctx context.Context, cutoff time.Duration) error
 	GetSystemValue(key string) (string, error)
 	PutSystemValue(key, val string) error
+	// Shutdown drains background work within ctx's deadline, then releases
+	// the engine. Close is Shutdown with no deadline.
+	Shutdown(ctx context.Context) error
 	Close() error
 }
+
+// DataStore is everything a request handler needs: the S3 API and the console
+// depend on this rather than on the full Engine, so they cannot reach the
+// maintenance operations.
+type DataStore interface {
+	BucketStore
+	BucketConfigStore
+	ObjectStore
+	MultipartStore
+}
+
+// Engine is the interface that all storage backends must implement.
+type Engine interface {
+	DataStore
+	Maintainer
+}
+
+// FilesystemEngine must implement Engine; this fails the build if it drifts.
+var _ Engine = (*FilesystemEngine)(nil)

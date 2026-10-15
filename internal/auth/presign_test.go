@@ -100,3 +100,57 @@ func TestPresignedExpiredIsRejected(t *testing.T) {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
+
+// TestPresignGetObjectRoundTrip is the regression test for share links that
+// never verified: PresignGetObject built its canonical query with
+// url.QueryEscape (space -> "+") while the verifier uses the SigV4 encoding
+// (space -> "%20"), so any extra parameter containing a space — notably the
+// response-content-disposition the console always adds — produced a URL that
+// failed with SignatureDoesNotMatch.
+func TestPresignGetObjectRoundTrip(t *testing.T) {
+	v := newTestVerifier()
+
+	cases := []struct {
+		name  string
+		key   string
+		extra url.Values
+	}{
+		{name: "plain", key: "report.txt"},
+		{name: "key with spaces and nesting", key: "dir/my file (1).txt"},
+		{
+			name:  "content disposition override",
+			key:   "dir/report.txt",
+			extra: url.Values{"response-content-disposition": {`attachment; filename="report.txt"`}},
+		},
+		{
+			name: "several overrides with reserved characters",
+			key:  "a+b/c=d.txt",
+			extra: url.Values{
+				"response-content-disposition": {`attachment; filename="a b*c~.txt"`},
+				"response-content-type":        {"text/plain; charset=utf-8"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			presigned, err := PresignGetObject("AKIATEST", "secretkey123", "us-east-1", "bucket", tc.key,
+				time.Hour, "http://localhost:9000", tc.extra)
+			if err != nil {
+				t.Fatalf("PresignGetObject: %v", err)
+			}
+
+			r := httptest.NewRequest(http.MethodGet, presigned, nil)
+			if err := v.Verify(r); err != nil {
+				t.Fatalf("presigned URL %q failed verification: %v", presigned, err)
+			}
+
+			// The override parameters must survive the trip intact.
+			for k, vs := range tc.extra {
+				if got := r.URL.Query().Get(k); got != vs[0] {
+					t.Errorf("query %s = %q, want %q", k, got, vs[0])
+				}
+			}
+		})
+	}
+}

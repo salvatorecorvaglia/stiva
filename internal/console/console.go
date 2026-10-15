@@ -139,7 +139,7 @@ func (h *Handler) getClientIP(r *http.Request) string {
 // Options configures a console Handler. It replaces a seven-argument
 // constructor in which the proxy-trust setting was not threaded through at all.
 type Options struct {
-	Engine           storage.Engine
+	Engine           storage.DataStore
 	Creds            *auth.Credentials
 	S3Port           int
 	Region           string
@@ -155,11 +155,22 @@ type Options struct {
 	// independent of a console session. Empty means only a valid console
 	// session token is accepted.
 	MetricsToken string
+	// AllowedOrigins lists exact origins, besides the console's own, that may
+	// call the API cross-origin (normalized as config.Load does).
+	AllowedOrigins []string
+	// Metrics and DataDir feed /metrics: the counters to report, and the
+	// directory whose disk usage is reported. Nil Metrics selects
+	// storage.GlobalMetrics; empty DataDir reports the working directory.
+	Metrics *storage.MetricsTracker
+	DataDir string
+	// JWTSecret signs console session tokens. Empty means a random secret,
+	// so sessions end when the process does.
+	JWTSecret []byte
 }
 
 // Handler serves the web console UI and its REST API.
 type Handler struct {
-	engine           storage.Engine
+	engine           storage.DataStore
 	creds            *auth.Credentials
 	s3Port           int
 	region           string
@@ -172,6 +183,14 @@ type Handler struct {
 	trustedProxyHops int
 	maxPresignExpiry time.Duration
 	metricsToken     string
+	allowedOrigins   []string
+	tokens           sessionTokens
+	// spentLinks remembers the IDs of download links already used, until
+	// they expire, so each link works exactly once.
+	spentLinks   map[string]time.Time
+	spentLinksMu sync.Mutex
+	metrics      *storage.MetricsTracker
+	dataDir      string
 }
 
 // NewHandler creates a new console handler.
@@ -199,6 +218,17 @@ func NewHandler(opts Options) *Handler {
 		trustedProxyHops: hops,
 		maxPresignExpiry: maxExpiry,
 		metricsToken:     opts.MetricsToken,
+		allowedOrigins:   opts.AllowedOrigins,
+		tokens:           newSessionTokens(opts.JWTSecret),
+		spentLinks:       make(map[string]time.Time),
+		metrics:          opts.Metrics,
+		dataDir:          opts.DataDir,
+	}
+	if h.metrics == nil {
+		h.metrics = storage.GlobalMetrics
+	}
+	if h.dataDir == "" {
+		h.dataDir = "."
 	}
 	h.setupRoutes()
 	return h
@@ -270,6 +300,12 @@ func (h *Handler) setupRoutes() {
 		{http.MethodGet, "/api/buckets/{bucket}/objects/presign", bucketAPI(h.handlePresignObject)},
 		{http.MethodPost, "/api/buckets/{bucket}/objects/upload", bucketAPI(h.uploadObject)},
 		{http.MethodGet, "/api/buckets/{bucket}/objects/download", bucketAPI(h.downloadObject)},
+		{http.MethodPost, "/api/buckets/{bucket}/objects/download-link", bucketAPI(h.createDownloadLink)},
+		{http.MethodPost, "/api/buckets/{bucket}/objects/delete", bucketAPI(h.batchDelete)},
+
+		// Authorized by the single-use token in the path rather than a
+		// session header: a browser navigating to it to download sends none.
+		{http.MethodGet, "/api/download/{token}", h.rateLimitMiddleware(h.apiLimiter, h.serveDownloadLink)},
 
 		{http.MethodPost, "/api/buckets/{bucket}/multipart/initiate", bucketAPI(h.initiateMultipart)},
 		{http.MethodPost, "/api/buckets/{bucket}/multipart/upload-part", bucketAPI(h.uploadPart)},
@@ -303,6 +339,13 @@ func (h *Handler) setupRoutes() {
 
 	// Prometheus metrics endpoint
 	h.mux.HandleFunc("/metrics", h.handleMetrics)
+
+	// Unauthenticated liveness probe for container healthchecks. It used to
+	// be pointed at the SPA's "/", which answers with the whole index page.
+	// GET patterns also match HEAD.
+	h.mux.HandleFunc("GET /_health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
 	// Static files (embedded frontend) with SPA wildcard fallback
 	staticFS, _ := fs.Sub(staticFiles, "static")
@@ -374,7 +417,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// In production, this should be set to the actual console URL.
 	origin := r.Header.Get("Origin")
 	if origin != "" {
-		if isValidConsoleOrigin(origin, r.Host) {
+		if isValidConsoleOrigin(origin, r.Host, h.allowedOrigins) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 		} else {
@@ -404,7 +447,7 @@ func (h *Handler) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		_, err := ValidateToken(token)
+		_, err := h.tokens.validate(token, h.creds)
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 			return
@@ -443,7 +486,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := GenerateToken(req.AccessKey)
+	token, err := h.tokens.generate(h.creds)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate token"})
 		return
@@ -565,6 +608,10 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 
 	effectivePrefix := prefix
 	effectiveDelimiter := delimiter
+	if r.URL.Query().Get("recursive") == "1" {
+		// Every key under the prefix, flat: what folder delete needs.
+		effectiveDelimiter = ""
+	}
 	if searchPrefix := r.URL.Query().Get("searchPrefix"); searchPrefix != "" {
 		effectivePrefix = prefix + searchPrefix
 		effectiveDelimiter = "" // Recursive search
@@ -696,8 +743,10 @@ func (h *Handler) uploadObject(w http.ResponseWriter, r *http.Request, bucket st
 			info, err = h.engine.PutObject(r.Context(), bucket, objectKey, part, -1, contentType)
 			part.Close()
 			if err != nil {
-				slog.Error("[Console] Upload error", "error", err)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
+				// A storage error (missing bucket, over-long key,
+				// object too large) says what the user can fix; this used to
+				// be a bare 500 "upload failed" whatever went wrong.
+				writeStorageError(w, err, "upload failed")
 				return
 			}
 
@@ -724,10 +773,17 @@ func (h *Handler) downloadObject(w http.ResponseWriter, r *http.Request, bucket 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMissingKey})
 		return
 	}
+	h.serveObject(w, r, bucket, key)
+}
 
+// serveObject streams an object as an attachment, for the session download
+// endpoint and for download links.
+func (h *Handler) serveObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	reader, info, err := h.engine.GetObject(r.Context(), bucket, key, "")
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object not found"})
+		// Every failure used to read as 404 "object not found", including
+		// an SSE-C object, which exists but needs its customer key.
+		writeStorageError(w, err, "failed to read object")
 		return
 	}
 	defer reader.Close()
@@ -756,6 +812,112 @@ func (h *Handler) downloadObject(w http.ResponseWriter, r *http.Request, bucket 
 	w.Header().Set("Accept-Ranges", "none")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, reader)
+}
+
+// createDownloadLink issues a short-lived, single-use URL for one object.
+//
+// The console used to download by fetching the whole object into browser
+// memory and saving that blob, which ran out of memory on large files. A
+// link on the console's own origin lets the browser stream the download
+// natively instead.
+func (h *Handler) createDownloadLink(w http.ResponseWriter, r *http.Request, bucket string) {
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil || req.Key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMissingKey})
+		return
+	}
+	if _, err := h.engine.HeadObject(r.Context(), bucket, req.Key, ""); err != nil {
+		writeStorageError(w, err, "failed to read object")
+		return
+	}
+	token, err := h.tokens.generateDownload(h.creds, bucket, req.Key, time.Now())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create download link"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": "/api/download/" + token})
+}
+
+// serveDownloadLink streams the object a download link grants, once.
+func (h *Handler) serveDownloadLink(w http.ResponseWriter, r *http.Request) {
+	claims, err := h.tokens.validateDownload(r.PathValue("token"), h.creds)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired download link"})
+		return
+	}
+	if !h.spendDownloadLink(claims) {
+		writeJSON(w, http.StatusGone, map[string]string{"error": "this download link has already been used"})
+		return
+	}
+	h.serveObject(w, r, claims.Bucket, claims.Key)
+}
+
+// spendDownloadLink records a link as used, reporting false if it already
+// was. Entries are dropped once the link has expired anyway, which bounds
+// the set by how many links can be issued within downloadLinkTTL.
+func (h *Handler) spendDownloadLink(c *downloadClaims) bool {
+	h.spentLinksMu.Lock()
+	defer h.spentLinksMu.Unlock()
+	now := time.Now()
+	for id, exp := range h.spentLinks {
+		if now.After(exp) {
+			delete(h.spentLinks, id)
+		}
+	}
+	if _, used := h.spentLinks[c.ID]; used {
+		return false
+	}
+	h.spentLinks[c.ID] = c.Expiry
+	return true
+}
+
+// maxBatchDelete matches the S3 limit on keys per DeleteObjects call.
+const maxBatchDelete = 1000
+
+// batchDelete deletes up to maxBatchDelete keys in one request, reporting
+// each key's outcome. The console used to send one DELETE per object.
+func (h *Handler) batchDelete(w http.ResponseWriter, r *http.Request, bucket string) {
+	var req struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInvalidRequest})
+		return
+	}
+	if len(req.Keys) == 0 || len(req.Keys) > maxBatchDelete {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("send between 1 and %d keys", maxBatchDelete),
+		})
+		return
+	}
+
+	type keyError struct {
+		Key   string `json:"key"`
+		Error string `json:"error"`
+	}
+	deleted := []string{}
+	failed := []keyError{}
+	for _, key := range req.Keys {
+		if key == "" {
+			failed = append(failed, keyError{Key: key, Error: errMissingKey})
+			continue
+		}
+		if _, _, err := h.engine.DeleteObject(bucket, key, ""); err != nil {
+			msg := "failed to delete object"
+			var s3Err *storage.S3Error
+			if errors.As(err, &s3Err) {
+				msg = s3Err.Message
+			} else {
+				slog.Error("[Console] Batch delete error", "bucket", bucket, "key", key, "error", err)
+			}
+			failed = append(failed, keyError{Key: key, Error: msg})
+			continue
+		}
+		deleted = append(deleted, key)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": deleted, "errors": failed})
 }
 
 func (h *Handler) deleteObject(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -826,7 +988,7 @@ func (h *Handler) initiateMultipart(w http.ResponseWriter, r *http.Request, buck
 		req.ContentType = "application/octet-stream"
 	}
 
-	info, err := h.engine.CreateMultipartUpload(bucket, req.Key, req.ContentType)
+	info, err := h.engine.CreateMultipartUpload(r.Context(), bucket, req.Key, req.ContentType)
 	if err != nil {
 		writeStorageError(w, err, "failed to start multipart upload")
 		return
@@ -1106,7 +1268,7 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	if !authorized && authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if _, err := ValidateToken(token); err == nil {
+		if _, err := h.tokens.validate(token, h.creds); err == nil {
 			authorized = true
 		}
 	}
@@ -1117,30 +1279,36 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dataDir := "."
-	if fsEng, ok := h.engine.(interface{ DataDir() string }); ok {
-		dataDir = fsEng.DataDir()
-	}
-
-	metricsStr := storage.GlobalMetrics.FormatPrometheus(dataDir)
+	metricsStr := h.metrics.FormatPrometheus(h.dataDir)
 	w.Header().Set(contentTypeHeader, "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(metricsStr))
 }
 
-func isValidConsoleOrigin(origin string, requestHost string) bool {
+// isValidConsoleOrigin reports whether a cross-origin caller may use the
+// console: its own origin (the Origin's host matches the request's Host), or
+// one listed in STIVA_CONSOLE_ALLOWED_ORIGINS.
+//
+// Any localhost origin used to be accepted on any port or scheme, letting any
+// other web app on the operator's machine call the API. The explicit list also
+// covers deployments where a reverse proxy rewrites Host, which the same-host
+// check alone rejects.
+func isValidConsoleOrigin(origin, requestHost string, allowed []string) bool {
 	if origin == "" {
 		return false
 	}
 	u, err := url.Parse(origin)
-	if err != nil {
+	if err != nil || u.Host == "" {
 		return false
 	}
 	if strings.EqualFold(u.Host, requestHost) {
 		return true
 	}
-	if u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" {
-		return true
+	normalized := strings.ToLower(origin)
+	for _, a := range allowed {
+		if normalized == a {
+			return true
+		}
 	}
 	return false
 }

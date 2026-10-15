@@ -32,7 +32,7 @@ func newLimitsHandler(t *testing.T) (*Handler, storage.Engine, string) {
 		LoginRateLimit: 1000,
 		APIRateLimit:   10000,
 	})
-	token, err := GenerateToken("access")
+	token, err := h.tokens.generate(auth.NewCredentials("access", "secret"))
 	if err != nil {
 		t.Fatalf("token: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestUploadPartRejectsOutOfRangePartNumber(t *testing.T) {
 	if err := engine.CreateBucket("parts"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	up, err := engine.CreateMultipartUpload("parts", "big.bin", "application/octet-stream")
+	up, err := engine.CreateMultipartUpload(context.Background(), "parts", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("initiate: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestEngineRejectsOutOfRangePartNumber(t *testing.T) {
 	if err := engine.CreateBucket("parts"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	up, err := engine.CreateMultipartUpload("parts", "big.bin", "application/octet-stream")
+	up, err := engine.CreateMultipartUpload(context.Background(), "parts", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("initiate: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestUploadPartStreamsLargeChunk(t *testing.T) {
 	if err := engine.CreateBucket("parts"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	up, err := engine.CreateMultipartUpload("parts", "big.bin", "application/octet-stream")
+	up, err := engine.CreateMultipartUpload(context.Background(), "parts", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("initiate: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestUploadPartRequiresFieldsBeforeFile(t *testing.T) {
 	if err := engine.CreateBucket("parts"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	up, err := engine.CreateMultipartUpload("parts", "big.bin", "application/octet-stream")
+	up, err := engine.CreateMultipartUpload(context.Background(), "parts", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("initiate: %v", err)
 	}

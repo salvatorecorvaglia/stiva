@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -82,7 +81,7 @@ func TestVerifyAcceptsOrdinaryScope(t *testing.T) {
 
 // TestStreamingRejectsOversizedChunk covers a single-request OOM. A chunk's
 // declared size was allocated up front to read it and checked only against
-// MaxPayloadSize (5GiB by default), so one chunk header could drive a 5GiB
+// the payload limit (5GiB by default), so one chunk header could drive a 5GiB
 // allocation before any data arrived. This builds a frame declaring 1GiB while
 // sending almost no data at all.
 func TestStreamingRejectsOversizedChunk(t *testing.T) {
@@ -99,30 +98,28 @@ func TestStreamingRejectsOversizedChunk(t *testing.T) {
 	req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
 	req.ContentLength = int64(body.Len())
 
-	code := authErrCode(t, verifier.Verify(req))
+	_, err := verifyAndRead(verifier, req)
+	code := authErrCode(t, err)
 	if code != "InvalidRequest" && code != "EntityTooLarge" {
 		t.Errorf("error code = %q, want InvalidRequest (oversized chunk rejected before allocation)", code)
 	}
 }
 
-// TestBadSignatureDoesNotSpoolBody covers the ordering of payload hashing
-// against signature verification. The body was hashed — spooling anything over
-// 2MiB to a temp file — before the signature was compared, so a caller who knew
-// only the access key could make the server write up to MaxPayloadSize to disk
-// per request and only then be told the signature was wrong.
-func TestBadSignatureDoesNotSpoolBody(t *testing.T) {
-	tempDir := t.TempDir()
-	orig := TempDir
-	TempDir = tempDir
-	t.Cleanup(func() { TempDir = orig })
-
+// TestBadSignatureDoesNotReadBody covers the ordering of payload handling
+// against signature verification. The body used to be hashed — and spooled to
+// disk past 2MiB — before the signature was compared, so a caller who knew
+// only the access key could make the server do that work per request and only
+// then be told the signature was wrong. The body must be left untouched.
+func TestBadSignatureDoesNotReadBody(t *testing.T) {
 	creds := testCreds()
 	verifier := NewSigV4Verifier(creds)
 
-	body := bytes.Repeat([]byte("a"), 3<<20) // over the 2MiB in-memory threshold
+	body := bytes.Repeat([]byte("a"), 3<<20)
 	req, _ := http.NewRequest(http.MethodPut, "http://localhost:9000/b/k", nil)
 	req.Host = "localhost:9000"
 	signRequestWithBody(req, creds, "us-east-1", "s3", time.Now().UTC(), body, "")
+	src := &countingReader{r: bytes.NewReader(body)}
+	req.Body = io.NopCloser(src)
 
 	// Corrupt the signature: verification must fail before the body is touched.
 	req.Header.Set("Authorization", strings.Replace(
@@ -131,14 +128,7 @@ func TestBadSignatureDoesNotSpoolBody(t *testing.T) {
 	if code := authErrCode(t, verifier.Verify(req)); code != "SignatureDoesNotMatch" {
 		t.Fatalf("error code = %q, want SignatureDoesNotMatch", code)
 	}
-
-	entries, err := os.ReadDir(tempDir)
-	if err != nil {
-		t.Fatalf("read temp dir: %v", err)
-	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "stiva-body-") {
-			t.Errorf("body was spooled to disk before the signature was verified: %s", e.Name())
-		}
+	if src.n != 0 {
+		t.Errorf("%d body bytes were read before the signature was verified", src.n)
 	}
 }

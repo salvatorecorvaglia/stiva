@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -73,7 +74,7 @@ func testCanonicalQuery(values url.Values) string {
 }
 
 // signPut signs a PUT with a real (non-UNSIGNED) payload hash, which is what
-// drives auth.HashPayload down its spool-to-disk path for bodies over 2MiB.
+// makes the SigV4 layer verify the body against it.
 func signPut(r *http.Request, creds *auth.Credentials, region string, now time.Time, body []byte) {
 	datestamp := now.Format("20060102")
 	amzDate := now.Format("20060102T150405Z")
@@ -111,38 +112,34 @@ func signPut(r *http.Request, creds *auth.Credentials, region string, now time.T
 		creds.AccessKey, scope, signedHeaders, hex.EncodeToString(mac.Sum(nil))))
 }
 
+// spooledBodies lists request-body temp files anywhere under dir. Payloads
+// are now verified as they stream into the object, so none should ever exist.
 func spooledBodies(t *testing.T, dir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read temp dir: %v", err)
-	}
 	var left []string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "stiva-body-") || strings.HasPrefix(e.Name(), "stiva-chunked-") {
-			left = append(left, e.Name())
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		if strings.HasPrefix(d.Name(), "stiva-body-") || strings.HasPrefix(d.Name(), "stiva-chunked-") {
+			left = append(left, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
 	}
 	return left
 }
 
 // TestSignedPutDoesNotLeakSpooledBody covers a disk leak in the SigV4 layer.
 //
-// auth.HashPayload spools a request body larger than 2MiB to a temp file and
-// swaps r.Body for a reader that deletes that file on Close. Nothing ever
-// called Close: net/http closes the *original* body it captured when reading
-// the request, not the replacement, and no handler closed r.Body either. Every
-// signed request over 2MiB therefore left a stiva-body-* file behind forever.
+// Signed bodies over 2MiB used to be spooled to a temp file to be hashed, and
+// for a long time nothing deleted it: every such request left a stiva-body-*
+// file behind. Bodies are now hashed as they stream into the object, so a
+// large signed PUT must leave no request-body file anywhere.
 func TestSignedPutDoesNotLeakSpooledBody(t *testing.T) {
 	dataDir := t.TempDir()
-	tempDir := filepath.Join(dataDir, "tmp")
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		t.Fatalf("mkdir temp: %v", err)
-	}
-
-	origTempDir := auth.TempDir
-	auth.TempDir = tempDir
-	t.Cleanup(func() { auth.TempDir = origTempDir })
 
 	eng, err := storage.NewFilesystemEngine(dataDir, nil, "")
 	if err != nil {
@@ -171,24 +168,15 @@ func TestSignedPutDoesNotLeakSpooledBody(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
 	}
-	if leaked := spooledBodies(t, tempDir); len(leaked) > 0 {
+	if leaked := spooledBodies(t, dataDir); len(leaked) > 0 {
 		t.Errorf("spooled request body was not cleaned up: %v", leaked)
 	}
 }
 
 // TestRejectedSignatureDoesNotLeakSpooledBody covers the same leak on the
-// failure path: the body is hashed (and spooled) before the signature is
-// compared, so a request that is ultimately rejected must still clean up.
+// failure path: a rejected request must leave nothing behind either.
 func TestRejectedSignatureDoesNotLeakSpooledBody(t *testing.T) {
 	dataDir := t.TempDir()
-	tempDir := filepath.Join(dataDir, "tmp")
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		t.Fatalf("mkdir temp: %v", err)
-	}
-
-	origTempDir := auth.TempDir
-	auth.TempDir = tempDir
-	t.Cleanup(func() { auth.TempDir = origTempDir })
 
 	eng, err := storage.NewFilesystemEngine(dataDir, nil, "")
 	if err != nil {
@@ -218,7 +206,72 @@ func TestRejectedSignatureDoesNotLeakSpooledBody(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (body: %s)", w.Code, w.Body.String())
 	}
-	if leaked := spooledBodies(t, tempDir); len(leaked) > 0 {
+	if leaked := spooledBodies(t, dataDir); len(leaked) > 0 {
 		t.Errorf("spooled request body was not cleaned up after a rejected signature: %v", leaked)
+	}
+}
+
+// TestTamperedLargeSignedPutIsNotStored: a body over 2MiB is now checked
+// against its signed SHA-256 while it streams into the object, and a mismatch
+// must still abort the upload — with S3's error code — and store nothing.
+func TestTamperedLargeSignedPutIsNotStored(t *testing.T) {
+	dataDir := t.TempDir()
+	eng, err := storage.NewFilesystemEngine(dataDir, nil, "")
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	creds := auth.NewCredentials("ak", "sk")
+	rt := NewRouter(RouterOptions{Engine: eng, Creds: creds, Region: "us-east-1"})
+	t.Cleanup(rt.Close)
+	if err := eng.CreateBucket("tamper"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.Repeat([]byte("t"), 3<<20)
+	req := httptest.NewRequest(http.MethodPut, "/tamper/big.bin", nil)
+	req.Host = "example.com"
+	signPut(req, creds, "us-east-1", time.Now().UTC(), body)
+	tampered := append([]byte(nil), body...)
+	tampered[len(tampered)/2] = 'X'
+	req.Body = io.NopCloser(bytes.NewReader(tampered))
+
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "XAmzContentSHA256Mismatch") {
+		t.Fatalf("status %d body %s; want 400 XAmzContentSHA256Mismatch", w.Code, w.Body.String())
+	}
+	if _, err := eng.HeadObject(context.Background(), "tamper", "big.bin", ""); err == nil {
+		t.Error("a body that failed its hash check was stored")
+	}
+}
+
+// TestLargeSignedBodyToConfigEndpointIsRejected: only object and part uploads
+// accept a body that is verified while it is read, since they read to the end
+// before committing. Everything else takes at most maxXMLRequestBody, read and
+// checked in full first — a larger body is refused outright.
+func TestLargeSignedBodyToConfigEndpointIsRejected(t *testing.T) {
+	eng, err := storage.NewFilesystemEngine(t.TempDir(), nil, "")
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	creds := auth.NewCredentials("ak", "sk")
+	rt := NewRouter(RouterOptions{Engine: eng, Creds: creds, Region: "us-east-1"})
+	t.Cleanup(rt.Close)
+	if err := eng.CreateBucket("cfg"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := append([]byte("<CORSConfiguration>"), bytes.Repeat([]byte(" "), 3<<20)...)
+	req := httptest.NewRequest(http.MethodPut, "/cfg?cors", nil)
+	req.Host = "example.com"
+	signPut(req, creds, "us-east-1", time.Now().UTC(), body)
+
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "MaxMessageLengthExceeded") {
+		t.Fatalf("status %d body %s; want 400 MaxMessageLengthExceeded", w.Code, w.Body.String())
 	}
 }

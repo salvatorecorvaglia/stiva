@@ -9,7 +9,7 @@ import (
 
 // TestPutObjectEnforcesMaxObjectSize guards the operator-configurable object
 // size ceiling. Before this, the only size limit was enforced by the SigV4
-// auth layer (auth.MaxPayloadSize), which a client sending
+// auth layer (the SigV4 verifier's payload limit), which a client sending
 // X-Amz-Content-Sha256: UNSIGNED-PAYLOAD bypasses entirely — the storage
 // engine itself had no cap of its own. This checks both a declared
 // Content-Length over the cap (rejected up front) and an unknown/chunked
@@ -53,7 +53,7 @@ func TestUploadPartEnforcesMaxObjectSize(t *testing.T) {
 	engine.SetMaxObjectSize(10)
 	engine.CreateBucket("capped-mp")
 
-	info, err := engine.CreateMultipartUpload("capped-mp", "big.bin", "application/octet-stream")
+	info, err := engine.CreateMultipartUpload(context.Background(), "capped-mp", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}

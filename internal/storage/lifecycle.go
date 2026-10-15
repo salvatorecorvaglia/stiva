@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -10,30 +12,92 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// maxLifecycleRules matches the S3 limit on rules per configuration.
+const maxLifecycleRules = 1000
+
+// EffectivePrefix returns the key prefix a rule applies to, whichever of the
+// three places S3 allows it to be written in: the legacy rule-level <Prefix>,
+// <Filter><Prefix>, or <Filter><And><Prefix>. Validate guarantees at most one
+// of them is set.
+func (r LifecycleRule) EffectivePrefix() string {
+	switch {
+	case r.Prefix != "":
+		return r.Prefix
+	case r.Filter.And != nil:
+		return r.Filter.And.Prefix
+	default:
+		return r.Filter.Prefix
+	}
+}
+
+// Validate rejects configurations Stiva would otherwise apply more broadly
+// than the caller intended. Any filter condition the sweep does not evaluate
+// (tags, object size) is refused rather than ignored: ignoring a condition
+// turns "expire these objects" into "expire all objects under this prefix".
+func (lc *LifecycleConfiguration) Validate() error {
+	if lc == nil || len(lc.Rules) == 0 {
+		return &S3Error{Code: "MalformedXML", Message: "The lifecycle configuration must contain at least one rule."}
+	}
+	if len(lc.Rules) > maxLifecycleRules {
+		return &S3Error{Code: "MalformedXML", Message: fmt.Sprintf("The lifecycle configuration cannot contain more than %d rules.", maxLifecycleRules)}
+	}
+	for i := range lc.Rules {
+		if err := lc.Rules[i].validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r LifecycleRule) validate() error {
+	if !strings.EqualFold(r.Status, "Enabled") && !strings.EqualFold(r.Status, "Disabled") {
+		return &S3Error{Code: "MalformedXML", Message: fmt.Sprintf("Rule %q: Status must be Enabled or Disabled.", r.ID)}
+	}
+
+	f := r.Filter
+	if f.Tag != nil || f.ObjectSizeGreaterThan != nil || f.ObjectSizeLessThan != nil {
+		return &S3Error{Code: "NotImplemented", Message: fmt.Sprintf("Rule %q: only prefix filters are supported by this server.", r.ID)}
+	}
+	if f.And != nil {
+		if len(f.And.Tags) > 0 || f.And.ObjectSizeGreaterThan != nil || f.And.ObjectSizeLessThan != nil {
+			return &S3Error{Code: "NotImplemented", Message: fmt.Sprintf("Rule %q: only prefix filters are supported by this server.", r.ID)}
+		}
+		if f.Prefix != "" {
+			return &S3Error{Code: "MalformedXML", Message: fmt.Sprintf("Rule %q: Filter cannot combine Prefix with And.", r.ID)}
+		}
+	}
+	if r.Prefix != "" && (f.Prefix != "" || f.And != nil) {
+		return &S3Error{Code: "MalformedXML", Message: fmt.Sprintf("Rule %q: Prefix and Filter cannot both be specified.", r.ID)}
+	}
+
+	if r.Expiration != nil && r.Expiration.Days < 0 {
+		return &S3Error{Code: "InvalidArgument", Message: fmt.Sprintf("Rule %q: Expiration Days must be a positive integer.", r.ID)}
+	}
+	if r.NoncurrentVersionExpiration != nil && r.NoncurrentVersionExpiration.NoncurrentDays < 0 {
+		return &S3Error{Code: "InvalidArgument", Message: fmt.Sprintf("Rule %q: NoncurrentDays must be a positive integer.", r.ID)}
+	}
+	if r.AbortIncompleteMultipartUpload != nil && r.AbortIncompleteMultipartUpload.DaysAfterInitiation < 0 {
+		return &S3Error{Code: "InvalidArgument", Message: fmt.Sprintf("Rule %q: DaysAfterInitiation must be a positive integer.", r.ID)}
+	}
+	return nil
+}
+
 func (fs *FilesystemEngine) PutBucketLifecycle(bucket string, lc *LifecycleConfiguration) error {
 	if err := fs.validateBucketName(bucket); err != nil {
 		return err
 	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
+	if err := lc.Validate(); err != nil {
 		return err
 	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
+	if err := fs.bucketMustExist(bucket); err != nil {
+		return err
 	}
 	return fs.metadata.PutBucketLifecycle(bucket, lc)
 }
 
 func (fs *FilesystemEngine) GetBucketLifecycle(bucket string) (*LifecycleConfiguration, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return nil, err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	lc, err := fs.metadata.GetBucketLifecycle(bucket)
 	if err != nil {
@@ -46,43 +110,22 @@ func (fs *FilesystemEngine) GetBucketLifecycle(bucket string) (*LifecycleConfigu
 }
 
 func (fs *FilesystemEngine) DeleteBucketLifecycle(bucket string) error {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.DeleteBucketLifecycle(bucket)
 }
 
 func (fs *FilesystemEngine) PutBucketLogging(bucket string, logging *BucketLoggingStatus) error {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.PutBucketLogging(bucket, logging)
 }
 
 func (fs *FilesystemEngine) GetBucketLogging(bucket string) (*BucketLoggingStatus, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return nil, err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.GetBucketLogging(bucket)
 }
@@ -96,7 +139,9 @@ const maxExpiryBatch = 10000
 // errExpiryBatchFull stops an iteration early once the batch cap is reached.
 var errExpiryBatchFull = errors.New("expiry batch full")
 
-func (fs *FilesystemEngine) CleanExpiredObjects() error {
+// CleanExpiredObjects applies every bucket's lifecycle rules. It returns
+// ctx's error, leaving the rest for the next sweep, once ctx is cancelled.
+func (fs *FilesystemEngine) CleanExpiredObjects(ctx context.Context) error {
 	buckets, err := fs.ListBuckets()
 	if err != nil {
 		return err
@@ -104,14 +149,28 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 
 	now := time.Now().UTC()
 	for _, bInfo := range buckets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if bInfo.Lifecycle == nil || len(bInfo.Lifecycle.Rules) == 0 {
 			continue
 		}
 
 		for _, rule := range bInfo.Lifecycle.Rules {
-			if strings.ToLower(rule.Status) != "enabled" {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !strings.EqualFold(rule.Status, "Enabled") {
 				continue
 			}
+			// A configuration stored before validation existed may still
+			// carry a condition the sweep cannot evaluate. Skipping the rule
+			// is the only safe reading: ignoring the condition would widen it.
+			if err := rule.validate(); err != nil {
+				slog.Warn("[Storage] Skipping invalid lifecycle rule", "bucket", bInfo.Name, "rule", rule.ID, "error", err)
+				continue
+			}
+			prefix := rule.EffectivePrefix()
 
 			// 1. Current Version Expiration
 			if rule.Expiration != nil && rule.Expiration.Days > 0 {
@@ -126,7 +185,7 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 					if len(expiredList) >= maxExpiryBatch {
 						return errExpiryBatchFull
 					}
-					if !strings.HasPrefix(m.Key, rule.Filter.Prefix) {
+					if !strings.HasPrefix(m.Key, prefix) {
 						return nil
 					}
 					// Check if expired
@@ -142,6 +201,9 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 				})
 
 				for _, exp := range expiredList {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
 					if exp.isDeleteMarker {
 						// If versioning is enabled and the only version left is a delete marker, expire it fully
 						hasNoncurrent := false
@@ -180,7 +242,7 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 					if v.IsLatest {
 						return nil // Only noncurrent versions
 					}
-					if !strings.HasPrefix(v.Key, rule.Filter.Prefix) {
+					if !strings.HasPrefix(v.Key, prefix) {
 						return nil
 					}
 					if now.Sub(v.LastModified) > cutoff {
@@ -194,6 +256,9 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 				})
 
 				for _, exp := range expiredNoncurrentList {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
 					slog.Info("[Storage] Expiring noncurrent version of key in bucket", "versionID", exp.versionID, "key", exp.key, "bucket", bInfo.Name, "age", exp.age, "cutoff", cutoff)
 					_, _, _ = fs.DeleteObject(bInfo.Name, exp.key, exp.versionID)
 				}
@@ -219,7 +284,7 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 							}
 							var m MultipartMeta
 							if err := json.Unmarshal(v, &m); err == nil {
-								if strings.HasPrefix(m.Key, rule.Filter.Prefix) && now.Sub(m.Created) > cutoff {
+								if strings.HasPrefix(m.Key, prefix) && now.Sub(m.Created) > cutoff {
 									aborts = append(aborts, struct {
 										key      string
 										uploadID string
@@ -234,6 +299,9 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 					// would pin it for the whole sweep.
 					releasedb()
 					for _, a := range aborts {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
 						slog.Info("[Storage] Aborting incomplete multipart upload of key in bucket", "uploadID", a.uploadID, "key", a.key, "bucket", bInfo.Name, "cutoff", cutoff)
 						_ = fs.AbortMultipartUpload(bInfo.Name, a.key, a.uploadID)
 					}
@@ -244,7 +312,9 @@ func (fs *FilesystemEngine) CleanExpiredObjects() error {
 	return nil
 }
 
-func (fs *FilesystemEngine) CleanExpiredMultipartUploads(cutoff time.Duration) error {
+// CleanExpiredMultipartUploads aborts uploads older than cutoff. It returns
+// ctx's error, leaving the rest for the next sweep, once ctx is cancelled.
+func (fs *FilesystemEngine) CleanExpiredMultipartUploads(ctx context.Context, cutoff time.Duration) error {
 	type uploadToAbort struct {
 		bucket   string
 		key      string
@@ -259,6 +329,9 @@ func (fs *FilesystemEngine) CleanExpiredMultipartUploads(cutoff time.Duration) e
 
 	now := time.Now().UTC()
 	for _, bInfo := range buckets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		func() {
 			unlock := fs.metadata.acquireBucketLock(bInfo.Name, false)
 			defer unlock()
@@ -299,6 +372,9 @@ func (fs *FilesystemEngine) CleanExpiredMultipartUploads(cutoff time.Duration) e
 	}
 
 	for _, u := range aborts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		slog.Info("[Storage] Cleaning up expired multipart upload", "uploadID", u.uploadID, "bucket", u.bucket, "key", u.key)
 		_ = fs.AbortMultipartUpload(u.bucket, u.key, u.uploadID)
 	}

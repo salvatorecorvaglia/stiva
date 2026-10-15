@@ -14,10 +14,11 @@ type MetricsTracker struct {
 	BytesUploaded    uint64
 	BytesDownloaded  uint64
 	ActiveMultiparts int64
-	// WebhookDropped/SyncDropped count events discarded because their
-	// dispatcher's bounded queue was full — the only prior signal for this
-	// was a log line, so an operator relying on /metrics had no way to
-	// detect silent notification/replication loss.
+	// WebhookDropped/SyncDropped count events that were never delivered:
+	// discarded because their dispatcher's bounded queue was full, or
+	// abandoned when shutdown hit its deadline. The only prior signal for
+	// either was a log line, so an operator relying on /metrics had no way
+	// to detect silent notification/replication loss.
 	WebhookDropped uint64
 	SyncDropped    uint64
 
@@ -64,14 +65,20 @@ func (m *MetricsTracker) DecActiveMultiparts() {
 	atomic.AddInt64(&m.ActiveMultiparts, -1)
 }
 
-// IncWebhookDropped records a webhook event discarded because the dispatch
-// queue was full.
+// SetActiveMultiparts sets the gauge outright, for seeding it from the uploads
+// already in progress at startup.
+func (m *MetricsTracker) SetActiveMultiparts(n int64) {
+	atomic.StoreInt64(&m.ActiveMultiparts, n)
+}
+
+// IncWebhookDropped records a webhook event that will never be delivered:
+// the dispatch queue was full, or shutdown abandoned it.
 func (m *MetricsTracker) IncWebhookDropped() {
 	atomic.AddUint64(&m.WebhookDropped, 1)
 }
 
-// IncSyncDropped records a replication task discarded because the dispatch
-// queue was full.
+// IncSyncDropped records a replication task that will never be delivered:
+// the dispatch queue was full, or shutdown abandoned it.
 func (m *MetricsTracker) IncSyncDropped() {
 	atomic.AddUint64(&m.SyncDropped, 1)
 }
@@ -127,11 +134,11 @@ stiva_disk_total_bytes %d
 # TYPE stiva_disk_free_bytes gauge
 stiva_disk_free_bytes %d
 
-# HELP stiva_webhook_dropped_total Total webhook events discarded because the dispatch queue was full.
+# HELP stiva_webhook_dropped_total Total webhook events never delivered: discarded because the dispatch queue was full, or abandoned at shutdown.
 # TYPE stiva_webhook_dropped_total counter
 stiva_webhook_dropped_total %d
 
-# HELP stiva_sync_dropped_total Total replication tasks discarded because the dispatch queue was full.
+# HELP stiva_sync_dropped_total Total replication tasks never delivered: discarded because the dispatch queue was full, or abandoned at shutdown.
 # TYPE stiva_sync_dropped_total counter
 stiva_sync_dropped_total %d
 `, reqs, errs, up, down, activeMP, diskTotalVal, diskFreeVal, webhookDropped, syncDropped)

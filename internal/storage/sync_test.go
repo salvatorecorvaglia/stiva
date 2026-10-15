@@ -412,3 +412,119 @@ func TestMirrorSyncSkipsSSECObjects(t *testing.T) {
 		t.Errorf("SSE-C object should not be sent to the mirror, got %d request(s)", requests)
 	}
 }
+
+// recordingMirror is a stand-in replication target that records the method
+// and body of every request it receives.
+type recordingMirror struct {
+	mu   sync.Mutex
+	reqs []string // "METHOD body"
+}
+
+func (m *recordingMirror) handler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	m.mu.Lock()
+	m.reqs = append(m.reqs, r.Method+" "+string(body))
+	m.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (m *recordingMirror) snapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.reqs...)
+}
+
+func newMirroredVersionedEngine(t *testing.T) (*FilesystemEngine, *recordingMirror) {
+	t.Helper()
+	mirror := &recordingMirror{}
+	server := httptest.NewServer(http.HandlerFunc(mirror.handler))
+	t.Cleanup(server.Close)
+
+	engine, err := NewFilesystemEngine(t.TempDir(), &SyncConfig{
+		Endpoint: server.URL, Bucket: "backup", AccessKey: "ak", SecretKey: "sk", Region: "us-east-1",
+	}, "")
+	if err != nil {
+		t.Fatalf("NewFilesystemEngine: %v", err)
+	}
+	t.Cleanup(func() { engine.Close() })
+
+	if err := engine.CreateBucket("primary"); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if err := engine.SetBucketVersioning("primary", "Enabled"); err != nil {
+		t.Fatalf("SetBucketVersioning: %v", err)
+	}
+	return engine, mirror
+}
+
+// TestMirrorSyncVersionDeleteKeepsLiveObject is the regression test for the
+// replica losing live data. The mirror is unversioned, so a DELETE there
+// removes the object outright — yet deleting any *old* version locally (by
+// hand, or every hour via NoncurrentVersionExpiration) sent exactly that,
+// while the current version was still present on the primary.
+func TestMirrorSyncVersionDeleteKeepsLiveObject(t *testing.T) {
+	engine, mirror := newMirroredVersionedEngine(t)
+	ctx := context.Background()
+
+	v1, err := engine.PutObject(ctx, "primary", "doc.txt", strings.NewReader("v1"), 2, "text/plain")
+	if err != nil {
+		t.Fatalf("PutObject v1: %v", err)
+	}
+	if _, err := engine.PutObject(ctx, "primary", "doc.txt", strings.NewReader("v2"), 2, "text/plain"); err != nil {
+		t.Fatalf("PutObject v2: %v", err)
+	}
+
+	// Delete the noncurrent version: the object itself is unaffected.
+	if _, _, err := engine.DeleteObject("primary", "doc.txt", v1.VersionID); err != nil {
+		t.Fatalf("DeleteObject v1: %v", err)
+	}
+
+	// Drains the queue and waits for every in-flight transfer.
+	engine.StopSyncDispatcher()
+
+	for _, req := range mirror.snapshot() {
+		if strings.HasPrefix(req, http.MethodDelete) {
+			t.Fatalf("deleting a noncurrent version sent %q to the mirror; requests: %v", req, mirror.snapshot())
+		}
+	}
+}
+
+// TestMirrorSyncDeletingLatestVersionRestoresPrevious covers the other half:
+// deleting the *current* version makes the previous one current again, so the
+// mirror must be brought up to that content rather than left with the deleted
+// bytes (or deleted outright).
+func TestMirrorSyncDeletingLatestVersionRestoresPrevious(t *testing.T) {
+	engine, mirror := newMirroredVersionedEngine(t)
+	ctx := context.Background()
+
+	if _, err := engine.PutObject(ctx, "primary", "doc.txt", strings.NewReader("v1"), 2, "text/plain"); err != nil {
+		t.Fatalf("PutObject v1: %v", err)
+	}
+	v2, err := engine.PutObject(ctx, "primary", "doc.txt", strings.NewReader("v2"), 2, "text/plain")
+	if err != nil {
+		t.Fatalf("PutObject v2: %v", err)
+	}
+
+	// Let the two PUT mirrors finish first, so the last request the mirror
+	// sees is the one triggered by the version delete.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(mirror.snapshot()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for initial mirror PUTs; got %v", mirror.snapshot())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, _, err := engine.DeleteObject("primary", "doc.txt", v2.VersionID); err != nil {
+		t.Fatalf("DeleteObject v2: %v", err)
+	}
+	engine.StopSyncDispatcher()
+
+	reqs := mirror.snapshot()
+	if len(reqs) != 3 {
+		t.Fatalf("expected 3 mirror requests (PUT, PUT, re-PUT of v1), got %v", reqs)
+	}
+	if reqs[2] != "PUT v1" {
+		t.Errorf("after deleting the latest version the mirror got %q, want %q", reqs[2], "PUT v1")
+	}
+}

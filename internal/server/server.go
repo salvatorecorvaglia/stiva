@@ -11,8 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,12 +24,31 @@ import (
 
 // Server holds both the S3 API server and the web console server, plus background workers.
 type Server struct {
-	s3Server      *http.Server
-	consoleServer *http.Server
-	engine        storage.Engine
-	cleanupStop   chan struct{}
-	shutdownOnce  sync.Once
+	s3Server        *http.Server
+	consoleServer   *http.Server
+	s3Router        *s3api.Router
+	engine          storage.Engine
+	multipartExpiry time.Duration
+
+	s3Listener      net.Listener
+	consoleListener net.Listener
+
+	// errCh carries a listener's failure after startup to main. Buffered so
+	// neither serving goroutine blocks on a reader that is gone.
+	errCh chan error
+
+	// cleanupCancel stops the background cleanup worker; cleanupDone is
+	// closed once it has returned. Both are set by Start.
+	cleanupCancel context.CancelFunc
+	cleanupDone   chan struct{}
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
+
+// defaultMultipartExpiry applies when the config leaves it unset (as configs
+// built directly, rather than through config.Load, do).
+const defaultMultipartExpiry = 7 * 24 * time.Hour
 
 // New creates and configures both servers.
 func New(cfg *config.Config) (*Server, error) {
@@ -54,12 +71,6 @@ func New(cfg *config.Config) (*Server, error) {
 	engine.SetWebhookSecret(cfg.WebhookSecret)
 	engine.SetMaxObjectSize(cfg.MaxObjectSize)
 	engine.SetDisableMinPartSize(cfg.DisableMinPartSize)
-
-	// Set temporary directory for auth hashing
-	auth.TempDir = filepath.Join(cfg.DataDir, "tmp")
-	if err := os.MkdirAll(auth.TempDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create temporary hashing directory: %w", err)
-	}
 
 	// Setup persistent JWT secret for Console session tracking
 	var jwtSecret []byte
@@ -97,7 +108,6 @@ func New(cfg *config.Config) (*Server, error) {
 			}
 		}
 	}
-	console.SetJWTSecret(jwtSecret)
 
 	creds := auth.NewCredentials(cfg.AccessKey, cfg.SecretKey)
 
@@ -109,6 +119,7 @@ func New(cfg *config.Config) (*Server, error) {
 		Domain:           cfg.Domain,
 		TrustProxy:       cfg.TrustProxy,
 		TrustedProxyHops: cfg.TrustedProxyHops,
+		Metrics:          engine.Metrics(),
 	})
 	s3Server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.S3Port),
@@ -130,6 +141,10 @@ func New(cfg *config.Config) (*Server, error) {
 		TrustProxy:       cfg.TrustProxy,
 		TrustedProxyHops: cfg.TrustedProxyHops,
 		MetricsToken:     cfg.MetricsToken,
+		AllowedOrigins:   cfg.ConsoleAllowedOrigins,
+		JWTSecret:        jwtSecret,
+		Metrics:          engine.Metrics(),
+		DataDir:          cfg.DataDir,
 	})
 	consoleServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.ConsolePort),
@@ -170,15 +185,23 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	}
 
+	multipartExpiry := cfg.MultipartExpiry
+	if multipartExpiry <= 0 {
+		multipartExpiry = defaultMultipartExpiry
+	}
+
 	return &Server{
-		s3Server:      s3Server,
-		consoleServer: consoleServer,
-		engine:        engine,
-		cleanupStop:   make(chan struct{}),
+		s3Server:        s3Server,
+		consoleServer:   consoleServer,
+		s3Router:        s3Router,
+		engine:          engine,
+		multipartExpiry: multipartExpiry,
+		errCh:           make(chan error, 2),
 	}, nil
 }
 
 // Start launches both servers concurrently and starts background workers.
+// A server that fails after this returns is reported on Errors().
 func (s *Server) Start() error {
 	var lc net.ListenConfig
 	ctx := context.Background()
@@ -193,102 +216,121 @@ func (s *Server) Start() error {
 		s3Listener.Close()
 		return fmt.Errorf("failed to bind Console port %s: %w", s.consoleServer.Addr, err)
 	}
+	s.s3Listener, s.consoleListener = s3Listener, consoleListener
 
-	go func() {
-		if s.s3Server.TLSConfig != nil {
-			slog.Info("[S3 API] Listening securely (HTTPS)", "addr", s.s3Server.Addr)
-			if err := s.s3Server.ServeTLS(s3Listener, "", ""); err != nil && err != http.ErrServerClosed {
-				slog.Error("[S3 API] Server error", "error", err)
-			}
-		} else {
-			slog.Info("[S3 API] Listening", "addr", s.s3Server.Addr)
-			if err := s.s3Server.Serve(s3Listener); err != nil && err != http.ErrServerClosed {
-				slog.Error("[S3 API] Server error", "error", err)
-			}
-		}
-	}()
+	go s.serve("S3 API", s.s3Server, s3Listener)
+	go s.serve("Console", s.consoleServer, consoleListener)
 
-	go func() {
-		if s.consoleServer.TLSConfig != nil {
-			slog.Info("[Console] Listening securely (HTTPS)", "addr", s.consoleServer.Addr)
-			if err := s.consoleServer.ServeTLS(consoleListener, "", ""); err != nil && err != http.ErrServerClosed {
-				slog.Error("[Console] Server error", "error", err)
-			}
-		} else {
-			slog.Info("[Console] Listening", "addr", s.consoleServer.Addr)
-			if err := s.consoleServer.Serve(consoleListener); err != nil && err != http.ErrServerClosed {
-				slog.Error("[Console] Server error", "error", err)
-			}
-		}
-	}()
-
-	// Start background multipart cleanup task
-	go func() {
-		slog.Info("[Server] Starting background multipart cleanup worker")
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-
-		if err := s.engine.CleanExpiredMultipartUploads(24 * time.Hour); err != nil {
-			slog.Error("[Server] Error in initial multipart cleanup", "error", err)
-		}
-		if err := s.engine.CleanExpiredObjects(); err != nil {
-			slog.Error("[Server] Error in initial lifecycle cleanup", "error", err)
-		}
-
-		for {
-			select {
-			case <-ticker.C:
-				if err := s.engine.CleanExpiredMultipartUploads(24 * time.Hour); err != nil {
-					slog.Error("[Server] Error cleaning expired multipart uploads", "error", err)
-				}
-				if err := s.engine.CleanExpiredObjects(); err != nil {
-					slog.Error("[Server] Error cleaning expired objects", "error", err)
-				}
-			case <-s.cleanupStop:
-				slog.Info("[Server] Background cleanup worker stopped")
-				return
-			}
-		}
-	}()
+	cleanupCtx, cancel := context.WithCancel(context.Background())
+	s.cleanupCancel = cancel
+	s.cleanupDone = make(chan struct{})
+	go s.runCleanup(cleanupCtx)
 
 	return nil
 }
 
-// Shutdown gracefully shuts down both servers and stops background workers.
+// Errors reports a server that stopped serving on its own after Start. It
+// used to be logged and otherwise ignored, leaving the process running with
+// one of its two servers dead.
+func (s *Server) Errors() <-chan error {
+	return s.errCh
+}
+
+func (s *Server) serve(name string, srv *http.Server, l net.Listener) {
+	var err error
+	if srv.TLSConfig != nil {
+		slog.Info("["+name+"] Listening securely (HTTPS)", "addr", srv.Addr)
+		err = srv.ServeTLS(l, "", "")
+	} else {
+		slog.Info("["+name+"] Listening", "addr", srv.Addr)
+		err = srv.Serve(l)
+	}
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return
+	}
+	slog.Error("["+name+"] Server error", "error", err)
+	select {
+	case s.errCh <- fmt.Errorf("%s server stopped: %w", name, err):
+	default: // the other server already reported; one error is enough
+	}
+}
+
+// runCleanup runs the multipart and lifecycle sweeps at startup and then
+// hourly, until ctx is cancelled. The sweeps check ctx between items, so
+// cancellation also cuts a running sweep short.
+func (s *Server) runCleanup(ctx context.Context) {
+	defer close(s.cleanupDone)
+	slog.Info("[Server] Starting background multipart cleanup worker", "multipartExpiry", s.multipartExpiry)
+
+	sweep := func() {
+		if err := s.engine.CleanExpiredMultipartUploads(ctx, s.multipartExpiry); err != nil && ctx.Err() == nil {
+			slog.Error("[Server] Error cleaning expired multipart uploads", "error", err)
+		}
+		if err := s.engine.CleanExpiredObjects(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("[Server] Error cleaning expired objects", "error", err)
+		}
+	}
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	sweep()
+	for {
+		select {
+		case <-ticker.C:
+			sweep()
+		case <-ctx.Done():
+			slog.Info("[Server] Background cleanup worker stopped")
+			return
+		}
+	}
+}
+
+// Shutdown gracefully shuts down both servers and stops background workers,
+// giving up on whatever is still running when ctx expires.
+//
 // It is safe to call more than once — a signal handler racing with a manual
 // admin shutdown call, or an orchestrator retrying after a timeout, could
-// otherwise call this twice and panic closing cleanupStop a second time.
-// Only the first call does any work; later calls return the same result.
+// otherwise call it twice. Only the first call does any work; later calls
+// return the same result.
 func (s *Server) Shutdown(ctx context.Context) error {
-	var err error
 	s.shutdownOnce.Do(func() {
-		err = s.shutdown(ctx)
+		s.shutdownErr = s.shutdown(ctx)
 	})
-	return err
+	return s.shutdownErr
 }
 
 func (s *Server) shutdown(ctx context.Context) error {
 	slog.Info("[Server] Shutting down")
 
-	// Stop background workers
-	close(s.cleanupStop)
-
 	var errs []error
+
+	// Stop the cleanup worker first and wait for it: it uses the engine,
+	// which is closed last. It used to be signalled and not waited for.
+	if s.cleanupCancel != nil {
+		s.cleanupCancel()
+		select {
+		case <-s.cleanupDone:
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("cleanup worker still running at the shutdown deadline: %w", ctx.Err()))
+		}
+	}
 
 	if err := s.s3Server.Shutdown(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("s3 API server shutdown error: %w", err))
 	}
-
-	if r, ok := s.s3Server.Handler.(*s3api.Router); ok {
-		r.Close()
+	if err := s.s3Router.Shutdown(ctx); err != nil {
+		errs = append(errs, err)
 	}
 
 	if err := s.consoleServer.Shutdown(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("console server shutdown error: %w", err))
 	}
 
-	if err := s.engine.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("storage engine close error: %w", err))
+	// Bounded by the same ctx: past it, undelivered replication and webhook
+	// events are abandoned (and counted) instead of holding the process open.
+	if err := s.engine.Shutdown(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("storage engine shutdown error: %w", err))
 	}
 
 	return errors.Join(errs...)

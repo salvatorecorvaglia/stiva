@@ -20,9 +20,27 @@ func (rt *Router) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 	}
 
 	resource := "/" + bucket + "/" + key
-	info, err := rt.engine.CreateMultipartUpload(bucket, key, contentType)
+
+	// SSE-C is declared when the upload is created, as in S3. It used to be
+	// ignored here and inferred from whichever part arrived first, so parallel
+	// first parts could leave an upload with some parts encrypted and some not.
+	params, err := extractSSECParams(r)
+	if err != nil {
+		writeSSECError(w, err, resource)
+		return
+	}
+	ctx := r.Context()
+	if params != nil {
+		ctx = context.WithValue(ctx, storage.SSECContextKey, params)
+	}
+
+	info, err := rt.engine.CreateMultipartUpload(ctx, bucket, key, contentType)
 	if handleStorageError(w, err, resource) {
 		return
+	}
+
+	if params != nil {
+		setSSECResponseHeaders(w, params.Algorithm, params.KeyMD5)
 	}
 
 	result := InitiateMultipartUploadResult{
@@ -60,14 +78,18 @@ func (rt *Router) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		ctx = context.WithValue(ctx, storage.SSECContextKey, params)
 	}
 
-	partInfo, err := rt.engine.UploadPart(ctx, bucket, key, uploadID, partNumber, r.Body, r.ContentLength)
+	body, err := verifiedBody(r)
+	if handleStorageError(w, err, resource) {
+		return
+	}
+
+	partInfo, err := rt.engine.UploadPart(ctx, bucket, key, uploadID, partNumber, body, r.ContentLength)
 	if handleStorageError(w, err, resource) {
 		return
 	}
 
 	if params != nil {
-		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", params.Algorithm)
-		w.Header().Set("x-amz-server-side-encryption-customer-key-MD5", params.KeyMD5)
+		setSSECResponseHeaders(w, params.Algorithm, params.KeyMD5)
 	}
 
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, partInfo.ETag))
@@ -148,8 +170,7 @@ func (rt *Router) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, b
 	}
 
 	if dstParams != nil {
-		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", dstParams.Algorithm)
-		w.Header().Set("x-amz-server-side-encryption-customer-key-MD5", dstParams.KeyMD5)
+		setSSECResponseHeaders(w, dstParams.Algorithm, dstParams.KeyMD5)
 	}
 
 	result := CopyPartResult{
@@ -213,8 +234,7 @@ func (rt *Router) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		w.Header().Set("x-amz-version-id", info.VersionID)
 	}
 	if info.SSECustomerAlgorithm != "" {
-		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", info.SSECustomerAlgorithm)
-		w.Header().Set("x-amz-server-side-encryption-customer-key-MD5", info.SSECustomerKeyMD5)
+		setSSECResponseHeaders(w, info.SSECustomerAlgorithm, info.SSECustomerKeyMD5)
 	}
 
 	writeXML(w, http.StatusOK, result)

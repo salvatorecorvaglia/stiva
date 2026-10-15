@@ -10,7 +10,11 @@ services:
     environment:
       - STIVA_ACCESS_KEY=${STIVA_ACCESS_KEY:-stiva}
       - STIVA_SECRET_KEY=${STIVA_SECRET_KEY:-stiva123}
-      - STIVA_DATA_DIR=${STIVA_DATA_DIR:-/data}
+      # Fixed, not taken from .env: the volume above is always mounted at
+      # /data. .env.example sets ./data for source runs, and passing that
+      # through put the data outside the volume, in a directory the
+      # non-root container user cannot even create.
+      - STIVA_DATA_DIR=/data
       - STIVA_REGION=${STIVA_REGION:-us-east-1}
       # The port variables must be passed into the container too. Without them
       # the published mapping followed STIVA_S3_PORT while the server kept
@@ -19,14 +23,8 @@ services:
       - STIVA_CONSOLE_PORT=${STIVA_CONSOLE_PORT:-9001}
       # Set a stable secret so console sessions survive a restart.
       - STIVA_JWT_SECRET=${STIVA_JWT_SECRET:-}
-    healthcheck:
-      # The console serves the SPA on / and requires no credentials for it.
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
-             "http://127.0.0.1:${STIVA_CONSOLE_PORT:-9001}/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+    # The healthcheck comes from the image (see the Dockerfile): it probes
+    # /_health on both ports and works with TLS enabled.
     restart: unless-stopped
     # Drop privileges the object server never needs.
     security_opt:

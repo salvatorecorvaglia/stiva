@@ -49,15 +49,8 @@ type ListVersionsOutput struct {
 // version count, not the bucket's — and can stop entirely once a page is
 // full.
 func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListVersionsOutput, error) {
-	if err := fs.validateBucketName(input.Bucket); err != nil {
+	if err := fs.requireBucket(input.Bucket); err != nil {
 		return nil, err
-	}
-	exists, err := fs.metadata.BucketExists(input.Bucket)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 
 	maxKeys := input.MaxKeys
@@ -66,14 +59,11 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 	}
 
 	out := &ListVersionsOutput{}
-	prefixSet := make(map[string]bool)
-	started := input.KeyMarker == ""
 	count := 0
 	// lastKey/lastVersionID track the most recently emitted entry (a version,
 	// delete marker, or common prefix) so a page's NextKeyMarker points at
 	// something the caller already received — not at the entry that didn't
-	// fit, which would then be skipped by the started-marker check on the
-	// next page and silently lost.
+	// fit, which would then be skipped on the next page and silently lost.
 	var lastKey, lastVersionID string
 
 	db, releasedb, err := fs.metadata.acquireBucketDB(input.Bucket)
@@ -85,15 +75,22 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 	bucketPrefix := input.Bucket + "\x00"
 	bucketPrefixBytes := []byte(bucketPrefix)
 
-	seekKey := bucketPrefix
-	switch {
-	case input.KeyMarker != "":
-		// Resuming a previous page: KeyMarker is itself a result key from
-		// that page, so it already accounts for Prefix — no need to combine
-		// the two.
-		seekKey = bucketPrefix + input.KeyMarker
-	case input.Prefix != "":
-		seekKey = bucketPrefix + input.Prefix
+	// A key marker ending in the delimiter is a rolled-up common prefix — what
+	// NextKeyMarker is when a page ends on one. Resuming from it must skip every
+	// key under that prefix, or the prefix is emitted again on the next page.
+	markerIsPrefix := input.KeyMarker != "" && input.Delimiter != "" &&
+		strings.HasSuffix(input.KeyMarker, input.Delimiter)
+
+	// Start at whichever of the prefix and the marker sorts later. The marker
+	// used to win outright, so a marker sorting before the prefix started the
+	// scan outside it and the loop stopped at the first non-matching key.
+	start := input.Prefix
+	if input.KeyMarker != "" {
+		resume := input.KeyMarker
+		if markerIsPrefix {
+			resume += "\xff" // no UTF-8 key contains 0xff, so this sorts after every key under the prefix
+		}
+		start = advanceToken(start, resume)
 	}
 
 	// objectKeyOf splits a raw bbolt key (already known to carry
@@ -108,6 +105,13 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 		return rest
 	}
 
+	pageFull := func() error {
+		out.IsTruncated = true
+		out.NextKeyMarker = lastKey
+		out.NextVersionIDMarker = lastVersionID
+		return errListPageFull
+	}
+
 	err = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectsBucket)
 		if b == nil {
@@ -115,11 +119,28 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 		}
 		c := b.Cursor()
 
-		k, v := c.Seek([]byte(seekKey))
+		k, v := c.Seek([]byte(bucketPrefix + start))
 		for k != nil && bytes.HasPrefix(k, bucketPrefixBytes) {
 			objectKey := objectKeyOf(k)
-			if input.Prefix != "" && !strings.HasPrefix(objectKey, input.Prefix) {
+			if !strings.HasPrefix(objectKey, input.Prefix) {
 				break
+			}
+
+			// Roll keys below a delimiter up into a common prefix, then jump
+			// past every key under it: they would all roll up the same way.
+			if input.Delimiter != "" {
+				remaining := objectKey[len(input.Prefix):]
+				if idx := strings.Index(remaining, input.Delimiter); idx >= 0 {
+					dirPrefix := input.Prefix + remaining[:idx+len(input.Delimiter)]
+					if count >= maxKeys {
+						return pageFull()
+					}
+					out.CommonPrefixes = append(out.CommonPrefixes, dirPrefix)
+					lastKey, lastVersionID = dirPrefix, ""
+					count++
+					k, v = c.Seek([]byte(bucketPrefix + dirPrefix + "\xff"))
+					continue
+				}
 			}
 
 			// Gather every version of this one key — typically a handful,
@@ -138,54 +159,24 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 				}
 				k, v = c.Next()
 			}
-
 			sort.SliceStable(keyVersions, func(i, j int) bool {
 				return keyVersions[i].LastModified.After(keyVersions[j].LastModified)
 			})
 
+			if objectKey == input.KeyMarker && !markerIsPrefix {
+				keyVersions = versionsAfterMarker(keyVersions, input.VersionIDMarker)
+			}
+
 			for _, info := range keyVersions {
-				if !started {
-					if info.Key == input.KeyMarker &&
-						(input.VersionIDMarker == "" || info.VersionID == input.VersionIDMarker) {
-						started = true
-					}
-					continue
-				}
-
-				// Roll keys below a delimiter up into a common prefix.
-				if input.Delimiter != "" {
-					remaining := info.Key[len(input.Prefix):]
-					if idx := strings.Index(remaining, input.Delimiter); idx >= 0 {
-						dirPrefix := input.Prefix + remaining[:idx+len(input.Delimiter)]
-						if !prefixSet[dirPrefix] {
-							if count >= maxKeys {
-								out.IsTruncated = true
-								out.NextKeyMarker = lastKey
-								out.NextVersionIDMarker = lastVersionID
-								return errListPageFull
-							}
-							prefixSet[dirPrefix] = true
-							out.CommonPrefixes = append(out.CommonPrefixes, dirPrefix)
-							lastKey, lastVersionID = info.Key, info.VersionID
-							count++
-						}
-						continue
-					}
-				}
-
 				if count >= maxKeys {
-					out.IsTruncated = true
-					out.NextKeyMarker = lastKey
-					out.NextVersionIDMarker = lastVersionID
-					return errListPageFull
+					return pageFull()
 				}
-
 				if info.IsDeleteMarker {
 					out.DeleteMarkers = append(out.DeleteMarkers, info)
 				} else {
 					out.Versions = append(out.Versions, info)
 				}
-				lastKey, lastVersionID = info.Key, info.VersionID
+				lastKey, lastVersionID = info.Key, markerVersionID(info.VersionID)
 				count++
 			}
 		}
@@ -195,8 +186,37 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 		return nil, err
 	}
 
-	sort.Strings(out.CommonPrefixes)
 	return out, nil
+}
+
+// versionsAfterMarker returns the versions of the marker key (newest first)
+// that come after versionIDMarker.
+//
+// With no version marker, S3 resumes after the whole key; this used to treat
+// the key's first version as the marker and re-emit the rest. If the marker
+// version has since been deleted, its position within the key is unknown, so
+// the listing moves on to the next key rather than — as it used to — never
+// finding the marker and returning an empty, untruncated page that ended
+// pagination early.
+func versionsAfterMarker(versions []ObjectInfo, versionIDMarker string) []ObjectInfo {
+	if versionIDMarker == "" {
+		return nil
+	}
+	for i, info := range versions {
+		if markerVersionID(info.VersionID) == versionIDMarker {
+			return versions[i+1:]
+		}
+	}
+	return nil
+}
+
+// markerVersionID is the version ID as clients see it in listings and send
+// back as version-id-marker: an unversioned object is reported as "null".
+func markerVersionID(versionID string) string {
+	if versionID == "" {
+		return "null"
+	}
+	return versionID
 }
 
 // ListMultipartUploads returns the in-progress multipart uploads for a bucket,
@@ -212,15 +232,8 @@ func (fs *FilesystemEngine) ListObjectVersions(input *ListVersionsInput) (*ListV
 // is full, instead of loading every in-progress upload in the bucket into
 // memory just to sort and slice it.
 func (fs *FilesystemEngine) ListMultipartUploads(bucket, prefix, keyMarker, uploadIDMarker string, maxUploads int) ([]MultipartUploadInfo, bool, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return nil, false, err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return nil, false, err
-	}
-	if !exists {
-		return nil, false, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 
 	if maxUploads <= 0 {

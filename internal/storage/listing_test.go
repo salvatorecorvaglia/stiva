@@ -285,7 +285,7 @@ func TestListObjectVersionsPaginatesAcrossKeysWithoutDuplicatesOrGaps(t *testing
 // TestListPartsReturnsUploadedParts covers the new ListParts surface.
 func TestListPartsReturnsUploadedParts(t *testing.T) {
 	fs := newListEngine(t, "mpu")
-	up, err := fs.CreateMultipartUpload("mpu", "big.bin", "application/octet-stream")
+	up, err := fs.CreateMultipartUpload(context.Background(), "mpu", "big.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("create mpu: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestListPartsReturnsUploadedParts(t *testing.T) {
 func TestListMultipartUploadsReportsInFlight(t *testing.T) {
 	fs := newListEngine(t, "mpu")
 	for _, key := range []string{"b.bin", "a.bin"} {
-		if _, err := fs.CreateMultipartUpload("mpu", key, "application/octet-stream"); err != nil {
+		if _, err := fs.CreateMultipartUpload(context.Background(), "mpu", key, "application/octet-stream"); err != nil {
 			t.Fatalf("create mpu %s: %v", key, err)
 		}
 	}
@@ -345,7 +345,7 @@ func TestListMultipartUploadsPaginationAdvances(t *testing.T) {
 	fs := newListEngine(t, "mpu-page")
 	keys := []string{"a.bin", "b.bin", "c.bin", "d.bin", "e.bin"}
 	for _, key := range keys {
-		if _, err := fs.CreateMultipartUpload("mpu-page", key, "application/octet-stream"); err != nil {
+		if _, err := fs.CreateMultipartUpload(context.Background(), "mpu-page", key, "application/octet-stream"); err != nil {
 			t.Fatalf("create mpu %s: %v", key, err)
 		}
 	}
@@ -480,5 +480,114 @@ func TestListObjectsPrefixWithEarlierMarkerAndDelimiter(t *testing.T) {
 		if out.CommonPrefixes[i] != want[i] {
 			t.Fatalf("common prefixes = %v, want %v", out.CommonPrefixes, want)
 		}
+	}
+}
+
+// newVersionedListEngine creates a versioned bucket holding versionsPerKey
+// versions of each key.
+func newVersionedListEngine(t *testing.T, bucket string, versionsPerKey int, keys ...string) *FilesystemEngine {
+	t.Helper()
+	fs := newListEngine(t, bucket)
+	if err := fs.SetBucketVersioning(bucket, "Enabled"); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	for _, key := range keys {
+		for i := 0; i < versionsPerKey; i++ {
+			body := fmt.Sprintf("%s-v%d", key, i)
+			if _, err := fs.PutObject(context.Background(), bucket, key,
+				strings.NewReader(body), int64(len(body)), "application/octet-stream"); err != nil {
+				t.Fatalf("put %s v%d: %v", key, i, err)
+			}
+		}
+	}
+	return fs
+}
+
+// TestListObjectVersionsKeyMarkerAloneSkipsWholeKey: per S3, a key-marker
+// without a version-id-marker means "start after this key". Stiva treated
+// the key's first version as the marker and re-emitted all its other versions.
+func TestListObjectVersionsKeyMarkerAloneSkipsWholeKey(t *testing.T) {
+	fs := newVersionedListEngine(t, "vmarker", 3, "a", "b")
+
+	out, err := fs.ListObjectVersions(&ListVersionsInput{Bucket: "vmarker", KeyMarker: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range out.Versions {
+		if v.Key == "a" {
+			t.Fatalf("key-marker %q returned a version of that same key: %+v", "a", v)
+		}
+	}
+	if len(out.Versions) != 3 {
+		t.Errorf("got %d versions after key-marker a, want the 3 versions of b", len(out.Versions))
+	}
+}
+
+// TestListObjectVersionsMissingVersionMarkerContinues: if the version named by
+// the marker was deleted between pages, the listing must carry on from the
+// next key rather than silently return an empty, non-truncated page.
+func TestListObjectVersionsMissingVersionMarkerContinues(t *testing.T) {
+	fs := newVersionedListEngine(t, "vgone", 2, "a", "b")
+
+	out, err := fs.ListObjectVersions(&ListVersionsInput{
+		Bucket: "vgone", KeyMarker: "a", VersionIDMarker: "no-such-version",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Versions) != 2 || out.Versions[0].Key != "b" {
+		t.Fatalf("got %+v; want the 2 versions of b", out.Versions)
+	}
+}
+
+// TestListObjectVersionsPaginationWithDelimiter: when a page ended on a common
+// prefix the next page emitted it again, because nothing skipped the keys
+// already rolled up into it.
+func TestListObjectVersionsPaginationWithDelimiter(t *testing.T) {
+	fs := newVersionedListEngine(t, "vdelim", 2, "a/1", "a/2", "b/1", "c", "d/1")
+
+	var prefixes, versions []string
+	keyMarker, versionMarker := "", ""
+	for pages := 1; ; pages++ {
+		if pages > 20 {
+			t.Fatal("pagination did not terminate")
+		}
+		out, err := fs.ListObjectVersions(&ListVersionsInput{
+			Bucket: "vdelim", Delimiter: "/", MaxKeys: 1,
+			KeyMarker: keyMarker, VersionIDMarker: versionMarker,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefixes = append(prefixes, out.CommonPrefixes...)
+		for _, v := range out.Versions {
+			versions = append(versions, v.Key+"@"+v.VersionID)
+		}
+		if !out.IsTruncated {
+			break
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIDMarker
+	}
+
+	if strings.Join(prefixes, ",") != "a/,b/,d/" {
+		t.Errorf("common prefixes across pages = %v, want [a/ b/ d/] each exactly once", prefixes)
+	}
+	if len(versions) != 2 || !strings.HasPrefix(versions[0], "c@") || !strings.HasPrefix(versions[1], "c@") {
+		t.Errorf("versions across pages = %v, want the 2 versions of c", versions)
+	}
+}
+
+// TestListObjectVersionsKeyMarkerBeforePrefix: the scan must start at
+// whichever of prefix and key-marker sorts later, or it begins outside the
+// prefix and stops at the first non-matching key.
+func TestListObjectVersionsKeyMarkerBeforePrefix(t *testing.T) {
+	fs := newVersionedListEngine(t, "vprefix", 1, "a", "logs/1", "logs/2")
+
+	out, err := fs.ListObjectVersions(&ListVersionsInput{Bucket: "vprefix", Prefix: "logs/", KeyMarker: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Versions) != 2 {
+		t.Fatalf("got %d versions, want the 2 under logs/", len(out.Versions))
 	}
 }

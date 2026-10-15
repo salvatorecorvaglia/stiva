@@ -30,7 +30,7 @@ func TestUploadPartCopyRoutesToPartCopyNotWholeObjectCopy(t *testing.T) {
 		t.Fatalf("create dst bucket: %v", err)
 	}
 
-	info, err := eng.CreateMultipartUpload("dst-bucket", "dest.txt", "application/octet-stream")
+	info, err := eng.CreateMultipartUpload(context.Background(), "dst-bucket", "dest.txt", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("create multipart upload: %v", err)
 	}

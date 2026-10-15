@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/salvatorecorvaglia/stiva/internal/checksum"
 	"github.com/salvatorecorvaglia/stiva/internal/storage"
 )
 
@@ -90,6 +91,50 @@ func writeSSECError(w http.ResponseWriter, err error, resource string) {
 	writeS3Error(w, code, msg, resource)
 }
 
+// setSSECResponseHeaders echoes the SSE-C algorithm and key MD5 on responses
+// for encrypted objects and uploads, as S3 does.
+func setSSECResponseHeaders(w http.ResponseWriter, algorithm, keyMD5 string) {
+	w.Header().Set(amzSSECAlgorithmHeader, algorithm)
+	w.Header().Set(amzSSECKeyMD5Header, keyMD5)
+}
+
+// verifiedBody returns the request body wrapped so that the upload fails —
+// before anything is committed to storage — if it does not match a
+// Content-MD5 or x-amz-checksum-* header the client sent. These were ignored,
+// so a body corrupted in transit was stored as if it were intact.
+//
+// A checksum sent as an aws-chunked trailer instead is verified while the
+// body is decoded, in auth.
+func verifiedBody(r *http.Request) (io.Reader, error) {
+	body := io.Reader(r.Body)
+
+	if raw := r.Header.Get("Content-MD5"); raw != "" {
+		h := md5.New()
+		want, err := checksum.DecodeExpected(raw, h)
+		if err != nil {
+			return nil, &storage.S3Error{Code: "InvalidDigest", Message: "The Content-MD5 you specified is not valid."}
+		}
+		body = checksum.NewVerifyingReader(body, h, want,
+			&storage.S3Error{Code: "BadDigest", Message: "The Content-MD5 you specified did not match what we received."})
+	}
+
+	for _, name := range checksum.Names {
+		raw := r.Header.Get(name)
+		if raw == "" {
+			continue
+		}
+		h, _ := checksum.New(name)
+		want, err := checksum.DecodeExpected(raw, h)
+		if err != nil {
+			return nil, &storage.S3Error{Code: "InvalidRequest", Message: fmt.Sprintf("Value for %s header is invalid.", name)}
+		}
+		body = checksum.NewVerifyingReader(body, h, want,
+			&storage.S3Error{Code: "BadDigest", Message: fmt.Sprintf("The %s you specified did not match the calculated checksum.", name)})
+	}
+
+	return body, nil
+}
+
 // handlePutObject handles PUT /<bucket>/<key> (PutObject).
 func (rt *Router) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	contentType := r.Header.Get(contentTypeHeader)
@@ -111,7 +156,12 @@ func (rt *Router) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		ctx = context.WithValue(ctx, storage.SSECContextKey, params)
 	}
 
-	info, err := rt.engine.PutObject(ctx, bucket, key, r.Body, size, contentType)
+	body, err := verifiedBody(r)
+	if handleStorageError(w, err, resource) {
+		return
+	}
+
+	info, err := rt.engine.PutObject(ctx, bucket, key, body, size, contentType)
 	if handleStorageError(w, err, resource) {
 		return
 	}
@@ -121,8 +171,7 @@ func (rt *Router) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		w.Header().Set(amzVersionIDHeader, info.VersionID)
 	}
 	if info.SSECustomerAlgorithm != "" {
-		w.Header().Set(amzSSECAlgorithmHeader, info.SSECustomerAlgorithm)
-		w.Header().Set(amzSSECKeyMD5Header, info.SSECustomerKeyMD5)
+		setSSECResponseHeaders(w, info.SSECustomerAlgorithm, info.SSECustomerKeyMD5)
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -158,21 +207,7 @@ func (rt *Router) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	defer reader.Close()
 
-	w.Header().Set(contentTypeHeader, info.ContentType)
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
-	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, info.ETag))
-	w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
-	w.Header().Set("Accept-Ranges", "bytes")
-	if info.VersionID != "" {
-		w.Header().Set(amzVersionIDHeader, info.VersionID)
-	}
-	if info.SSECustomerAlgorithm != "" {
-		w.Header().Set(amzSSECAlgorithmHeader, info.SSECustomerAlgorithm)
-		w.Header().Set(amzSSECKeyMD5Header, info.SSECustomerKeyMD5)
-	}
-	// Content is caller-supplied, so never let a browser sniff it into
-	// something executable.
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	writeObjectHeaders(w, info)
 
 	// The response-header overrides let a caller restate an object's
 	// Content-Type and Content-Disposition. On an unauthenticated public-bucket
@@ -183,19 +218,8 @@ func (rt *Router) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		applyResponseHeaderOverrides(w, r.URL.Query())
 	}
 
-	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
-		quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
-		if ifMatch != "*" && ifMatch != info.ETag && ifMatch != quotedETag {
-			writeS3Error(w, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", resource)
-			return
-		}
-	}
-	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" {
-		quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
-		if ifNoneMatch == "*" || ifNoneMatch == info.ETag || ifNoneMatch == quotedETag {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
+	if !preconditionsHold(w, r, info, resource) {
+		return
 	}
 
 	// If the reader supports seeking, use http.ServeContent which handles
@@ -230,6 +254,45 @@ func (rt *Router) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 	// Fallback for non-seekable readers: serve full content only.
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, reader)
+}
+
+// writeObjectHeaders sets the metadata headers GetObject and HeadObject both
+// return.
+func writeObjectHeaders(w http.ResponseWriter, info *storage.ObjectInfo) {
+	w.Header().Set(contentTypeHeader, info.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, info.ETag))
+	w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
+	w.Header().Set("Accept-Ranges", "bytes")
+	if info.VersionID != "" {
+		w.Header().Set(amzVersionIDHeader, info.VersionID)
+	}
+	if info.SSECustomerAlgorithm != "" {
+		setSSECResponseHeaders(w, info.SSECustomerAlgorithm, info.SSECustomerKeyMD5)
+	}
+	// Content is caller-supplied, so never let a browser sniff it into
+	// something executable.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+// preconditionsHold evaluates If-Match and If-None-Match against the
+// object's ETag. When one fails it writes the response (412 or 304) and
+// returns false.
+func preconditionsHold(w http.ResponseWriter, r *http.Request, info *storage.ObjectInfo, resource string) bool {
+	quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
+	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
+		if ifMatch != "*" && ifMatch != info.ETag && ifMatch != quotedETag {
+			writeS3Error(w, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", resource)
+			return false
+		}
+	}
+	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" {
+		if ifNoneMatch == "*" || ifNoneMatch == info.ETag || ifNoneMatch == quotedETag {
+			w.WriteHeader(http.StatusNotModified)
+			return false
+		}
+	}
+	return true
 }
 
 // applyResponseHeaderOverrides implements the S3 "response header override"
@@ -338,32 +401,9 @@ func (rt *Router) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	w.Header().Set(contentTypeHeader, info.ContentType)
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
-	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, info.ETag))
-	w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
-	w.Header().Set("Accept-Ranges", "bytes")
-	if info.VersionID != "" {
-		w.Header().Set(amzVersionIDHeader, info.VersionID)
-	}
-	if info.SSECustomerAlgorithm != "" {
-		w.Header().Set(amzSSECAlgorithmHeader, info.SSECustomerAlgorithm)
-		w.Header().Set(amzSSECKeyMD5Header, info.SSECustomerKeyMD5)
-	}
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
-		quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
-		if ifMatch != "*" && ifMatch != info.ETag && ifMatch != quotedETag {
-			writeS3Error(w, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", resource)
-			return
-		}
-	}
-	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" {
-		quotedETag := fmt.Sprintf(`"%s"`, info.ETag)
-		if ifNoneMatch == "*" || ifNoneMatch == info.ETag || ifNoneMatch == quotedETag {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
+	writeObjectHeaders(w, info)
+	if !preconditionsHold(w, r, info, resource) {
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)

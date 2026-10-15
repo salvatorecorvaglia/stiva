@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -356,4 +357,59 @@ func TestCanonicalQueryStringEncoding(t *testing.T) {
 	if canonical != expected {
 		t.Errorf("expected canonical query string:\n%q\ngot:\n%q", expected, canonical)
 	}
+}
+
+// TestHostMustBeSigned: SigV4 requires the Host header to be covered by the
+// signature. Stiva accepted signatures that left it out, and with
+// virtual-host routing the bucket lives in Host — so a captured request
+// signed without it could be replayed against a different bucket.
+func TestHostMustBeSigned(t *testing.T) {
+	creds := NewCredentials("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	v := NewSigV4Verifier(creds)
+
+	t.Run("authorization header", func(t *testing.T) {
+		now := time.Now().UTC()
+		amzDate := now.Format("20060102T150405Z")
+		scope := now.Format("20060102") + "/us-east-1/s3/aws4_request"
+
+		r := httptest.NewRequest(http.MethodGet, "http://bucket.example.com/key", nil)
+		r.Header.Set("X-Amz-Date", amzDate)
+		r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+		signed := []string{"x-amz-content-sha256", "x-amz-date"}
+		canonical := v.buildCanonicalRequest(r, signed)
+		sts := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hashSHA256([]byte(canonical))
+		sig := hex.EncodeToString(hmacSHA256(v.deriveSigningKey(now.Format("20060102"), "us-east-1", "s3"), []byte(sts)))
+		r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+creds.AccessKey+"/"+scope+
+			", SignedHeaders=x-amz-content-sha256;x-amz-date, Signature="+sig)
+
+		err := v.Verify(r)
+		var authErr *AuthError
+		if !errors.As(err, &authErr) || authErr.Code != "AccessDenied" {
+			t.Fatalf("a signature not covering Host was accepted (err = %v)", err)
+		}
+	})
+
+	t.Run("presigned", func(t *testing.T) {
+		now := time.Now().UTC()
+		datestamp, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+		scope := datestamp + "/us-east-1/s3/aws4_request"
+		q := url.Values{}
+		q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+		q.Set("X-Amz-Credential", creds.AccessKey+"/"+scope)
+		q.Set("X-Amz-Date", amzDate)
+		q.Set("X-Amz-Expires", "3600")
+		q.Set("X-Amz-SignedHeaders", "x-amz-date")
+
+		r := httptest.NewRequest(http.MethodGet, "/bucket/key?"+q.Encode(), nil)
+		canonical := v.buildCanonicalRequestPresigned(r, []string{"x-amz-date"})
+		sts := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hashSHA256([]byte(canonical))
+		q.Set("X-Amz-Signature", hex.EncodeToString(hmacSHA256(v.deriveSigningKey(datestamp, "us-east-1", "s3"), []byte(sts))))
+		r.URL.RawQuery = q.Encode()
+
+		err := v.Verify(r)
+		var authErr *AuthError
+		if !errors.As(err, &authErr) || authErr.Code != "AccessDenied" {
+			t.Fatalf("a presigned URL not covering Host was accepted (err = %v)", err)
+		}
+	})
 }

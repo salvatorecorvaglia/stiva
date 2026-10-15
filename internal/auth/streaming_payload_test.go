@@ -83,11 +83,28 @@ func buildStreamingRequest(t *testing.T, creds *Credentials, chunks [][]byte, ta
 	req.Header.Set("Host", host)
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	// Real SDKs always state the decoded size of an aws-chunked body.
+	decoded := 0
+	for _, c := range chunks {
+		decoded += len(c)
+	}
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(decoded))
 	req.Header.Set("Authorization", fmt.Sprintf(
 		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		creds.AccessKey, scope, strings.Join(signedHeaders, ";"), seedSig,
 	))
 	return req
+}
+
+// verifyAndRead runs Verify and then reads the whole body, returning the first
+// error from either. Payload problems in a large or aws-chunked body surface
+// as the body is read — before the storage layer can commit it — rather than
+// from Verify itself.
+func verifyAndRead(v *SigV4Verifier, r *http.Request) ([]byte, error) {
+	if err := v.Verify(r); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r.Body)
 }
 
 func hmacSHA256Test(key, data []byte) []byte {
@@ -127,7 +144,7 @@ func TestVerifyStreamingPayloadRejectsTamperedChunk(t *testing.T) {
 	chunks := [][]byte{[]byte("hello, "), []byte("world!")}
 	req := buildStreamingRequest(t, creds, chunks, 1) // tamper the second chunk's signature
 
-	err := verifier.Verify(req)
+	_, err := verifyAndRead(verifier, req)
 	if err == nil {
 		t.Fatal("expected an error for a tampered chunk signature, got nil")
 	}

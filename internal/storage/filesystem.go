@@ -11,8 +11,10 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -64,12 +66,21 @@ func putGzipReader(gr *gzip.Reader) {
 
 type pooledGzipReader struct {
 	*gzip.Reader
+	closeOnce sync.Once
+	closeErr  error
 }
 
+// Close returns the reader to the pool exactly once. It used to put it back on
+// every call, and object readers do get closed twice (net/http closes a
+// request body it was given, and the owner closes it too), which let two later
+// callers decompress through the same shared gzip.Reader. The Once also makes
+// it safe for those two closes to run concurrently.
 func (p *pooledGzipReader) Close() error {
-	err := p.Reader.Close()
-	putGzipReader(p.Reader)
-	return err
+	p.closeOnce.Do(func() {
+		p.closeErr = p.Reader.Close()
+		putGzipReader(p.Reader)
+	})
+	return p.closeErr
 }
 
 // FilesystemEngine implements the Engine interface using the local filesystem.
@@ -80,6 +91,8 @@ type FilesystemEngine struct {
 	metadata *MetadataStore
 	mu       sync.Mutex
 	locks    map[string]*uploadLock
+	// bucketLocks backs lockBucket; guarded by mu like locks.
+	bucketLocks map[string]*bucketRWLock
 
 	// disableMinPartSize turns off the 5MB minimum part size on
 	// CompleteMultipartUpload. It is threaded in from configuration rather
@@ -109,6 +122,17 @@ type FilesystemEngine struct {
 	webhookWG             sync.WaitGroup
 	isWebhookShuttingDown int32
 	webhookMu             sync.Mutex
+
+	// metrics receives this engine's counters; see Metrics.
+	metrics *MetricsTracker
+
+	// dispatchCtx scopes every replication and webhook delivery, retry wait
+	// and queued event. Shutdown cancels it once its deadline passes, which
+	// aborts in-flight requests and abandons what is left instead of draining
+	// it without limit. Created on first use (see dispatchContext).
+	dispatchOnce   sync.Once
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
 }
 
 type uploadLock struct {
@@ -134,8 +158,10 @@ func NewFilesystemEngine(dataDir string, syncCfg *SyncConfig, webhookURL string)
 	}
 
 	cleanupOrphanedTempFiles(dataDir)
+	seedActiveMultipartGauge(meta, GlobalMetrics)
 
 	return &FilesystemEngine{
+		metrics:    GlobalMetrics,
 		dataDir:    dataDir,
 		metadata:   meta,
 		locks:      make(map[string]*uploadLock),
@@ -160,6 +186,23 @@ func NewFilesystemEngine(dataDir string, syncCfg *SyncConfig, webhookURL string)
 	}, nil
 }
 
+// Metrics returns the tracker this engine records into: GlobalMetrics unless
+// SetMetrics chose another.
+func (fs *FilesystemEngine) Metrics() *MetricsTracker {
+	if fs.metrics == nil {
+		return GlobalMetrics
+	}
+	return fs.metrics
+}
+
+// SetMetrics makes the engine record into m instead of GlobalMetrics, seeding
+// m's in-progress multipart gauge from the uploads already stored. Like the
+// other setters it must be called before the engine serves traffic.
+func (fs *FilesystemEngine) SetMetrics(m *MetricsTracker) {
+	fs.metrics = m
+	seedActiveMultipartGauge(fs.metadata, m)
+}
+
 // SetWebhookSecret sets the HMAC secret used to sign outgoing webhook
 // payloads, so receivers can authenticate them. Without it, any host that
 // learns the webhook URL can forge events. Must be called before the first
@@ -182,11 +225,64 @@ func (fs *FilesystemEngine) SetDisableMinPartSize(v bool) {
 	fs.disableMinPartSize = v
 }
 
-// Close closes the underlying metadata store and stops workers.
+// Close stops the replication and webhook workers, waiting for everything
+// already queued to be delivered, then closes the metadata store. It waits as
+// long as that takes; Shutdown bounds it.
 func (fs *FilesystemEngine) Close() error {
-	fs.StopSyncDispatcher()
-	fs.StopWebhookDispatcher()
-	return fs.metadata.Close()
+	return fs.Shutdown(context.Background())
+}
+
+// Shutdown stops accepting replication and webhook events, delivers what is
+// already queued, and closes the metadata store.
+//
+// The drain used to be unbounded: each queue holds up to 5,000 events and a
+// replication transfer may run for minutes, so a slow or unreachable target
+// held the process long past any shutdown timeout. When ctx expires first,
+// in-flight deliveries are cancelled, the remaining events are abandoned and
+// counted in the dropped-event metrics, and the error reports the deadline.
+func (fs *FilesystemEngine) Shutdown(ctx context.Context) error {
+	fs.beginSyncStop()
+	fs.beginWebhookStop()
+
+	drained := make(chan struct{})
+	go func() {
+		fs.syncWG.Wait()
+		fs.webhookWG.Wait()
+		close(drained)
+	}()
+
+	var drainErr error
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		drainErr = fmt.Errorf("event queues not drained before the shutdown deadline; undelivered events were counted as dropped: %w", ctx.Err())
+		slog.Warn("[Storage] Shutdown deadline reached, abandoning undelivered replication and webhook events")
+		fs.dispatchContext() // make sure there is a cancel func to call
+		fs.dispatchCancel()
+		<-drained // cancellation makes every worker and retry return promptly
+	}
+
+	return errors.Join(drainErr, fs.metadata.Close())
+}
+
+// dispatchContext returns the context governing event delivery.
+func (fs *FilesystemEngine) dispatchContext() context.Context {
+	fs.dispatchOnce.Do(func() {
+		fs.dispatchCtx, fs.dispatchCancel = context.WithCancel(context.Background())
+	})
+	return fs.dispatchCtx
+}
+
+// sleepCtx waits for d, reporting false if ctx was cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (fs *FilesystemEngine) GetSystemValue(key string) (string, error) {
@@ -202,6 +298,11 @@ func (fs *FilesystemEngine) CreateBucket(name string) error {
 	if err := fs.validateBucketName(name); err != nil {
 		return err
 	}
+
+	// Held across the check and the create, which otherwise let concurrent
+	// creates of one name all report success.
+	unlock := fs.lockBucket(name, true)
+	defer unlock()
 
 	exists, err := fs.metadata.BucketExists(name)
 	if err != nil {
@@ -227,12 +328,14 @@ func (fs *FilesystemEngine) DeleteBucket(name string) error {
 		return err
 	}
 
-	exists, err := fs.metadata.BucketExists(name)
-	if err != nil {
+	// Exclusive across the emptiness check and the removal: every object and
+	// multipart commit holds this lock shared (see lockBucketForCommit), so no
+	// write can land between "it's empty" and "it's gone".
+	unlock := fs.lockBucket(name, true)
+	defer unlock()
+
+	if err := fs.bucketMustExist(name); err != nil {
 		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 
 	// Check if bucket has objects, delete markers, or active multipart uploads
@@ -246,6 +349,9 @@ func (fs *FilesystemEngine) DeleteBucket(name string) error {
 
 	if err := os.RemoveAll(fs.bucketPath(name)); err != nil {
 		return fmt.Errorf("failed to remove bucket directory: %w", err)
+	}
+	if err := os.RemoveAll(fs.blobDir(name)); err != nil {
+		return fmt.Errorf("failed to remove bucket data directory: %w", err)
 	}
 
 	return fs.metadata.DeleteBucket(name)
@@ -266,60 +372,32 @@ func (fs *FilesystemEngine) ListBuckets() ([]BucketInfo, error) {
 
 // PutBucketCORS sets CORS configuration for a bucket.
 func (fs *FilesystemEngine) PutBucketCORS(bucket string, cors *CORSConfiguration) error {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.PutBucketCORS(bucket, cors)
 }
 
 // GetBucketCORS gets CORS configuration for a bucket.
 func (fs *FilesystemEngine) GetBucketCORS(bucket string) (*CORSConfiguration, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return nil, err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.GetBucketCORS(bucket)
 }
 
 // DeleteBucketCORS deletes CORS configuration for a bucket.
 func (fs *FilesystemEngine) DeleteBucketCORS(bucket string) error {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.DeleteBucketCORS(bucket)
 }
 
 // CountObjects returns the number of objects in a bucket without loading metadata.
 func (fs *FilesystemEngine) CountObjects(bucket string) (int, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return 0, err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return 0, err
-	}
-	if !exists {
-		return 0, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.CountObjectMetas(bucket)
 }
@@ -332,21 +410,20 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 	if err := fs.validateBucketName(bucket); err != nil {
 		return nil, err
 	}
+	if err := validateNewKey(key); err != nil {
+		return nil, err
+	}
 	// A declared Content-Length over the cap is rejected immediately; an
 	// unknown/chunked size (-1) still passes here but is bounded below by
 	// wrapping reader in a LimitReader, so this applies regardless of
 	// signing mode — including UNSIGNED-PAYLOAD, which bypasses the SigV4
-	// layer's own MaxPayloadSize check entirely.
+	// layer's own payload size check entirely.
 	if fs.maxObjectSize > 0 && size > fs.maxObjectSize {
 		return nil, &S3Error{Code: "EntityTooLarge", Message: "Your proposed upload exceeds the maximum allowed object size."}
 	}
 
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
+	if err := fs.bucketMustExist(bucket); err != nil {
 		return nil, err
-	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 
 	versionStatus, err := fs.metadata.GetBucketVersioning(bucket)
@@ -362,41 +439,16 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 		versionID = "null"
 	}
 
-	objPath, err := fs.objectPathWithVersion(bucket, key, versionID)
-	if err != nil {
+	if _, err := fs.objectPathWithVersion(bucket, key, versionID); err != nil {
 		return nil, &S3Error{Code: "InvalidArgument", Message: err.Error()}
 	}
-
-	bucketDir := filepath.Clean(fs.bucketPath(bucket))
-	bucketPrefix := bucketDir + string(filepath.Separator)
-	if !strings.HasPrefix(objPath, bucketPrefix) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	rel, err := filepath.Rel(bucketDir, objPath)
-	if err != nil || filepath.IsAbs(rel) || isRelTraversal(rel) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	objDir := filepath.Dir(objPath)
-	if objDir != bucketDir && !strings.HasPrefix(objDir, bucketPrefix) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	relDir, err := filepath.Rel(bucketDir, objDir)
-	if err != nil || filepath.IsAbs(relDir) || isRelTraversal(relDir) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-
-	// Check for flat namespace directory/file path conflicts
-	if err := fs.checkPathConflict(objPath, bucket); err != nil {
+	blobID, blobPath, err := fs.newBlob(bucket)
+	if err != nil {
 		return nil, err
 	}
 
-	// Ensure parent directory exists (for nested keys like "photos/2024/img.jpg")
-	if err := os.MkdirAll(objDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create object directory: %w", err)
-	}
-
 	// Write to a temp file first, then rename for atomicity
-	tmpFile, err := os.CreateTemp(objDir, ".stiva-tmp-*")
+	tmpFile, err := os.CreateTemp(filepath.Dir(blobPath), ".stiva-tmp-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -496,13 +548,11 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 	unlockObj := fs.lockObjectKey(bucket, key)
 	defer unlockObj()
 
-	// Atomically move temp file to final location
-	if !strings.HasPrefix(objPath, bucketPrefix) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
+	unlockBucket, err := fs.lockBucketForCommit(bucket)
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Rename(tmpPath, objPath); err != nil {
-		return nil, fmt.Errorf("failed to rename temp file: %w", err)
-	}
+	defer unlockBucket()
 
 	etag := hex.EncodeToString(hash.Sum(nil))
 	if contentType == "" {
@@ -525,11 +575,11 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 		info.SSECustomerKeyMD5 = ssecParams.KeyMD5
 	}
 
-	if err := fs.metadata.PutObjectMeta(info); err != nil {
+	if err := fs.commitObject(tmpPath, blobID, blobPath, info); err != nil {
 		return nil, err
 	}
 
-	GlobalMetrics.AddUploaded(written)
+	fs.Metrics().AddUploaded(written)
 
 	fs.triggerWebhook("ObjectCreated:Put", info)
 
@@ -549,15 +599,9 @@ func (fs *FilesystemEngine) GetObject(ctx context.Context, bucket, key, versionI
 		return nil, info, err
 	}
 
-	objPath, err := fs.objectPathWithVersion(bucket, key, info.VersionID)
+	objPath, err := fs.dataPath(info)
 	if err != nil {
 		return nil, nil, &S3Error{Code: "InvalidArgument", Message: err.Error()}
-	}
-
-	bucketDir := filepath.Clean(fs.bucketPath(bucket))
-	bucketPrefix := bucketDir + string(filepath.Separator)
-	if !strings.HasPrefix(objPath, bucketPrefix) {
-		return nil, nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
 	}
 
 	file, err := os.Open(objPath)
@@ -607,13 +651,23 @@ func (fs *FilesystemEngine) GetObject(ctx context.Context, bucket, key, versionI
 	}
 
 	rc := &readCloserWrapper{Reader: reader, closers: closers}
+	if reader == io.Reader(file) {
+		// Neither encrypted nor compressed: the bytes on disk are the object.
+		return &fileObjectReader{
+			metricsReadSeekCloser: metricsReadSeekCloser{
+				metricsReadCloser: metricsReadCloser{ReadCloser: rc, metrics: fs.Metrics()},
+				seeker:            file,
+			},
+			file: file,
+		}, info, nil
+	}
 	if rs, ok := reader.(io.ReadSeeker); ok {
 		return &metricsReadSeekCloser{
-			metricsReadCloser: metricsReadCloser{ReadCloser: rc},
+			metricsReadCloser: metricsReadCloser{ReadCloser: rc, metrics: fs.Metrics()},
 			seeker:            rs,
 		}, info, nil
 	}
-	return &metricsReadCloser{ReadCloser: rc}, info, nil
+	return &metricsReadCloser{ReadCloser: rc, metrics: fs.Metrics()}, info, nil
 }
 
 // HeadObject retrieves object metadata without the data.
@@ -644,41 +698,41 @@ func (fs *FilesystemEngine) HeadObject(ctx context.Context, bucket, key, version
 
 // DeleteObject removes an object version or creates a delete marker.
 func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDeleteMarker bool, delVersionID string, err error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return false, "", err
 	}
 
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return false, "", err
-	}
-	if !exists {
-		return false, "", &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
-	}
+	// The same per-key lock PutObject and CompleteMultipartUpload hold while
+	// they rename and write metadata. Without it a delete landing between a
+	// PUT's rename and its metadata write removed the new file and left
+	// metadata pointing at nothing.
+	unlockObj := fs.lockObjectKey(bucket, key)
+	defer unlockObj()
 
 	versionStatus, err := fs.metadata.GetBucketVersioning(bucket)
 	if err != nil {
 		versionStatus = ""
 	}
 
-	bucketDir := filepath.Clean(fs.bucketPath(bucket))
-	bucketPrefix := bucketDir + string(filepath.Separator)
-
+	// Throughout, metadata is removed before the data it points at: a crash
+	// in between leaves an unreferenced file, never a record whose data is
+	// gone.
 	if versionID != "" {
-		objPath, err := fs.objectPathWithVersion(bucket, key, versionID)
-		if err != nil {
+		if _, err := fs.objectPathWithVersion(bucket, key, versionID); err != nil {
 			return false, "", &S3Error{Code: "InvalidArgument", Message: err.Error()}
 		}
-		if !strings.HasPrefix(objPath, bucketPrefix) {
-			return false, "", &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-		}
-		os.Remove(objPath)
-		fs.cleanupParentDirs(objPath, bucket)
+
+		// Whether the version being removed is the current one decides what
+		// the (unversioned) mirror needs, so capture it before deleting.
+		latest, latestErr := fs.metadata.GetObjectMeta(bucket, key, "")
+		wasLatest := latestErr == nil && latest.VersionID == versionID
+		removed, _ := fs.storedRecord(bucket, key, versionID)
 
 		err = fs.metadata.DeleteObjectMeta(bucket, key, versionID)
 		if err != nil {
 			return false, "", err
 		}
+		fs.removeData(removed)
 
 		info := &ObjectInfo{
 			Bucket:    bucket,
@@ -686,22 +740,23 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 			VersionID: versionID,
 		}
 		fs.triggerWebhook("ObjectRemoved:Delete", info)
-		fs.MirrorSync(bucket, key, "DELETE")
+		fs.mirrorAfterVersionDelete(bucket, key, wasLatest)
 		return false, "", nil
 	}
 
 	if versionStatus == "Enabled" || versionStatus == "Suspended" {
+		if err := fs.promoteLegacyNullVersion(bucket, key); err != nil {
+			return false, "", err
+		}
 		var delVersionID string
+		var replaced *ObjectInfo
 		switch versionStatus {
 		case "Enabled":
 			delVersionID = uuid.New().String()
 		case "Suspended":
+			// The delete marker becomes the null version, replacing it.
 			delVersionID = "null"
-			objPath, err := fs.objectPathWithVersion(bucket, key, "null")
-			if err == nil && strings.HasPrefix(objPath, bucketPrefix) {
-				os.Remove(objPath)
-				fs.cleanupParentDirs(objPath, bucket)
-			}
+			replaced, _ = fs.storedRecord(bucket, key, "null")
 		}
 
 		info := &ObjectInfo{
@@ -718,6 +773,7 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 		if err := fs.metadata.PutObjectMeta(info); err != nil {
 			return false, "", err
 		}
+		fs.removeData(replaced)
 
 		fs.triggerWebhook("ObjectRemoved:DeleteMarkerCreated", info)
 		fs.MirrorSync(bucket, key, "DELETE")
@@ -731,33 +787,177 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 		return false, "", nil //nolint:nilerr // intentional: absent key is not an error
 	}
 
-	// Fetch all versions of the object to remove their files from disk
+	// Every version's data goes with the key: collect it before the
+	// metadata that locates it is deleted.
 	versions, err := fs.metadata.GetObjectVersions(bucket, key)
-	if err == nil {
-		for _, v := range versions {
-			objPath, err := fs.objectPathWithVersion(bucket, key, v.VersionID)
-			if err == nil && strings.HasPrefix(objPath, bucketPrefix) {
-				os.Remove(objPath)
-				fs.cleanupParentDirs(objPath, bucket)
-			}
-		}
-	} else {
-		// Fallback to deleting the latest version's file if GetObjectVersions fails
-		objPath, err := fs.objectPathWithVersion(bucket, key, info.VersionID)
-		if err == nil && strings.HasPrefix(objPath, bucketPrefix) {
-			os.Remove(objPath)
-			fs.cleanupParentDirs(objPath, bucket)
-		}
+	if err != nil {
+		versions = []ObjectInfo{*info}
 	}
 
 	err = fs.metadata.DeleteObjectMeta(bucket, key, "")
 	if err != nil {
 		return false, "", err
 	}
+	for i := range versions {
+		fs.removeData(&versions[i])
+	}
 
 	fs.triggerWebhook("ObjectRemoved:Delete", info)
 	fs.MirrorSync(bucket, key, "DELETE")
 	return false, "", nil
+}
+
+// commitObject publishes a fully written temp file as the data of info, a
+// new version of info.Key, and records its metadata. Callers hold the key
+// lock and the shared bucket lock.
+//
+// The data goes to a new blob, so nothing is overwritten in place: the record
+// this write replaces (see prepareKeyForWrite) has its data removed only once
+// the new metadata is committed. A crash in between leaves an unreferenced
+// file, never a record pointing at the wrong or missing data.
+func (fs *FilesystemEngine) commitObject(tmpPath, blobID, blobPath string, info *ObjectInfo) error {
+	replaced, err := fs.prepareKeyForWrite(info.Bucket, info.Key, info.VersionID)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, blobPath); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	info.BlobID = blobID
+	if err := fs.metadata.PutObjectMeta(info); err != nil {
+		removeObjectFile(blobPath) // never referenced by any record
+		return err
+	}
+	fs.removeData(replaced)
+	return nil
+}
+
+// prepareKeyForWrite reconciles what is already stored under key with the
+// version about to be committed, and returns the record that version
+// replaces, if any. Callers hold the key lock.
+//
+// An unversioned write replaces the current object and drops the key's
+// version history, whose data is removed here before its metadata goes in
+// PutObjectMeta. A versioned write first turns an object written before
+// versioning was enabled into the "null" version, as S3 does; with
+// versioning suspended the write then replaces that null version.
+func (fs *FilesystemEngine) prepareKeyForWrite(bucket, key, versionID string) (*ObjectInfo, error) {
+	if versionID == "" {
+		fs.removeVersionFiles(bucket, key)
+		return fs.storedRecord(bucket, key, "")
+	}
+	if err := fs.promoteLegacyNullVersion(bucket, key); err != nil {
+		return nil, err
+	}
+	if versionID == "null" {
+		return fs.storedRecord(bucket, key, "null")
+	}
+	return nil, nil
+}
+
+// storedRecord returns the record holding data for key at versionID ("" for
+// the current, unversioned object), or nil when there is none.
+func (fs *FilesystemEngine) storedRecord(bucket, key, versionID string) (*ObjectInfo, error) {
+	rec, err := fs.metadata.GetObjectMeta(bucket, key, versionID)
+	if err != nil || rec.IsDeleteMarker || rec.VersionID != versionID {
+		return nil, nil //nolint:nilerr // no record, or not the one asked for: nothing is replaced
+	}
+	return rec, nil
+}
+
+// promoteLegacyNullVersion makes an object written while the bucket was
+// unversioned addressable as version "null". Callers hold the key lock.
+//
+// Such an object has an empty version ID. The first versioned write or delete
+// used to replace its metadata outright, losing the object and orphaning its
+// file. Re-recording it as the "null" version lets the existing version logic
+// apply unchanged: with versioning Enabled it becomes a noncurrent version;
+// with it Suspended the write replaces it, as a Suspended write replaces the
+// null version. Blob data does not depend on the version ID; data in the old
+// key-path layout is moved to the null version's path.
+func (fs *FilesystemEngine) promoteLegacyNullVersion(bucket, key string) error {
+	latest, err := fs.metadata.GetObjectMeta(bucket, key, "")
+	if err != nil || latest.VersionID != "" || latest.IsDeleteMarker {
+		return nil //nolint:nilerr // nothing stored, or already versioned: nothing to promote
+	}
+
+	if latest.BlobID == "" {
+		src, err := fs.objectPathWithVersion(bucket, key, "")
+		if err != nil {
+			return &S3Error{Code: "InvalidArgument", Message: err.Error()}
+		}
+		dst, err := fs.objectPathWithVersion(bucket, key, "null")
+		if err != nil {
+			return &S3Error{Code: "InvalidArgument", Message: err.Error()}
+		}
+		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to move pre-versioning object to its null version: %w", err)
+		}
+	}
+
+	latest.VersionID = "null"
+	latest.IsLatest = true
+	return fs.metadata.PutObjectMetaRaw(latest)
+}
+
+// removeVersionFiles deletes the data of every stored version of key, leaving
+// the unversioned object's own data alone. Callers hold the key lock.
+func (fs *FilesystemEngine) removeVersionFiles(bucket, key string) {
+	versions, err := fs.metadata.GetObjectVersions(bucket, key)
+	if err != nil {
+		return
+	}
+	for i := range versions {
+		if versions[i].VersionID != "" {
+			fs.removeData(&versions[i])
+		}
+	}
+}
+
+// removeData deletes the file holding a record's data, in whichever layout
+// it was written. Delete markers have none.
+func (fs *FilesystemEngine) removeData(rec *ObjectInfo) {
+	if rec == nil || rec.IsDeleteMarker {
+		return
+	}
+	path, err := fs.dataPath(rec)
+	if err != nil {
+		slog.Warn("[Storage] Cannot locate object data to remove", "bucket", rec.Bucket, "key", rec.Key, "error", err)
+		return
+	}
+	removeObjectFile(path)
+	if rec.BlobID == "" {
+		fs.cleanupParentDirs(path, rec.Bucket)
+	}
+}
+
+// removeObjectFile deletes a stored object's file. A file that is already
+// gone is fine; any other failure leaves data on disk that nothing references
+// any more, so it is logged rather than silently ignored as it used to be.
+func removeObjectFile(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("[Storage] Failed to remove object file; it is now orphaned on disk", "path", path, "error", err)
+	}
+}
+
+// mirrorAfterVersionDelete brings the replica in line after one specific
+// version was removed.
+//
+// The mirror is a plain, unversioned copy of each key's current state, so a
+// DELETE there removes the object outright. Removing a noncurrent version
+// leaves the current state unchanged and needs nothing. Removing the current
+// version exposes whatever is now latest: re-upload it, or delete the mirror
+// copy if nothing readable is left (no versions, or a delete marker on top).
+func (fs *FilesystemEngine) mirrorAfterVersionDelete(bucket, key string, wasLatest bool) {
+	if !wasLatest {
+		return
+	}
+	next, err := fs.metadata.GetObjectMeta(bucket, key, "")
+	if err == nil && !next.IsDeleteMarker {
+		fs.MirrorSync(bucket, key, "PUT")
+		return
+	}
+	fs.MirrorSync(bucket, key, "DELETE")
 }
 
 // CopyObject copies an object from one location to another.
@@ -801,63 +1001,52 @@ func (fs *FilesystemEngine) CopyObject(ctx context.Context, src CopySource, dstB
 
 // GetBucketVersioning gets the versioning status of a bucket.
 func (fs *FilesystemEngine) GetBucketVersioning(bucket string) (string, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return "", err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return "", err
-	}
-	if !exists {
-		return "", &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.GetBucketVersioning(bucket)
 }
 
 // SetBucketVersioning sets the versioning status of a bucket.
 func (fs *FilesystemEngine) SetBucketVersioning(bucket, status string) error {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	if status != "Enabled" && status != "Suspended" && status != "Disabled" {
 		return &S3Error{Code: "InvalidArgument", Message: "Versioning status must be Enabled, Suspended, or Disabled"}
+	}
+	if status == "Disabled" {
+		// As in S3, a versioned bucket can be suspended but never returned to
+		// unversioned. Allowing it sent the next plain DELETE down the
+		// unversioned path, which erases every version of the key.
+		current, err := fs.metadata.GetBucketVersioning(bucket)
+		if err != nil {
+			return err
+		}
+		if current == "Enabled" || current == "Suspended" {
+			return &S3Error{
+				Code:    "IllegalVersioningConfigurationException",
+				Message: "A versioned bucket cannot be returned to an unversioned state; use Suspended instead.",
+			}
+		}
+		// Never versioned: Disabled is a no-op.
+		return nil
 	}
 	return fs.metadata.PutBucketVersioning(bucket, status)
 }
 
 // SetBucketPublic sets the public status of a bucket.
 func (fs *FilesystemEngine) SetBucketPublic(bucket string, public bool) error {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.SetBucketPublic(bucket, public)
 }
 
 // IsBucketPublic gets the public status of a bucket.
 func (fs *FilesystemEngine) IsBucketPublic(bucket string) (bool, error) {
-	if err := fs.validateBucketName(bucket); err != nil {
+	if err := fs.requireBucket(bucket); err != nil {
 		return false, err
-	}
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
-		return false, err
-	}
-	if !exists {
-		return false, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 	return fs.metadata.IsBucketPublic(bucket)
 }
@@ -866,16 +1055,8 @@ func (fs *FilesystemEngine) IsBucketPublic(bucket string) (bool, error) {
 // Performs cursor-based pagination and skip-scanning direct query inside bbolt transaction
 // to avoid loading all keys in memory (OOM safety).
 func (fs *FilesystemEngine) ListObjects(input *ListObjectsInput) (*ListObjectsOutput, error) {
-	if err := fs.validateBucketName(input.Bucket); err != nil {
+	if err := fs.requireBucket(input.Bucket); err != nil {
 		return nil, err
-	}
-
-	exists, err := fs.metadata.BucketExists(input.Bucket)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
 	}
 
 	maxKeys := input.MaxKeys
@@ -1094,11 +1275,12 @@ func isCompressibleContentType(contentType string) bool {
 
 type metricsReadCloser struct {
 	io.ReadCloser
+	metrics *MetricsTracker
 }
 
 func (m *metricsReadCloser) Read(p []byte) (int, error) {
 	n, err := m.ReadCloser.Read(p)
-	GlobalMetrics.AddDownloaded(int64(n))
+	m.metrics.AddDownloaded(int64(n))
 	return n, err
 }
 
@@ -1110,6 +1292,26 @@ type metricsReadSeekCloser struct {
 func (m *metricsReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
 	return m.seeker.Seek(offset, whence)
 }
+
+// FileBacked is implemented by object readers whose content is exactly the
+// bytes of a file on disk — neither encrypted nor compressed. An HTTP layer
+// can then hand the file itself to net/http, which copies it with sendfile
+// instead of through userspace. It must count what it sends with
+// CountDownloaded, since reads of the file bypass the reader's own metrics.
+type FileBacked interface {
+	BackingFile() *os.File
+	CountDownloaded(n int64)
+}
+
+// fileObjectReader is the reader GetObject returns for a plain object.
+type fileObjectReader struct {
+	metricsReadSeekCloser
+	file *os.File
+}
+
+func (f *fileObjectReader) BackingFile() *os.File { return f.file }
+
+func (f *fileObjectReader) CountDownloaded(n int64) { f.metrics.AddDownloaded(n) }
 
 // Metadata returns the underlying MetadataStore.
 func (fs *FilesystemEngine) Metadata() *MetadataStore {
@@ -1154,9 +1356,32 @@ func validateSSECParams(info *ObjectInfo, params *SSECParams) error {
 	return nil
 }
 
+// seedActiveMultipartGauge starts the in-progress multipart gauge from the
+// uploads already recorded. It used to start at zero on every boot, so
+// completing or aborting uploads begun before a restart drove it negative.
+func seedActiveMultipartGauge(meta *MetadataStore, metrics *MetricsTracker) {
+	buckets, err := meta.ListBuckets()
+	if err != nil {
+		slog.Warn("[Storage] Could not count in-progress multipart uploads at startup", "error", err)
+		return
+	}
+	var total int64
+	for _, b := range buckets {
+		err := meta.IterateMultipartMetas(b.Name, func(*MultipartMeta) error {
+			total++
+			return nil
+		})
+		if err != nil {
+			slog.Warn("[Storage] Could not count in-progress multipart uploads", "bucket", b.Name, "error", err)
+		}
+	}
+	metrics.SetActiveMultiparts(total)
+}
+
 func cleanupOrphanedTempFiles(dataDir string) {
 	walkDirs := []string{
 		filepath.Join(dataDir, "buckets"),
+		filepath.Join(dataDir, "blobs"),
 		filepath.Join(dataDir, "multipart"),
 		filepath.Join(dataDir, "tmp"),
 	}
@@ -1251,7 +1476,10 @@ func (crs *ctrReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	}
 
 	crs.stream = cipher.NewCTR(crs.block, ctr)
-	crs.currentOffset = target
+	// The file now sits at the start of target's block. The discard read
+	// below advances currentOffset by remainder itself, so starting from
+	// target here (as this used to) over-counted by remainder.
+	crs.currentOffset = blockIndex * 16
 
 	if remainder > 0 {
 		discardBuf := make([]byte, remainder)

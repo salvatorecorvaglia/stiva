@@ -86,15 +86,18 @@ func TestStaticHTMLHasNoInlineScript(t *testing.T) {
 // an object key free to close the data-key/aria-label attribute it was
 // interpolated into and append an event handler.
 func TestEscapeHtmlEscapesQuotes(t *testing.T) {
-	body, err := os.ReadFile("../../internal/console/static/app.js")
+	// escapeHtml lives in lib.js with the console's other pure helpers,
+	// where jstest/lib.test.cjs also exercises it; this static check holds
+	// even where Node is not installed.
+	body, err := os.ReadFile("../../internal/console/static/lib.js")
 	if err != nil {
-		t.Fatalf("failed to read app.js: %v", err)
+		t.Fatalf("failed to read lib.js: %v", err)
 	}
 	js := string(body)
 
 	fn := regexp.MustCompile(`(?s)function escapeHtml\(str\) \{.*?\n    \}`).FindString(js)
 	if fn == "" {
-		t.Fatal("could not locate escapeHtml in app.js")
+		t.Fatal("could not locate escapeHtml in lib.js")
 	}
 	if strings.Contains(fn, "textContent") {
 		t.Error("escapeHtml round-trips through textContent/innerHTML, which does not escape quotes")

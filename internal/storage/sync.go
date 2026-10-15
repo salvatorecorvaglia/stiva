@@ -49,11 +49,18 @@ const (
 
 func (fs *FilesystemEngine) initSyncDispatcher() {
 	fs.syncQueue = make(chan syncTask, syncQueueSize)
+	ctx := fs.dispatchContext()
 	for i := 0; i < syncWorkerCount; i++ {
 		fs.syncWG.Add(1)
 		go func() {
 			defer fs.syncWG.Done()
 			for task := range fs.syncQueue {
+				// Past the shutdown deadline the rest of the queue is
+				// abandoned rather than delivered.
+				if ctx.Err() != nil {
+					fs.Metrics().IncSyncDropped()
+					continue
+				}
 				fs.attemptSync(task, 0)
 			}
 		}()
@@ -68,7 +75,8 @@ func (fs *FilesystemEngine) initSyncDispatcher() {
 // Wait() blocks until the retry chain finishes rather than returning while a
 // retry is still pending.
 func (fs *FilesystemEngine) attemptSync(task syncTask, n int) {
-	err := performSync(context.Background(), task.fs, task.fs.syncClient, task.cfg, task.bucket, task.key, task.op)
+	ctx := fs.dispatchContext()
+	err := performSync(ctx, task.fs, task.fs.syncClient, task.cfg, task.bucket, task.key, task.op)
 	if err == nil {
 		slog.Info("[Sync] Mirroring succeeded", "op", task.op, "bucket", task.bucket, "key", task.key)
 		return
@@ -83,6 +91,7 @@ func (fs *FilesystemEngine) attemptSync(task syncTask, n int) {
 	}
 
 	if atomic.LoadInt32(&fs.isSyncShuttingDown) == 1 {
+		fs.Metrics().IncSyncDropped()
 		slog.Warn("[Sync] Dispatcher shutting down, abandoning retry", "op", task.op, "bucket", task.bucket, "key", task.key)
 		return
 	}
@@ -94,26 +103,34 @@ func (fs *FilesystemEngine) attemptSync(task syncTask, n int) {
 	slog.Warn("[Sync] Mirroring attempt failed, will retry", "op", task.op, "bucket", task.bucket, "key", task.key, "attempt", n, "error", err)
 	backoff := syncBaseBackoff << n
 	fs.syncWG.Add(1)
-	time.AfterFunc(backoff, func() {
+	go func() {
 		defer fs.syncWG.Done()
+		if !sleepCtx(ctx, backoff) {
+			fs.Metrics().IncSyncDropped()
+			return
+		}
 		fs.attemptSync(task, n+1)
-	})
+	}()
 }
 
-// StopSyncDispatcher halts replication queue processing, waits for pending transfers, and shuts down workers.
+// StopSyncDispatcher halts replication queue processing, waits for pending
+// transfers, and shuts down workers. It waits as long as that takes; use
+// Shutdown to bound it.
 func (fs *FilesystemEngine) StopSyncDispatcher() {
+	fs.beginSyncStop()
+	fs.syncWG.Wait()
+}
+
+// beginSyncStop refuses new replication events and closes the queue so the
+// workers exit once it is drained. It is idempotent.
+func (fs *FilesystemEngine) beginSyncStop() {
 	fs.syncMu.Lock()
+	defer fs.syncMu.Unlock()
 	if atomic.SwapInt32(&fs.isSyncShuttingDown, 1) == 1 {
-		fs.syncMu.Unlock()
 		return
 	}
-
-	q := fs.syncQueue
-	fs.syncMu.Unlock()
-
-	if q != nil {
-		close(q)
-		fs.syncWG.Wait()
+	if fs.syncQueue != nil {
+		close(fs.syncQueue)
 	}
 }
 
@@ -146,7 +163,7 @@ func (fs *FilesystemEngine) MirrorSync(bucket, key, op string) {
 	select {
 	case fs.syncQueue <- task:
 	default:
-		GlobalMetrics.IncSyncDropped()
+		fs.Metrics().IncSyncDropped()
 		slog.Warn("[Sync] Sync queue full, dropping sync task", "op", op, "bucket", bucket, "key", key)
 	}
 }

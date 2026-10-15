@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func validConfig() *Config {
@@ -18,6 +19,7 @@ func validConfig() *Config {
 		LogLevel:         "info",
 		LogFormat:        "text",
 		TrustedProxyHops: 1,
+		MultipartExpiry:  defaultMultipartExpiry,
 	}
 }
 
@@ -146,20 +148,23 @@ func TestValidateAcceptsLongJWTSecret(t *testing.T) {
 
 // TestEnvBoolAcceptsCommonSpellings covers the finding that only the exact
 // string "true" enabled boolean flags, silently ignoring "1", "TRUE" and "yes".
-func TestEnvBoolAcceptsCommonSpellings(t *testing.T) {
+// TestBoolFlagsAcceptCommonSpellings covers the boolean parsing Load applies
+// to every flag (checked here through STIVA_TRUST_PROXY). Unrecognised
+// spellings are startup errors; see TestDisableMinPartSizeRejectsGarbage.
+func TestBoolFlagsAcceptCommonSpellings(t *testing.T) {
 	truthy := []string{"1", "t", "true", "TRUE", "True", "y", "yes", "YES", "on", " true "}
 	for _, v := range truthy {
-		t.Setenv("STIVA_TEST_BOOL", v)
-		if !envBool("STIVA_TEST_BOOL") {
-			t.Errorf("envBool(%q) = false, want true", v)
+		t.Setenv("STIVA_TRUST_PROXY", v)
+		if !Load().TrustProxy {
+			t.Errorf("STIVA_TRUST_PROXY=%q parsed as false, want true", v)
 		}
 	}
 
-	falsy := []string{"", "0", "false", "no", "off", "banana"}
+	falsy := []string{"", "0", "f", "false", "n", "no", "off"}
 	for _, v := range falsy {
-		t.Setenv("STIVA_TEST_BOOL", v)
-		if envBool("STIVA_TEST_BOOL") {
-			t.Errorf("envBool(%q) = true, want false", v)
+		t.Setenv("STIVA_TRUST_PROXY", v)
+		if Load().TrustProxy {
+			t.Errorf("STIVA_TRUST_PROXY=%q parsed as true, want false", v)
 		}
 	}
 }
@@ -193,5 +198,63 @@ func TestDisableMinPartSizeRejectsGarbage(t *testing.T) {
 		t.Error("STIVA_DISABLE_MIN_PART_SIZE=enabled should fail validation")
 	} else if !strings.Contains(err.Error(), "STIVA_DISABLE_MIN_PART_SIZE") {
 		t.Errorf("error should name the offending variable, got: %v", err)
+	}
+}
+
+// TestMultipartExpiryParsing covers STIVA_MULTIPART_EXPIRY. Incomplete
+// multipart uploads used to be aborted after a hardcoded 24 hours, which
+// killed slow uploads of very large objects partway through.
+func TestMultipartExpiryParsing(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", defaultMultipartExpiry},
+		{"36h", 36 * time.Hour},
+		{"7d", 7 * 24 * time.Hour},
+		{"2d12h", 60 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Setenv("STIVA_MULTIPART_EXPIRY", tc.raw)
+		cfg := Load()
+		if cfg.MultipartExpiry != tc.want {
+			t.Errorf("STIVA_MULTIPART_EXPIRY=%q parsed as %v, want %v", tc.raw, cfg.MultipartExpiry, tc.want)
+		}
+		if err := cfg.Validate(); err != nil && strings.Contains(err.Error(), "STIVA_MULTIPART_EXPIRY") {
+			t.Errorf("STIVA_MULTIPART_EXPIRY=%q rejected: %v", tc.raw, err)
+		}
+	}
+}
+
+func TestMultipartExpiryRejectsBadValues(t *testing.T) {
+	for _, raw := range []string{"soon", "-2h", "30m", "0"} {
+		t.Setenv("STIVA_MULTIPART_EXPIRY", raw)
+		err := Load().Validate()
+		if err == nil || !strings.Contains(err.Error(), "STIVA_MULTIPART_EXPIRY") {
+			t.Errorf("STIVA_MULTIPART_EXPIRY=%q: err = %v, want a startup error naming the variable", raw, err)
+		}
+	}
+}
+
+// TestConsoleAllowedOrigins covers STIVA_CONSOLE_ALLOWED_ORIGINS: a
+// comma-separated list of exact origins (scheme://host[:port]) the console
+// answers besides its own.
+func TestConsoleAllowedOrigins(t *testing.T) {
+	t.Setenv("STIVA_CONSOLE_ALLOWED_ORIGINS", " https://Admin.Example.com , http://localhost:5173/ ")
+	cfg := Load()
+	want := []string{"https://admin.example.com", "http://localhost:5173"}
+	if strings.Join(cfg.ConsoleAllowedOrigins, ",") != strings.Join(want, ",") {
+		t.Errorf("parsed %q, want %q", cfg.ConsoleAllowedOrigins, want)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid origins rejected: %v", err)
+	}
+
+	for _, raw := range []string{"not-an-origin", "https://x.example.com/path", "ftp://x.example.com", "https://", "*"} {
+		t.Setenv("STIVA_CONSOLE_ALLOWED_ORIGINS", raw)
+		err := Load().Validate()
+		if err == nil || !strings.Contains(err.Error(), "STIVA_CONSOLE_ALLOWED_ORIGINS") {
+			t.Errorf("STIVA_CONSOLE_ALLOWED_ORIGINS=%q: err = %v, want a startup error naming the variable", raw, err)
+		}
 	}
 }

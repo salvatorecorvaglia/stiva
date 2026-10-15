@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -217,5 +218,85 @@ func TestConcurrentGetBucketDBInitLocks(t *testing.T) {
 	// Verify that the entry in initLocks is eventually deleted after all goroutines complete
 	if meta.hasInitLock(badBucket) {
 		t.Error("expected initLocks entry to be deleted after all concurrent attempts complete")
+	}
+}
+
+// TestMetadataMigrationAtScale migrates a legacy database larger than one
+// batch. Migration used to commit one transaction — one fsync — per record,
+// which for a large installation turned the first startup after upgrading
+// into a very long wait. It also checks that migrated buckets report correct
+// object counts: records copied in raw must not be trusted to a count
+// initialized before they arrived.
+func TestMetadataMigrationAtScale(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := bolt.Open(filepath.Join(tmpDir, "stiva.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const bigObjects, smallObjects, versionsPerBig = 2500, 30, 1
+	err = db.Update(func(tx *bolt.Tx) error {
+		bb, err := tx.CreateBucket(bucketsBucket)
+		if err != nil {
+			return err
+		}
+		ob, err := tx.CreateBucket(objectsBucket)
+		if err != nil {
+			return err
+		}
+		for _, name := range []string{"big", "small"} {
+			data, _ := json.Marshal(BucketInfo{Name: name, CreationDate: time.Now().UTC()})
+			if err := bb.Put([]byte(name), data); err != nil {
+				return err
+			}
+		}
+		put := func(bucket, key, version string) error {
+			info := ObjectInfo{Bucket: bucket, Key: key, VersionID: version, Size: 1, LastModified: time.Now().UTC(), IsLatest: true}
+			data, _ := json.Marshal(info)
+			if err := ob.Put(objectMetaKey(bucket, key), data); err != nil {
+				return err
+			}
+			if version != "" {
+				return ob.Put(objectMetaKeyVersion(bucket, key, version), data)
+			}
+			return nil
+		}
+		for i := 0; i < bigObjects; i++ {
+			if err := put("big", fmt.Sprintf("obj-%05d", i), fmt.Sprintf("v%d", i)); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < smallObjects; i++ {
+			if err := put("small", fmt.Sprintf("obj-%05d", i), ""); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := NewMetadataStore(tmpDir)
+	if err != nil {
+		t.Fatalf("NewMetadataStore: %v", err)
+	}
+	defer meta.Close()
+
+	for bucket, want := range map[string]int{"big": bigObjects, "small": smallObjects} {
+		got, err := meta.CountObjectMetas(bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s: CountObjectMetas after migration = %d, want %d", bucket, got, want)
+		}
+		if scan, _ := meta.countObjectMetasByScan(bucket); scan != want {
+			t.Errorf("%s: %d records migrated, want %d", bucket, scan, want)
+		}
+	}
+	if _, err := meta.GetObjectMeta("big", "obj-02499", "v2499"); err != nil {
+		t.Errorf("last version record of the big bucket not migrated: %v", err)
 	}
 }

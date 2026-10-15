@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,10 @@ var (
 	bucketsBucket   = []byte("buckets")
 	objectsBucket   = []byte("objects")
 	multipartBucket = []byte("multipart")
+	// statsBucket holds per-bucket counters kept in step with the records
+	// they summarize; objectCountKey is the number of current-version records.
+	statsBucket    = []byte("stats")
+	objectCountKey = []byte("objects")
 )
 
 type initLock struct {
@@ -56,10 +61,12 @@ type MetadataStore struct {
 
 	bucketCache map[string]*BucketInfo
 	cacheMu     sync.RWMutex
+	// cacheGen is bumped (under cacheMu) by every bucket-config write. A cache
+	// fill records it before reading the database and only stores its result
+	// if it is unchanged, so a read that raced a write can't overwrite the
+	// write's invalidation with the old value.
+	cacheGen    uint64
 	inMigration bool
-
-	countCache map[string]countEntry
-	countMu    sync.RWMutex
 }
 
 type bucketLockSegment struct {
@@ -147,7 +154,6 @@ func NewMetadataStore(dataDir string) (*MetadataStore, error) {
 		activeBuckets: make(map[string]*bucketDBEntry),
 		dataDir:       dataDir,
 		bucketCache:   make(map[string]*BucketInfo),
-		countCache:    make(map[string]countEntry),
 	}
 	for i := 0; i < 32; i++ {
 		m.bucketLocks[i] = &bucketLockSegment{
@@ -304,7 +310,7 @@ func (m *MetadataStore) acquireBucketDB(bucket string) (*bolt.DB, func(), error)
 		if _, err := tx.CreateBucketIfNotExists(multipartBucket); err != nil {
 			return err
 		}
-		return nil
+		return initObjectCount(tx)
 	})
 	if err != nil {
 		db.Close()
@@ -370,80 +376,13 @@ func (m *MetadataStore) migrateIfNecessary() error {
 	slog.Info("[Migration] Migrating old single-database metadata to per-bucket databases")
 
 	if objectsBucketExists {
-		var errs []error
-		err = m.globalDB.View(func(tx *bolt.Tx) error {
-			b := tx.Bucket(objectsBucket)
-			return b.ForEach(func(k, v []byte) error {
-				parts := bytes.SplitN(k, []byte("\x00"), 2)
-				if len(parts) != 2 {
-					return nil
-				}
-				bucketName := string(parts[0])
-
-				bucketDB, releasebucketDB, err := m.acquireBucketDB(bucketName)
-				if err != nil {
-					errs = append(errs, err)
-					return nil
-				}
-				defer releasebucketDB()
-
-				err = bucketDB.Update(func(btx *bolt.Tx) error {
-					bb, err := btx.CreateBucketIfNotExists(objectsBucket)
-					if err != nil {
-						return err
-					}
-					return bb.Put(k, v)
-				})
-				if err != nil {
-					errs = append(errs, err)
-				}
-				return nil
-			})
-		})
-		if err != nil {
+		if err := m.migrateRecords(objectsBucket); err != nil {
 			return err
-		}
-		if len(errs) > 0 {
-			return errs[0]
 		}
 	}
-
 	if multipartBucketExists {
-		var errs []error
-		err = m.globalDB.View(func(tx *bolt.Tx) error {
-			b := tx.Bucket(multipartBucket)
-			return b.ForEach(func(k, v []byte) error {
-				parts := bytes.SplitN(k, []byte("\x00"), 3)
-				if len(parts) < 1 {
-					return nil
-				}
-				bucketName := string(parts[0])
-
-				bucketDB, releasebucketDB, err := m.acquireBucketDB(bucketName)
-				if err != nil {
-					errs = append(errs, err)
-					return nil
-				}
-				defer releasebucketDB()
-
-				err = bucketDB.Update(func(btx *bolt.Tx) error {
-					bb, err := btx.CreateBucketIfNotExists(multipartBucket)
-					if err != nil {
-						return err
-					}
-					return bb.Put(k, v)
-				})
-				if err != nil {
-					errs = append(errs, err)
-				}
-				return nil
-			})
-		})
-		if err != nil {
+		if err := m.migrateRecords(multipartBucket); err != nil {
 			return err
-		}
-		if len(errs) > 0 {
-			return errs[0]
 		}
 	}
 
@@ -464,6 +403,74 @@ func (m *MetadataStore) migrateIfNecessary() error {
 	return nil
 }
 
+// migrationBatchSize is how many records migration writes per transaction.
+const migrationBatchSize = 1000
+
+// migrateRecords copies every record of one top-level bbolt bucket in the old
+// single-file database into the per-bucket databases.
+//
+// It writes in batches. It used to commit one transaction — one fsync — per
+// record, so the first start after upgrading a large installation could take
+// hours. Keys begin with the bucket name, so each bucket's records are
+// contiguous and a batch never spans two databases.
+func (m *MetadataStore) migrateRecords(src []byte) error {
+	type record struct{ k, v []byte }
+	var batch []record
+	batchBucket := ""
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		db, release, err := m.acquireBucketDB(batchBucket)
+		if err != nil {
+			return err
+		}
+		defer release()
+		err = db.Update(func(tx *bolt.Tx) error {
+			dst, err := tx.CreateBucketIfNotExists(src)
+			if err != nil {
+				return err
+			}
+			for _, r := range batch {
+				if err := dst.Put(r.k, r.v); err != nil {
+					return err
+				}
+			}
+			// These records bypass the writes that maintain the object
+			// count, so drop it and let the first read recount.
+			if sb := tx.Bucket(statsBucket); sb != nil {
+				return sb.Delete(objectCountKey)
+			}
+			return nil
+		})
+		batch = batch[:0]
+		return err
+	}
+
+	err := m.globalDB.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(src).ForEach(func(k, v []byte) error {
+			name, _, found := bytes.Cut(k, []byte{0})
+			if !found && bytes.Equal(src, objectsBucket) {
+				return nil // not an object record
+			}
+			if len(batch) > 0 && (string(name) != batchBucket || len(batch) >= migrationBatchSize) {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+			batchBucket = string(name)
+			// bbolt's keys and values are only valid inside the transaction.
+			batch = append(batch, record{append([]byte(nil), k...), append([]byte(nil), v...)})
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
+}
+
 // PutBucket stores bucket metadata.
 func (m *MetadataStore) PutBucket(info *BucketInfo) error {
 	unlock := m.acquireBucketLock(info.Name, true)
@@ -478,11 +485,16 @@ func (m *MetadataStore) PutBucket(info *BucketInfo) error {
 	})
 	if err == nil {
 		m.cacheMu.Lock()
+		m.cacheGen++
 		m.bucketCache[info.Name] = info
 		m.cacheMu.Unlock()
 	}
 	return err
 }
+
+// errNoSuchBucketRecord marks a lookup of a bucket that is not in the
+// registry, as opposed to a failure to read the registry at all.
+var errNoSuchBucketRecord = errors.New("bucket not found")
 
 // GetBucket retrieves bucket metadata by name.
 func (m *MetadataStore) GetBucket(name string) (*BucketInfo, error) {
@@ -493,7 +505,7 @@ func (m *MetadataStore) GetBucket(name string) (*BucketInfo, error) {
 		b := tx.Bucket(bucketsBucket)
 		data := b.Get([]byte(name))
 		if data == nil {
-			return fmt.Errorf("bucket not found: %s", name)
+			return fmt.Errorf("%w: %s", errNoSuchBucketRecord, name)
 		}
 		return json.Unmarshal(data, &info)
 	})
@@ -516,27 +528,59 @@ func (m *MetadataStore) GetBucketCached(name string) (*BucketInfo, error) {
 
 	if exists {
 		if info == nil {
-			return nil, fmt.Errorf("bucket not found: %s", name)
+			return nil, fmt.Errorf("%w: %s", errNoSuchBucketRecord, name)
 		}
 		return info, nil
 	}
 
+	gen := m.bucketCacheGeneration()
 	info, err := m.GetBucket(name)
+	m.fillBucketCache(name, info, err, gen)
 
+	return info, err
+}
+
+// bucketCacheGeneration returns the current cache generation; pass it to
+// fillBucketCache after reading from the database.
+func (m *MetadataStore) bucketCacheGeneration() uint64 {
+	m.cacheMu.RLock()
+	defer m.cacheMu.RUnlock()
+	return m.cacheGen
+}
+
+// fillBucketCache stores a database read in the cache, unless a bucket-config
+// write happened since gen was taken. Such a write may have committed before
+// or after the read; either way the read may be stale, and keeping it would
+// serve the old config (a bucket made private still read as public) with no
+// expiry to correct it.
+func (m *MetadataStore) fillBucketCache(name string, info *BucketInfo, err error, gen uint64) {
 	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.cacheGen != gen {
+		return
+	}
 	// Drop the whole cache rather than track per-entry recency: entries are
 	// cheap to rebuild and this bound is only a safety valve.
 	if len(m.bucketCache) >= maxBucketCacheEntries {
 		m.bucketCache = make(map[string]*BucketInfo, maxBucketCacheEntries)
 	}
-	if err != nil {
-		m.bucketCache[name] = nil
-	} else {
+	switch {
+	case err == nil:
 		m.bucketCache[name] = info
+	case errors.Is(err, errNoSuchBucketRecord):
+		m.bucketCache[name] = nil
+	default:
+		// A failed read says nothing about the bucket; caching it as
+		// missing would hide the bucket until its next config change.
 	}
-	m.cacheMu.Unlock()
+}
 
-	return info, err
+// invalidateBucketCache drops a bucket's cached config after a write to it.
+func (m *MetadataStore) invalidateBucketCache(name string) {
+	m.cacheMu.Lock()
+	m.cacheGen++
+	delete(m.bucketCache, name)
+	m.cacheMu.Unlock()
 }
 
 // DeleteBucket removes bucket metadata and deletes its DB file.
@@ -550,10 +594,7 @@ func (m *MetadataStore) DeleteBucket(name string) error {
 	if err != nil {
 		return err
 	}
-	m.cacheMu.Lock()
-	delete(m.bucketCache, name)
-	m.cacheMu.Unlock()
-	m.invalidateCount(name)
+	m.invalidateBucketCache(name)
 	return m.closeAndRemoveBucketDB(name)
 }
 
@@ -613,33 +654,39 @@ func (m *MetadataStore) ListBuckets() ([]BucketInfo, error) {
 }
 
 // BucketExists checks if a bucket exists in the central metadata store.
+//
+// It is answered from the bucket cache, whose generation guard keeps it
+// consistent with bucket creation and deletion. It used to open a database
+// transaction on every call — and nearly every engine operation, plus the
+// router's per-request logging and public-access checks, makes one.
 func (m *MetadataStore) BucketExists(name string) (bool, error) {
-	unlock := m.acquireBucketLock(name, false)
-	defer unlock()
-	exists := false
-	err := m.globalDB.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		exists = b.Get([]byte(name)) != nil
-		return nil
-	})
-	return exists, err
+	_, err := m.GetBucketCached(name)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, errNoSuchBucketRecord):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
-// PutBucketCORS sets CORS configuration for a bucket.
-func (m *MetadataStore) PutBucketCORS(bucket string, cors *CORSConfiguration) error {
+// updateBucketInfo applies mutate to a bucket's stored configuration in one
+// transaction, under the bucket's write lock, and invalidates its cached copy.
+func (m *MetadataStore) updateBucketInfo(bucket string, mutate func(*BucketInfo)) error {
 	unlock := m.acquireBucketLock(bucket, true)
 	defer unlock()
 	err := m.globalDB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketsBucket)
 		data := b.Get([]byte(bucket))
 		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
+			return fmt.Errorf("%w: %s", errNoSuchBucketRecord, bucket)
 		}
 		var info BucketInfo
 		if err := json.Unmarshal(data, &info); err != nil {
 			return err
 		}
-		info.CORS = cors
+		mutate(&info)
 		newData, err := json.Marshal(info)
 		if err != nil {
 			return err
@@ -647,11 +694,16 @@ func (m *MetadataStore) PutBucketCORS(bucket string, cors *CORSConfiguration) er
 		return b.Put([]byte(bucket), newData)
 	})
 	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
+		m.invalidateBucketCache(bucket)
 	}
 	return err
+}
+
+// PutBucketCORS sets CORS configuration for a bucket.
+func (m *MetadataStore) PutBucketCORS(bucket string, cors *CORSConfiguration) error {
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
+		info.CORS = cors
+	})
 }
 
 // GetBucketCORS gets CORS configuration for a bucket.
@@ -665,60 +717,16 @@ func (m *MetadataStore) GetBucketCORS(bucket string) (*CORSConfiguration, error)
 
 // DeleteBucketCORS deletes CORS configuration for a bucket.
 func (m *MetadataStore) DeleteBucketCORS(bucket string) error {
-	unlock := m.acquireBucketLock(bucket, true)
-	defer unlock()
-	err := m.globalDB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		data := b.Get([]byte(bucket))
-		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
-		}
-		var info BucketInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			return err
-		}
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
 		info.CORS = nil
-		newData, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(bucket), newData)
 	})
-	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
-	}
-	return err
 }
 
 // PutBucketVersioning sets versioning configuration for a bucket.
 func (m *MetadataStore) PutBucketVersioning(bucket string, status string) error {
-	unlock := m.acquireBucketLock(bucket, true)
-	defer unlock()
-	err := m.globalDB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		data := b.Get([]byte(bucket))
-		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
-		}
-		var info BucketInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			return err
-		}
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
 		info.Versioning = status
-		newData, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(bucket), newData)
 	})
-	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
-	}
-	return err
 }
 
 // GetBucketVersioning gets versioning configuration for a bucket.
@@ -732,31 +740,9 @@ func (m *MetadataStore) GetBucketVersioning(bucket string) (string, error) {
 
 // SetBucketPublic sets the public status of a bucket.
 func (m *MetadataStore) SetBucketPublic(bucket string, public bool) error {
-	unlock := m.acquireBucketLock(bucket, true)
-	defer unlock()
-	err := m.globalDB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		data := b.Get([]byte(bucket))
-		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
-		}
-		var info BucketInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			return err
-		}
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
 		info.IsPublic = public
-		newData, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(bucket), newData)
 	})
-	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
-	}
-	return err
 }
 
 // IsBucketPublic gets the public status of a bucket.
@@ -778,7 +764,6 @@ func objectMetaKeyVersion(bucket, key, versionID string) []byte {
 
 // PutObjectMeta stores object metadata (both the latest pointer and the historical record).
 func (m *MetadataStore) PutObjectMeta(info *ObjectInfo) error {
-	defer m.invalidateCount(info.Bucket)
 	unlock := m.acquireBucketLock(info.Bucket, false)
 	defer unlock()
 	db, releasedb, err := m.acquireBucketDB(info.Bucket)
@@ -793,13 +778,23 @@ func (m *MetadataStore) PutObjectMeta(info *ObjectInfo) error {
 
 		// Update old latest version if present
 		oldData := b.Get(objectMetaKey(info.Bucket, info.Key))
+		if oldData == nil {
+			if err := adjustObjectCount(tx, 1); err != nil {
+				return err
+			}
+		}
 		if oldData != nil {
 			var oldInfo ObjectInfo
 			if err := json.Unmarshal(oldData, &oldInfo); err == nil {
 				if oldInfo.VersionID != "" && oldInfo.VersionID != info.VersionID {
 					oldInfo.IsLatest = false
-					oldHistData, _ := json.Marshal(oldInfo)
-					_ = b.Put(objectMetaKeyVersion(oldInfo.Bucket, oldInfo.Key, oldInfo.VersionID), oldHistData)
+					oldHistData, err := json.Marshal(oldInfo)
+					if err != nil {
+						return err
+					}
+					if err := b.Put(objectMetaKeyVersion(oldInfo.Bucket, oldInfo.Key, oldInfo.VersionID), oldHistData); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -876,7 +871,6 @@ func (m *MetadataStore) GetObjectMeta(bucket, key, versionID string) (*ObjectInf
 // DeleteObjectMeta removes object metadata. If versionID is specified, deletes only that version.
 // If latest is deleted, updates the latest pointer to the next newest version in history.
 func (m *MetadataStore) DeleteObjectMeta(bucket, key, versionID string) error {
-	defer m.invalidateCount(bucket)
 	unlock := m.acquireBucketLock(bucket, false)
 	defer unlock()
 	db, releasedb, err := m.acquireBucketDB(bucket)
@@ -902,13 +896,25 @@ func (m *MetadataStore) DeleteObjectMeta(bucket, key, versionID string) error {
 					nextLatest, err := m.findNextNewestVersion(tx, bucket, key, versionID)
 					if err == nil && nextLatest != nil {
 						nextLatest.IsLatest = true
-						nextData, _ := json.Marshal(nextLatest)
-						_ = b.Put(objectMetaKey(bucket, key), nextData)
+						nextData, err := json.Marshal(nextLatest)
+						if err != nil {
+							return err
+						}
+						if err := b.Put(objectMetaKey(bucket, key), nextData); err != nil {
+							return err
+						}
 						if nextLatest.VersionID != "" {
-							_ = b.Put(objectMetaKeyVersion(bucket, key, nextLatest.VersionID), nextData)
+							if err := b.Put(objectMetaKeyVersion(bucket, key, nextLatest.VersionID), nextData); err != nil {
+								return err
+							}
 						}
 					} else {
-						_ = b.Delete(objectMetaKey(bucket, key))
+						if err := b.Delete(objectMetaKey(bucket, key)); err != nil {
+							return err
+						}
+						if err := adjustObjectCount(tx, -1); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -916,7 +922,14 @@ func (m *MetadataStore) DeleteObjectMeta(bucket, key, versionID string) error {
 		}
 
 		// Delete all metadata (pointer and all historical versions)
-		_ = b.Delete(objectMetaKey(bucket, key))
+		if b.Get(objectMetaKey(bucket, key)) != nil {
+			if err := b.Delete(objectMetaKey(bucket, key)); err != nil {
+				return err
+			}
+			if err := adjustObjectCount(tx, -1); err != nil {
+				return err
+			}
+		}
 		prefix := []byte(bucket + "\x00" + key + "\x00")
 		c := b.Cursor()
 		var keysToDelete [][]byte
@@ -926,7 +939,9 @@ func (m *MetadataStore) DeleteObjectMeta(bucket, key, versionID string) error {
 			keysToDelete = append(keysToDelete, keyCopy)
 		}
 		for _, k := range keysToDelete {
-			_ = b.Delete(k)
+			if err := b.Delete(k); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -983,50 +998,111 @@ func (m *MetadataStore) ListAllObjectMetas(bucket string) ([]ObjectInfo, error) 
 	return objects, err
 }
 
-// countCacheTTL bounds how long a cached object count may be reused when no
-// write has invalidated it. Writes invalidate eagerly, so this only limits
-// staleness from changes made outside this process.
-const countCacheTTL = 30 * time.Second
-
-type countEntry struct {
-	count      int
-	computedAt time.Time
-}
-
-// invalidateCount drops the cached object count for a bucket. Called from every
-// path that adds or removes a latest-version pointer.
-func (m *MetadataStore) invalidateCount(bucket string) {
-	m.countMu.Lock()
-	delete(m.countCache, bucket)
-	m.countMu.Unlock()
-}
-
-// CountObjectMetas counts latest objects in a bucket.
-//
-// The result is memoised: the console lists every bucket on each dashboard load
-// and refreshes every ten seconds, so an uncached count meant a full cursor scan
-// of every bucket's database on every page view.
-func (m *MetadataStore) CountObjectMetas(bucket string) (int, error) {
-	m.countMu.RLock()
-	entry, ok := m.countCache[bucket]
-	m.countMu.RUnlock()
-	if ok && time.Since(entry.computedAt) < countCacheTTL {
-		return entry.count, nil
+// initObjectCount records a zero object count for a bucket database that has
+// no count and no objects yet (a new bucket). A database that already holds
+// objects but no count predates stored counts, and is left for
+// CountObjectMetas to count once.
+func initObjectCount(tx *bolt.Tx) error {
+	sb, err := tx.CreateBucketIfNotExists(statsBucket)
+	if err != nil {
+		return err
 	}
+	if sb.Get(objectCountKey) != nil {
+		return nil
+	}
+	if ob := tx.Bucket(objectsBucket); ob != nil {
+		if k, _ := ob.Cursor().First(); k != nil {
+			return nil
+		}
+	}
+	return setObjectCount(tx, 0)
+}
 
-	count, err := m.countObjectMetasUncached(bucket)
+func setObjectCount(tx *bolt.Tx, n uint64) error {
+	sb, err := tx.CreateBucketIfNotExists(statsBucket)
+	if err != nil {
+		return err
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], n)
+	return sb.Put(objectCountKey, buf[:])
+}
+
+// adjustObjectCount applies delta to the stored object count, within the
+// same transaction as the change it accounts for. With no stored count yet
+// it does nothing: the first read computes one. A count that would go
+// negative has drifted from the records, so it is dropped to be recomputed.
+func adjustObjectCount(tx *bolt.Tx, delta int64) error {
+	sb := tx.Bucket(statsBucket)
+	if sb == nil {
+		return nil
+	}
+	v := sb.Get(objectCountKey)
+	if v == nil {
+		return nil
+	}
+	n := int64(binary.BigEndian.Uint64(v)) + delta
+	if n < 0 {
+		return sb.Delete(objectCountKey)
+	}
+	return setObjectCount(tx, uint64(n))
+}
+
+// scanObjectCount counts current-version records (keys with no version
+// suffix) by walking the whole bucket.
+func scanObjectCount(tx *bolt.Tx, bucket string) int {
+	count := 0
+	prefix := []byte(bucket + "\x00")
+	c := tx.Bucket(objectsBucket).Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+		if !bytes.Contains(k[len(prefix):], []byte{0}) {
+			count++
+		}
+	}
+	return count
+}
+
+// CountObjectMetas returns the number of current-version records (latest
+// objects and delete markers) in a bucket.
+//
+// It reads a count kept up to date in the same transactions that add or
+// remove those records. It used to scan the whole bucket, memoised only until
+// the next write — so on a busy bucket nearly every console dashboard load,
+// which counts every bucket, did a full scan. A database without a stored
+// count gets one from a single scan, made in a write transaction so no
+// concurrent change can slip between the scan and the store.
+func (m *MetadataStore) CountObjectMetas(bucket string) (int, error) {
+	unlock := m.acquireBucketLock(bucket, false)
+	defer unlock()
+	db, releasedb, err := m.acquireBucketDB(bucket)
 	if err != nil {
 		return 0, err
 	}
+	defer releasedb()
 
-	m.countMu.Lock()
-	m.countCache[bucket] = countEntry{count: count, computedAt: time.Now()}
-	m.countMu.Unlock()
+	count := -1
+	err = db.View(func(tx *bolt.Tx) error {
+		if sb := tx.Bucket(statsBucket); sb != nil {
+			if v := sb.Get(objectCountKey); v != nil {
+				count = int(binary.BigEndian.Uint64(v))
+			}
+		}
+		return nil
+	})
+	if err != nil || count >= 0 {
+		return count, err
+	}
 
-	return count, nil
+	err = db.Update(func(tx *bolt.Tx) error {
+		count = scanObjectCount(tx, bucket)
+		return setObjectCount(tx, uint64(count))
+	})
+	return count, err
 }
 
-func (m *MetadataStore) countObjectMetasUncached(bucket string) (int, error) {
+// countObjectMetasByScan counts by walking the bucket, ignoring the stored
+// count; tests use it as the reference.
+func (m *MetadataStore) countObjectMetasByScan(bucket string) (int, error) {
 	unlock := m.acquireBucketLock(bucket, false)
 	defer unlock()
 	db, releasedb, err := m.acquireBucketDB(bucket)
@@ -1035,17 +1111,8 @@ func (m *MetadataStore) countObjectMetasUncached(bucket string) (int, error) {
 	}
 	defer releasedb()
 	count := 0
-	prefix := []byte(bucket + "\x00")
 	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(objectsBucket)
-		c := b.Cursor()
-		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-			objectKey := string(k[len(prefix):])
-			if strings.Contains(objectKey, "\x00") {
-				continue
-			}
-			count++
-		}
+		count = scanObjectCount(tx, bucket)
 		return nil
 	})
 	return count, err
@@ -1053,7 +1120,6 @@ func (m *MetadataStore) countObjectMetasUncached(bucket string) (int, error) {
 
 // DeleteAllObjectMetas removes all object metadata for a given bucket.
 func (m *MetadataStore) DeleteAllObjectMetas(bucket string) error {
-	defer m.invalidateCount(bucket)
 	unlock := m.acquireBucketLock(bucket, false)
 	defer unlock()
 	db, releasedb, err := m.acquireBucketDB(bucket)
@@ -1076,7 +1142,7 @@ func (m *MetadataStore) DeleteAllObjectMetas(bucket string) error {
 				return err
 			}
 		}
-		return nil
+		return setObjectCount(tx, 0)
 	})
 }
 
@@ -1189,31 +1255,9 @@ func (m *MetadataStore) IterateMultipartMetas(bucket string, fn func(meta *Multi
 
 // PutBucketLifecycle sets lifecycle configuration for a bucket.
 func (m *MetadataStore) PutBucketLifecycle(bucket string, lc *LifecycleConfiguration) error {
-	unlock := m.acquireBucketLock(bucket, true)
-	defer unlock()
-	err := m.globalDB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		data := b.Get([]byte(bucket))
-		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
-		}
-		var info BucketInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			return err
-		}
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
 		info.Lifecycle = lc
-		newData, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(bucket), newData)
 	})
-	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
-	}
-	return err
 }
 
 // GetBucketLifecycle gets lifecycle configuration for a bucket.
@@ -1227,60 +1271,16 @@ func (m *MetadataStore) GetBucketLifecycle(bucket string) (*LifecycleConfigurati
 
 // DeleteBucketLifecycle deletes lifecycle configuration for a bucket.
 func (m *MetadataStore) DeleteBucketLifecycle(bucket string) error {
-	unlock := m.acquireBucketLock(bucket, true)
-	defer unlock()
-	err := m.globalDB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		data := b.Get([]byte(bucket))
-		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
-		}
-		var info BucketInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			return err
-		}
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
 		info.Lifecycle = nil
-		newData, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(bucket), newData)
 	})
-	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
-	}
-	return err
 }
 
 // PutBucketLogging sets logging configuration for a bucket.
 func (m *MetadataStore) PutBucketLogging(bucket string, logging *BucketLoggingStatus) error {
-	unlock := m.acquireBucketLock(bucket, true)
-	defer unlock()
-	err := m.globalDB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketsBucket)
-		data := b.Get([]byte(bucket))
-		if data == nil {
-			return fmt.Errorf("bucket not found: %s", bucket)
-		}
-		var info BucketInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			return err
-		}
+	return m.updateBucketInfo(bucket, func(info *BucketInfo) {
 		info.Logging = logging
-		newData, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(bucket), newData)
 	})
-	if err == nil {
-		m.cacheMu.Lock()
-		delete(m.bucketCache, bucket)
-		m.cacheMu.Unlock()
-	}
-	return err
 }
 
 // GetBucketLogging gets logging configuration for a bucket.
@@ -1294,7 +1294,6 @@ func (m *MetadataStore) GetBucketLogging(bucket string) (*BucketLoggingStatus, e
 
 // PutObjectMetaRaw stores object metadata exactly as provided, without overriding fields.
 func (m *MetadataStore) PutObjectMetaRaw(info *ObjectInfo) error {
-	defer m.invalidateCount(info.Bucket)
 	unlock := m.acquireBucketLock(info.Bucket, false)
 	defer unlock()
 	db, releasedb, err := m.acquireBucketDB(info.Bucket)
@@ -1315,6 +1314,11 @@ func (m *MetadataStore) PutObjectMetaRaw(info *ObjectInfo) error {
 			}
 		}
 		if info.IsLatest {
+			if b.Get(objectMetaKey(info.Bucket, info.Key)) == nil {
+				if err := adjustObjectCount(tx, 1); err != nil {
+					return err
+				}
+			}
 			return b.Put(objectMetaKey(info.Bucket, info.Key), data)
 		}
 		return nil

@@ -17,12 +17,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-func (fs *FilesystemEngine) CreateMultipartUpload(bucket, key, contentType string) (*MultipartUploadInfo, error) {
+func (fs *FilesystemEngine) CreateMultipartUpload(ctx context.Context, bucket, key, contentType string) (*MultipartUploadInfo, error) {
 	if err := fs.validateBucketName(bucket); err != nil {
 		return nil, err
 	}
@@ -30,13 +31,12 @@ func (fs *FilesystemEngine) CreateMultipartUpload(bucket, key, contentType strin
 	if _, err := fs.objectPath(bucket, key); err != nil {
 		return nil, &S3Error{Code: "InvalidArgument", Message: err.Error()}
 	}
-
-	exists, err := fs.metadata.BucketExists(bucket)
-	if err != nil {
+	if err := validateNewKey(key); err != nil {
 		return nil, err
 	}
-	if !exists {
-		return nil, &S3Error{Code: "NoSuchBucket", Message: errBucketNotFound}
+
+	if err := fs.bucketMustExist(bucket); err != nil {
+		return nil, err
 	}
 
 	uploadID := uuid.New().String()
@@ -60,12 +60,26 @@ func (fs *FilesystemEngine) CreateMultipartUpload(bucket, key, contentType strin
 		ContentType: contentType,
 		Created:     time.Now().UTC(),
 	}
+	// The SSE-C mode is fixed here, once. Only the algorithm and key MD5 are
+	// kept; the key itself is never stored (see MultipartMeta).
+	if params := extractSSECParams(ctx); params != nil {
+		meta.SSECustomerAlgorithm = params.Algorithm
+		meta.SSECustomerKeyMD5 = params.KeyMD5
+	}
+
+	// Recorded under the shared bucket lock so DeleteBucket, which refuses to
+	// remove a bucket with uploads in progress, can't miss this one.
+	unlockBucket, err := fs.lockBucketForCommit(bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockBucket()
 
 	if err := fs.metadata.PutMultipartMeta(meta); err != nil {
 		return nil, err
 	}
 
-	GlobalMetrics.IncActiveMultiparts()
+	fs.Metrics().IncActiveMultiparts()
 
 	return &MultipartUploadInfo{
 		UploadID: uploadID,
@@ -103,49 +117,23 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 		return nil, &S3Error{Code: "EntityTooLarge", Message: "Your proposed upload exceeds the maximum allowed part size."}
 	}
 
-	// 1. Lock briefly to get/initialize multipart metadata and validate SSE-C params
-	var ssecParams *SSECParams
-	if ctx != nil {
-		if params, ok := ctx.Value(SSECContextKey).(*SSECParams); ok && params != nil {
-			ssecParams = params
-		}
-	}
+	ssecParams := extractSSECParams(ctx)
 
-	// Brief lock to read and initialize metadata parameters
-	var meta *MultipartMeta
-	err := func() error {
-		unlock := fs.lockUpload(uploadID)
-		defer unlock()
-
-		var err error
-		meta, err = fs.metadata.GetMultipartMeta(bucket, key, uploadID)
-		if err != nil {
-			return err
-		}
-
-		// First part upload with SSE-C: record the algorithm and key MD5 so
-		// later parts can be checked against it. The key itself is never stored.
-		if meta.SSECustomerAlgorithm == "" && len(meta.Parts) == 0 && ssecParams != nil {
-			meta.SSECustomerAlgorithm = ssecParams.Algorithm
-			meta.SSECustomerKeyMD5 = ssecParams.KeyMD5
-			if err := fs.metadata.PutMultipartMeta(meta); err != nil {
-				return err
-			}
-		}
-		return nil
-	}()
+	meta, err := fs.metadata.GetMultipartMeta(bucket, key, uploadID)
 	if err != nil {
 		return nil, &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
 	}
 
-	// SSE-C validation
+	// Every part must match the SSE-C mode declared at creation. The mode used
+	// to be adopted from whichever part arrived first, so parallel first parts
+	// could leave one object assembled from encrypted and plaintext parts.
 	if meta.SSECustomerAlgorithm != "" && ssecParams == nil {
-		return nil, &S3Error{Code: "InvalidArgument", Message: "The object was stored using a Server-side Encryption with Customer-provided Keys (SSE-C) and cannot be retrieved without it"}
+		return nil, &S3Error{Code: "InvalidArgument", Message: "This multipart upload was created with SSE-C; every part must supply the customer key"}
 	}
-	if meta.SSECustomerAlgorithm == "" && len(meta.Parts) > 0 && ssecParams != nil {
-		return nil, &S3Error{Code: "InvalidArgument", Message: "The object was not stored using a Server-side Encryption with Customer-provided Keys (SSE-C) and cannot be retrieved with it"}
+	if meta.SSECustomerAlgorithm == "" && ssecParams != nil {
+		return nil, &S3Error{Code: "InvalidArgument", Message: "This multipart upload was not created with SSE-C and cannot accept a customer key"}
 	}
-	if meta.SSECustomerAlgorithm != "" && ssecParams != nil {
+	if meta.SSECustomerAlgorithm != "" {
 		if subtle.ConstantTimeCompare([]byte(ssecParams.KeyMD5), []byte(meta.SSECustomerKeyMD5)) != 1 {
 			return nil, &S3Error{Code: "InvalidDigest", Message: "The customer-provided encryption key MD5 does not match"}
 		}
@@ -268,7 +256,7 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 		return nil, err
 	}
 
-	GlobalMetrics.AddUploaded(written)
+	fs.Metrics().AddUploaded(written)
 
 	return &partInfo, nil
 }
@@ -370,40 +358,19 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		versionID = "null"
 	}
 
-	objPath, err := fs.objectPathWithVersion(bucket, key, versionID)
-	if err != nil {
+	if err := validateNewKey(key); err != nil {
+		return nil, err
+	}
+	if _, err := fs.objectPathWithVersion(bucket, key, versionID); err != nil {
 		return nil, &S3Error{Code: "InvalidArgument", Message: err.Error()}
 	}
-
-	bucketDir := filepath.Clean(fs.bucketPath(bucket))
-	bucketPrefix := bucketDir + string(filepath.Separator)
-	if !strings.HasPrefix(objPath, bucketPrefix) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	rel, err := filepath.Rel(bucketDir, objPath)
-	if err != nil || filepath.IsAbs(rel) || isRelTraversal(rel) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	objDir := filepath.Dir(objPath)
-	if objDir != bucketDir && !strings.HasPrefix(objDir, bucketPrefix) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	relDir, err := filepath.Rel(bucketDir, objDir)
-	if err != nil || filepath.IsAbs(relDir) || isRelTraversal(relDir) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-
-	// Check for flat namespace directory/file path conflicts
-	if err := fs.checkPathConflict(objPath, bucket); err != nil {
+	blobID, blobPath, err := fs.newBlob(bucket)
+	if err != nil {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(objDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create object directory: %w", err)
-	}
-
 	// Use atomic temp-file + rename for crash safety
-	tmpFile, err := os.CreateTemp(objDir, ".stiva-multipart-*")
+	tmpFile, err := os.CreateTemp(filepath.Dir(blobPath), ".stiva-multipart-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -449,7 +416,16 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		out = gw
 	}
 
-	hash := md5.New()
+	// The S3 multipart ETag is the MD5 of the parts' binary MD5s, suffixed
+	// with the part count, so it comes from the part ETags alone. The whole
+	// assembled object used to be MD5'd as well, only as a fallback that
+	// could not trigger — and routing every byte through that hash is what
+	// kept io.Copy below from using copy_file_range between part and object.
+	etag, err := multipartETag(parts, uploadedParts)
+	if err != nil {
+		return nil, err
+	}
+
 	var totalSize int64
 	partDir, err := fs.multipartDir(bucket, key, uploadID)
 	if err != nil {
@@ -494,7 +470,7 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 			partReader = &cipher.StreamReader{S: stream, R: partFile}
 		}
 
-		n, err := io.Copy(io.MultiWriter(out, hash), partReader)
+		n, err := io.Copy(out, partReader)
 		for _, c := range closers {
 			c.Close()
 		}
@@ -515,31 +491,17 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		return nil, fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	// Atomically move temp file to final location
-	if !strings.HasPrefix(objPath, bucketPrefix) {
-		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-	}
-	if err := os.Rename(tmpPath, objPath); err != nil {
-		return nil, fmt.Errorf("failed to rename temp file: %w", err)
-	}
+	// Same commit discipline as PutObject: the per-key lock keeps a racing
+	// PUT or DELETE of this key from interleaving between the rename and the
+	// metadata write, and the shared bucket lock keeps DeleteBucket out.
+	unlockObj := fs.lockObjectKey(bucket, key)
+	defer unlockObj()
 
-	// Calculate S3-compliant multipart ETag
-	var md5s []byte
-	for _, part := range parts {
-		trimmedETag := strings.Trim(part.ETag, `"`)
-		b, err := hex.DecodeString(trimmedETag)
-		if err == nil && len(b) == 16 {
-			md5s = append(md5s, b...)
-		}
+	unlockBucket, err := fs.lockBucketForCommit(bucket)
+	if err != nil {
+		return nil, err
 	}
-	var etag string
-	if len(md5s) > 0 {
-		mHash := md5.New()
-		_, _ = mHash.Write(md5s)
-		etag = fmt.Sprintf("%s-%d", hex.EncodeToString(mHash.Sum(nil)), len(parts))
-	} else {
-		etag = hex.EncodeToString(hash.Sum(nil))
-	}
+	defer unlockBucket()
 
 	contentType := meta.ContentType
 	if contentType == "" {
@@ -562,25 +524,49 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		info.SSECustomerKeyMD5 = meta.SSECustomerKeyMD5
 	}
 
-	if err := fs.metadata.PutObjectMeta(info); err != nil {
+	if err := fs.commitObject(tmpPath, blobID, blobPath, info); err != nil {
 		return nil, err
 	}
 
 	// Clean up multipart temp files
 	if uploadPath, err := fs.multipartUploadPath(bucket, uploadID); err == nil {
-		os.RemoveAll(uploadPath)
+		removeUploadDir(uploadPath)
 	}
 	if err := fs.metadata.DeleteMultipartMeta(bucket, key, uploadID); err != nil {
 		slog.Error("Failed to delete multipart metadata", "error", err, "bucket", bucket, "key", key, "uploadID", uploadID)
 	}
 
-	GlobalMetrics.DecActiveMultiparts()
+	fs.Metrics().DecActiveMultiparts()
 
 	fs.triggerWebhook("ObjectCreated:CompleteMultipartUpload", info)
 
 	fs.MirrorSync(bucket, key, "PUT")
 
 	return info, nil
+}
+
+// removeUploadDir deletes a finished or aborted upload's part files, logging
+// a failure instead of silently leaving the parts on disk.
+func removeUploadDir(path string) {
+	if err := os.RemoveAll(path); err != nil {
+		slog.Warn("[Storage] Failed to remove multipart upload directory; its parts are now orphaned on disk", "path", path, "error", err)
+	}
+}
+
+// multipartETag computes the S3 ETag of an assembled multipart object: the
+// MD5 of the concatenated binary MD5s of its parts, then "-" and the part
+// count. It uses the ETags recorded when each part was uploaded, which the
+// caller has already matched against the completion request.
+func multipartETag(parts []CompletePart, uploaded map[int]PartInfo) (string, error) {
+	h := md5.New()
+	for _, part := range parts {
+		sum, err := hex.DecodeString(strings.Trim(uploaded[part.PartNumber].ETag, `"`))
+		if err != nil || len(sum) != md5.Size {
+			return "", fmt.Errorf("part %d has a malformed stored ETag %q", part.PartNumber, uploaded[part.PartNumber].ETag)
+		}
+		_, _ = h.Write(sum)
+	}
+	return fmt.Sprintf("%s-%d", hex.EncodeToString(h.Sum(nil)), len(parts)), nil
 }
 
 func (fs *FilesystemEngine) AbortMultipartUpload(bucket, key, uploadID string) error {
@@ -604,10 +590,10 @@ func (fs *FilesystemEngine) AbortMultipartUpload(bucket, key, uploadID string) e
 	if err != nil {
 		return &S3Error{Code: "InvalidArgument", Message: err.Error()}
 	}
-	os.RemoveAll(uploadPath)
+	removeUploadDir(uploadPath)
 	err = fs.metadata.DeleteMultipartMeta(bucket, key, uploadID)
 	if err == nil {
-		GlobalMetrics.DecActiveMultiparts()
+		fs.Metrics().DecActiveMultiparts()
 	}
 	return err
 }
@@ -639,6 +625,69 @@ func (fs *FilesystemEngine) lockKey(key string) func() {
 		}
 		fs.mu.Unlock()
 	}
+}
+
+// bucketRWLock is a refcounted read/write lock scoped to one bucket.
+type bucketRWLock struct {
+	sync.RWMutex
+	refCount int
+}
+
+// lockBucket takes a bucket's engine-level lock: exclusive for creating or
+// deleting the bucket itself, shared for committing an object into it.
+//
+// This is what makes DeleteBucket atomic with respect to object writes. It
+// used to check the bucket was empty and then remove it as separate steps, so
+// a PUT committing in between was acknowledged while its data went away with
+// the bucket. A committer holds the shared lock and re-checks the bucket still
+// exists; DeleteBucket holds the exclusive lock across its check and removal.
+//
+// It is separate from the metadata store's own bucket locks, which the calls
+// made under this one take internally; sharing them would mean re-entrant
+// read locking, which deadlocks against a waiting writer.
+func (fs *FilesystemEngine) lockBucket(bucket string, exclusive bool) func() {
+	fs.mu.Lock()
+	if fs.bucketLocks == nil {
+		fs.bucketLocks = make(map[string]*bucketRWLock)
+	}
+	l, ok := fs.bucketLocks[bucket]
+	if !ok {
+		l = &bucketRWLock{}
+		fs.bucketLocks[bucket] = l
+	}
+	l.refCount++
+	fs.mu.Unlock()
+
+	if exclusive {
+		l.Lock()
+	} else {
+		l.RLock()
+	}
+	return func() {
+		if exclusive {
+			l.Unlock()
+		} else {
+			l.RUnlock()
+		}
+		fs.mu.Lock()
+		l.refCount--
+		if l.refCount == 0 {
+			delete(fs.bucketLocks, bucket)
+		}
+		fs.mu.Unlock()
+	}
+}
+
+// lockBucketForCommit takes the shared bucket lock and confirms the bucket
+// still exists, for the final step of a write. On success the caller must
+// call the returned release function.
+func (fs *FilesystemEngine) lockBucketForCommit(bucket string) (func(), error) {
+	unlock := fs.lockBucket(bucket, false)
+	if err := fs.bucketMustExist(bucket); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
 }
 
 func (fs *FilesystemEngine) lockUpload(uploadID string) func() {

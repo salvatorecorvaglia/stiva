@@ -742,7 +742,10 @@ body {
     transition: opacity var(--transition-fast);
 }
 
-.data-table tbody tr:hover .file-actions {
+.data-table tbody tr:hover .file-actions,
+.data-table tbody tr:focus-within .file-actions {
+    /* focus-within: a keyboard user tabbing to Share/Download/Delete must
+       be able to see the button that has focus, not only a mouse user. */
     opacity: 1;
 }
 
@@ -1280,3 +1283,242 @@ th[aria-sort] {
         scroll-behavior: auto !important;
     }
 }
+
+/* ================================================================
+   Component classes replacing former inline styles
+   ================================================================
+   These used to be style="" attributes in index.html and app.js, several
+   of which referenced tokens that do not exist (--border, --input-bg, --text,
+   --text-muted, --danger) and so silently fell back to browser defaults.
+   Everything here uses the tokens defined in :root. */
+
+.breadcrumb-container {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.breadcrumb-container .breadcrumb {
+    margin-bottom: 0;
+}
+
+.view-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    margin-top: 0.5rem;
+}
+
+.view-meta-row .view-subtitle {
+    margin: 0;
+}
+
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.toggle-label input {
+    cursor: pointer;
+    width: 14px;
+    height: 14px;
+}
+
+.col-select {
+    width: 40px;
+}
+
+.modal-desc {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    margin-bottom: 1rem;
+}
+
+.form-group-spaced {
+    margin-bottom: 1rem;
+}
+
+.form-select {
+    width: 100%;
+    padding: 0.625rem;
+    background: var(--bg-input);
+    border: 1px solid var(--border-secondary);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-family);
+    font-size: 0.95rem;
+}
+
+.form-select:focus {
+    outline: none;
+    border-color: var(--border-hover);
+}
+
+.input-with-button {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.input-with-button .form-input {
+    flex: 1;
+}
+
+.form-error-inline {
+    margin-top: 0.5rem;
+    text-align: left;
+}
+
+.confirm-message {
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.confirm-warning {
+    font-size: 0.85rem;
+    color: var(--accent-red);
+    font-weight: 500;
+}
+
+.modal-footer-split {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.btn-small {
+    padding: 0.3rem 0.75rem;
+    font-size: 0.8rem;
+}
+
+/* Upload progress: the current file and a way to stop */
+.upload-progress-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+}
+
+.upload-file-name {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+/* Preview */
+.preview-body {
+    max-height: 70vh;
+    overflow-y: auto;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.preview-content {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+}
+
+.preview-notice {
+    width: 100%;
+    padding: 3rem 1.5rem;
+    text-align: center;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-secondary);
+    border-radius: var(--radius-sm);
+}
+
+.preview-notice-icon {
+    font-size: 3rem;
+    margin-bottom: 1rem;
+    opacity: 0.5;
+}
+
+.preview-notice-text {
+    margin-bottom: 1.5rem;
+    color: var(--text-secondary);
+}
+
+.preview-status {
+    padding: 2rem;
+    color: var(--text-secondary);
+}
+
+.preview-status-error {
+    color: var(--accent-red);
+}
+
+.preview-media {
+    max-width: 100%;
+    max-height: 60vh;
+    object-fit: contain;
+    border: 1px solid var(--border-secondary);
+    border-radius: var(--radius-sm);
+}
+
+.preview-audio-wrap {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    padding: 2rem;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-secondary);
+    border-radius: var(--radius-sm);
+}
+
+.preview-audio {
+    width: 100%;
+    max-width: 400px;
+}
+
+.preview-frame {
+    width: 100%;
+    height: 60vh;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: white;
+}
+
+.preview-text {
+    width: 100%;
+    max-height: 60vh;
+    margin: 0;
+    padding: 1.25rem;
+    overflow: auto;
+    text-align: left;
+    white-space: pre-wrap;
+    font-family: monospace;
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    background: var(--bg-input);
+    border: 1px solid var(--border-secondary);
+    border-radius: var(--radius-sm);
+}
+
+/* Loading skeleton sizes */
+.skeleton-gap-lg {
+    margin-top: 1rem;
+}
+
+.skeleton-gap-sm {
+    margin-top: 0.5rem;
+    display: flex;
+    gap: 1.5rem;
+}
+
+.skeleton-w-60 { width: 60px; }
+.skeleton-w-70 { width: 70px; }
+.skeleton-w-80 { width: 80px; }
+.skeleton-w-120 { width: 120px; }
+.skeleton-w-140 { width: 140px; }
+.skeleton-tall { height: 1.2rem; }
