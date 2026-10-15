@@ -11,6 +11,66 @@ import (
 	"time"
 )
 
+func TestPromoteLegacyNullVersionConfinedToBuckets(t *testing.T) {
+	for _, escape := range []bool{false, true} {
+		name := "nested object"
+		if escape {
+			name = "escaping symlink"
+		}
+		t.Run(name, func(t *testing.T) {
+			engine := setupTestEngine(t)
+			const bucket, key = "legacy-promotion", "docs/old.txt"
+			if err := engine.CreateBucket(bucket); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(engine.bucketPath(bucket), "docs")
+			if escape {
+				outside := t.TempDir()
+				if err := os.Symlink(outside, dir); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			src := filepath.Join(dir, "old.txt")
+			if err := os.WriteFile(src, []byte("original"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Metadata().PutObjectMetaRaw(&ObjectInfo{
+				Bucket: bucket, Key: key, Size: 8, IsLatest: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err := engine.promoteLegacyNullVersion(bucket, key)
+			if escape {
+				if err == nil {
+					t.Fatal("promotion through escaping symlink succeeded")
+				}
+				if data, err := os.ReadFile(src); err != nil || string(data) != "original" {
+					t.Fatalf("outside source changed: %q, %v", data, err)
+				}
+				if _, err := os.Stat(src + ".null"); !os.IsNotExist(err) {
+					t.Fatalf("outside destination created: %v", err)
+				}
+				rec, err := engine.Metadata().GetObjectMeta(bucket, key, "")
+				if err != nil || rec.VersionID != "" {
+					t.Fatalf("metadata changed after rejected promotion: %+v, %v", rec, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := readVersion(t, engine, bucket, key, "null"); err != nil || got != "original" {
+				t.Fatalf("promoted version = %q, %v", got, err)
+			}
+			if _, err := os.Stat(src); !os.IsNotExist(err) {
+				t.Fatalf("legacy source still exists: %v", err)
+			}
+		})
+	}
+}
+
 // dataFiles lists the object data files a bucket holds on disk, in either
 // layout: blob files and legacy key-path files.
 func dataFiles(t *testing.T, engine *FilesystemEngine, bucket string) []string {

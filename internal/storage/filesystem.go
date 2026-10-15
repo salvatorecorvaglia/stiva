@@ -890,7 +890,23 @@ func (fs *FilesystemEngine) promoteLegacyNullVersion(bucket, key string) error {
 		if err != nil {
 			return &S3Error{Code: "InvalidArgument", Message: err.Error()}
 		}
-		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
+		// Resolve both names relative to a trusted root. Root.Rename also
+		// prevents symlink traversal outside the buckets directory.
+		base := filepath.Join(fs.dataDir, "buckets")
+		srcRel, err := filepath.Rel(base, src)
+		if err != nil || !filepath.IsLocal(srcRel) {
+			return &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
+		}
+		dstRel, err := filepath.Rel(base, dst)
+		if err != nil || !filepath.IsLocal(dstRel) {
+			return &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
+		}
+		root, err := os.OpenRoot(base)
+		if err != nil {
+			return fmt.Errorf("failed to open buckets directory: %w", err)
+		}
+		defer root.Close()
+		if err := root.Rename(srcRel, dstRel); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to move pre-versioning object to its null version: %w", err)
 		}
 	}
