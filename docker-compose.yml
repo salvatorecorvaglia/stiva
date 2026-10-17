@@ -1,6 +1,6 @@
 services:
   stiva:
-    image: salvatorecorvaglia/stiva:latest
+    image: corvaglia91/stiva:latest
     container_name: stiva
     ports:
       - "${STIVA_S3_PORT:-9000}:${STIVA_S3_PORT:-9000}"   # S3 API

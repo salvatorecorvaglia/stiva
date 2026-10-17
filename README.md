@@ -78,7 +78,7 @@ docker run -d \
   -v $(pwd)/data:/data \
   -e STIVA_ACCESS_KEY=stiva \
   -e STIVA_SECRET_KEY=stiva123 \
-  salvatorecorvaglia/stiva:latest
+  corvaglia91/stiva:latest
 ```
 
 To build and run the image locally instead:
