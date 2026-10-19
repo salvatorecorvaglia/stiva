@@ -104,7 +104,7 @@ Lint rules are defined in [`.golangci.yml`](.golangci.yml).
 Use clear branch names prefixing the type of changes you are making:
 - `feature/` for new features (e.g., `feature/lifecycle-rules`)
 - `bugfix/` for bug fixes (e.g., `bugfix/multipart-part-size`)
-- `docs/` for documentation updates (e.g., `docs/add-contributing-guide`)
+- `documentation/` for documentation updates (e.g., `documentation/add-contributing-guide`)
 - `refactor/` for code refactoring
 - `test/` for testing additions
 
