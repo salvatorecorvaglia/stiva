@@ -16,7 +16,10 @@ test('partSizeFor keeps multipart uploads within the 10,000-part limit', () => {
     // A fixed 5 MiB part used to cap console uploads at ~48.8 GiB.
     for (const size of [60 * 1024 * MiB, 500 * 1024 * MiB, 4 * 1024 * 1024 * MiB]) {
         const part = lib.partSizeFor(size);
-        assert.ok(Math.ceil(size / part) <= 10000, `${size} bytes needs ${Math.ceil(size / part)} parts`);
+        assert.ok(
+            Math.ceil(size / part) <= 10000,
+            `${size} bytes needs ${Math.ceil(size / part)} parts`,
+        );
         assert.equal(part % MiB, 0, 'parts are whole MiB');
     }
     // Beyond 10,000 parts of the 5 GiB maximum, S3 cannot hold the object.
@@ -27,14 +30,21 @@ test('validateFolderName rejects names that are not a single path segment', () =
     assert.equal(lib.validateFolderName('reports-2026'), '');
     assert.equal(lib.validateFolderName('Ünïcödé földer'), '');
     for (const bad of ['', '   ', '.', '..', 'a/b', 'a\\b', 'tab\there', 'x'.repeat(256)]) {
-        assert.notEqual(lib.validateFolderName(bad), '', `${JSON.stringify(bad)} should be rejected`);
+        assert.notEqual(
+            lib.validateFolderName(bad),
+            '',
+            `${JSON.stringify(bad)} should be rejected`,
+        );
     }
 });
 
 test('objectKeyFor keeps the folder structure of dropped folders', () => {
     assert.equal(lib.objectKeyFor('', 'photo.jpg'), 'photo.jpg');
     assert.equal(lib.objectKeyFor('albums/', 'trip/day1/photo.jpg'), 'albums/trip/day1/photo.jpg');
-    assert.equal(lib.objectKeyFor('albums/', '/trip\\day1\\photo.jpg'), 'albums/trip/day1/photo.jpg');
+    assert.equal(
+        lib.objectKeyFor('albums/', '/trip\\day1\\photo.jpg'),
+        'albums/trip/day1/photo.jpg',
+    );
 });
 
 test('retryDelay backs off exponentially with a cap', () => {
@@ -45,11 +55,23 @@ test('retryDelay backs off exponentially with a cap', () => {
 });
 
 test('apiErrorMessage surfaces the server message', () => {
-    assert.equal(lib.apiErrorMessage(404, '{"error":"The specified bucket does not exist"}', 'Upload failed'),
-        'The specified bucket does not exist');
-    assert.equal(lib.apiErrorMessage(413, '', 'Upload failed'), 'The file is too large for this server');
+    assert.equal(
+        lib.apiErrorMessage(
+            404,
+            '{"error":"The specified bucket does not exist"}',
+            'Upload failed',
+        ),
+        'The specified bucket does not exist',
+    );
+    assert.equal(
+        lib.apiErrorMessage(413, '', 'Upload failed'),
+        'The file is too large for this server',
+    );
     assert.equal(lib.apiErrorMessage(500, '<html>', 'Upload failed'), 'Upload failed (HTTP 500)');
-    assert.equal(lib.apiErrorMessage(0, '', 'Upload failed'), 'Upload failed: the server could not be reached');
+    assert.equal(
+        lib.apiErrorMessage(0, '', 'Upload failed'),
+        'Upload failed: the server could not be reached',
+    );
 });
 
 test('formatSize handles missing and edge values', () => {
@@ -60,8 +82,10 @@ test('formatSize handles missing and edge values', () => {
 });
 
 test('escapeHtml escapes markup and attribute quotes', () => {
-    assert.equal(lib.escapeHtml(`<a href="x" title='y'>&</a>`),
-        '&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;');
+    assert.equal(
+        lib.escapeHtml(`<a href="x" title='y'>&</a>`),
+        '&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;',
+    );
 });
 
 test('previewKind prefers the stored content type, then the extension', () => {

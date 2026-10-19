@@ -5,9 +5,7 @@
 // unit-tested with Node (see ../jstest). Loaded before app.js, which reads it
 // from window.StivaLib.
 
-(function (root) {
-    'use strict';
-
+((root) => {
     const MiB = 1024 * 1024;
     const MIN_PART_SIZE = 5 * MiB; // S3 minimum for every part but the last
     const MAX_PART_SIZE = 5 * 1024 * MiB; // S3 maximum part size
@@ -31,8 +29,11 @@
         if (!trimmed) return 'Enter a folder name.';
         if (trimmed === '.' || trimmed === '..') return 'A folder cannot be named "." or "..".';
         if (/[/\\]/.test(trimmed)) return 'A folder name cannot contain "/" or "\\".';
-        if (/[\u0000-\u001f\u007f]/.test(trimmed)) return 'A folder name cannot contain control characters.';
-        if (new TextEncoder().encode(trimmed).length > 255) return 'A folder name can be at most 255 bytes.';
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: reject control characters in object key segments.
+        if (/[\u0000-\u001f\u007f]/.test(trimmed))
+            return 'A folder name cannot contain control characters.';
+        if (new TextEncoder().encode(trimmed).length > 255)
+            return 'A folder name can be at most 255 bytes.';
         return '';
     }
 
@@ -47,7 +48,7 @@
     // retryDelay is the wait before retry number attempt (0-based) of a
     // failed part upload.
     function retryDelay(attempt) {
-        return Math.min(500 * Math.pow(2, attempt), 8000);
+        return Math.min(500 * 2 ** attempt, 8000);
     }
 
     // apiErrorMessage turns a failed console API response into a message for
@@ -69,7 +70,7 @@
         if (bytes === 0) return '0 B';
         const units = ['B', 'KB', 'MB', 'GB', 'TB'];
         const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-        const size = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+        const size = (bytes / 1024 ** i).toFixed(i > 0 ? 1 : 0);
         return `${size} ${units[i]}`;
     }
 
@@ -100,18 +101,48 @@
             if (ct.startsWith('audio/')) return 'audio';
             if (ct === 'application/pdf') return 'pdf';
             if (ct.startsWith('text/')) return 'text';
-            if (['application/json', 'application/xml', 'application/javascript',
-                 'application/x-javascript', 'application/yaml', 'application/x-yaml',
-                 'application/x-sh'].includes(ct)) return 'text';
+            if (
+                [
+                    'application/json',
+                    'application/xml',
+                    'application/javascript',
+                    'application/x-javascript',
+                    'application/yaml',
+                    'application/x-yaml',
+                    'application/x-sh',
+                ].includes(ct)
+            )
+                return 'text';
         }
 
         const ext = '.' + filename.split('.').pop().toLowerCase();
-        if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico'].includes(ext)) return 'image';
+        if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico'].includes(ext))
+            return 'image';
         if (['.mp4', '.webm', '.ogg', '.mov'].includes(ext)) return 'video';
         if (['.mp3', '.wav', '.m4a', '.aac'].includes(ext)) return 'audio';
         if (ext === '.pdf') return 'pdf';
-        if (['.txt', '.json', '.js', '.ts', '.go', '.html', '.css', '.md', '.log', '.env',
-             '.yml', '.yaml', '.xml', '.ini', '.conf', '.sh', '.py'].includes(ext)) return 'text';
+        if (
+            [
+                '.txt',
+                '.json',
+                '.js',
+                '.ts',
+                '.go',
+                '.html',
+                '.css',
+                '.md',
+                '.log',
+                '.env',
+                '.yml',
+                '.yaml',
+                '.xml',
+                '.ini',
+                '.conf',
+                '.sh',
+                '.py',
+            ].includes(ext)
+        )
+            return 'text';
         return 'none';
     }
 

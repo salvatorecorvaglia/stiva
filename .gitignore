@@ -90,3 +90,6 @@ claude-settings.json
 .windsurf/
 .cline/
 CLAUDE.md
+
+# JavaScript tooling
+node_modules/

@@ -2,12 +2,16 @@
 // Stiva Console — Application Logic
 // ================================================================
 
-(function () {
-    'use strict';
-
+(() => {
     const {
-        apiErrorMessage, escapeHtml, formatSize, objectKeyFor, partSizeFor,
-        previewKind, retryDelay, validateFolderName,
+        apiErrorMessage,
+        escapeHtml,
+        formatSize,
+        objectKeyFor,
+        partSizeFor,
+        previewKind,
+        retryDelay,
+        validateFolderName,
     } = window.StivaLib;
 
     // ---- State ----
@@ -72,12 +76,12 @@
     const nextPageBtn = $('#next-page-btn');
     const pageIndicator = $('#page-indicator');
 
-    const shareModal = $('#share-modal');
+    const _shareModal = $('#share-modal');
     const shareExpires = $('#share-expires');
     const shareUrlInput = $('#share-url-input');
     const copyShareUrlBtn = $('#copy-share-url-btn');
 
-    const previewModal = $('#preview-modal');
+    const _previewModal = $('#preview-modal');
     const previewTitle = $('#preview-title');
     const previewContentContainer = $('#preview-content-container');
     const previewFileSize = $('#preview-file-size');
@@ -91,7 +95,7 @@
         };
 
         if (token) {
-            opts.headers['Authorization'] = `Bearer ${token}`;
+            opts.headers.Authorization = `Bearer ${token}`;
         }
 
         if (body && !isFormData) {
@@ -123,7 +127,11 @@
     // every mutating console action (create bucket, delete object, toggle
     // public access, ...), which previously diverged slightly at each call
     // site in how errors were surfaced. Returns true on success.
-    async function apiAction(method, path, { body = null, isFormData = false, successMsg, errorMsg, onSuccess, onError } = {}) {
+    async function apiAction(
+        method,
+        path,
+        { body = null, isFormData = false, successMsg, errorMsg, onSuccess, onError } = {},
+    ) {
         try {
             const resp = await api(method, path, body, isFormData);
             if (resp.ok) {
@@ -190,7 +198,7 @@
                 loginError.textContent = data.error || 'Invalid credentials';
                 loginError.style.display = 'block';
             }
-        } catch (err) {
+        } catch (_err) {
             loginError.textContent = 'Connection failed. Is the server running?';
             loginError.style.display = 'block';
         } finally {
@@ -211,7 +219,12 @@
             if (publicVal) {
                 const ok = await confirmPremium(
                     `Make "${currentBucket}" public? Anyone who knows or guesses an object's URL will be able to download it without credentials.`,
-                    { title: 'Make Bucket Public', confirmLabel: 'Make Public', warning: 'Objects in this bucket will be readable by anyone.' });
+                    {
+                        title: 'Make Bucket Public',
+                        confirmLabel: 'Make Public',
+                        warning: 'Objects in this bucket will be readable by anyone.',
+                    },
+                );
                 if (!ok) {
                     bucketPublicToggle.checked = false;
                     return;
@@ -225,7 +238,9 @@
                         bucketPublicBadge.style.display = publicVal ? 'inline-flex' : 'none';
                     }
                 },
-                onError: () => { bucketPublicToggle.checked = !publicVal; },
+                onError: () => {
+                    bucketPublicToggle.checked = !publicVal;
+                },
             });
         });
     }
@@ -259,7 +274,7 @@
             if (badge && data.s3Port) {
                 badge.innerHTML = `<span class="status-dot"></span>S3 API: Port ${data.s3Port}`;
             }
-        } catch (err) {
+        } catch (_err) {
             // Non-critical: the badge just keeps its static fallback text.
         }
     }
@@ -427,11 +442,12 @@
 
         // Fetch and show bucket public status
         api('GET', `/api/buckets/${name}/public`)
-            .then(r => r.json())
-            .then(data => {
+            .then((r) => r.json())
+            .then((data) => {
                 const isPublic = !!data.public;
                 if (bucketPublicToggle) bucketPublicToggle.checked = isPublic;
-                if (bucketPublicBadge) bucketPublicBadge.style.display = isPublic ? 'inline-flex' : 'none';
+                if (bucketPublicBadge)
+                    bucketPublicBadge.style.display = isPublic ? 'inline-flex' : 'none';
             })
             .catch(() => {});
 
@@ -475,7 +491,7 @@
             // Hide the folder placeholder: it used to appear as a stray file
             // inside every folder created from the console.
             loadedItems = (data.items || []).filter(
-                (item) => item.isPrefix || !item.key.endsWith(FOLDER_PLACEHOLDER)
+                (item) => item.isPrefix || !item.key.endsWith(FOLDER_PLACEHOLDER),
             );
 
             renderObjectsTable();
@@ -487,7 +503,7 @@
 
             if (currentPageIndex > 0 || hasNext) {
                 paginationContainer.style.display = 'flex';
-                prevPageBtn.disabled = (currentPageIndex === 0);
+                prevPageBtn.disabled = currentPageIndex === 0;
                 nextPageBtn.disabled = !hasNext;
                 pageIndicator.textContent = `Page ${currentPageIndex + 1}`;
             } else {
@@ -515,7 +531,7 @@
             const headers = {
                 name: $('#th-name'),
                 size: $('#th-size'),
-                date: $('#th-date')
+                date: $('#th-date'),
             };
             for (const th of Object.values(headers)) {
                 if (th) th.classList.remove('sort-asc', 'sort-desc');
@@ -534,11 +550,10 @@
         // Sorting is applied to the loaded page only, not the whole bucket. Say
         // so rather than letting the column arrows imply a global ordering.
         const scopeNote = paginationContainer.style.display !== 'none' ? ' on this page' : '';
-        objectCount.textContent =
-            `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''}${scopeNote}`;
+        objectCount.textContent = `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''}${scopeNote}`;
 
-        const folders = loadedItems.filter(item => item.isPrefix);
-        const files = loadedItems.filter(item => !item.isPrefix);
+        const folders = loadedItems.filter((item) => item.isPrefix);
+        const files = loadedItems.filter((item) => !item.isPrefix);
 
         folders.sort((a, b) => a.key.localeCompare(b.key));
 
@@ -569,7 +584,7 @@
         const headers = {
             name: $('#th-name'),
             size: $('#th-size'),
-            date: $('#th-date')
+            date: $('#th-date'),
         };
 
         for (const [field, th] of Object.entries(headers)) {
@@ -577,7 +592,10 @@
             th.classList.remove('sort-asc', 'sort-desc');
             if (field === currentSortField) {
                 th.classList.add(currentSortOrder === 'asc' ? 'sort-asc' : 'sort-desc');
-                th.setAttribute('aria-sort', currentSortOrder === 'asc' ? 'ascending' : 'descending');
+                th.setAttribute(
+                    'aria-sort',
+                    currentSortOrder === 'asc' ? 'ascending' : 'descending',
+                );
             } else {
                 th.setAttribute('aria-sort', 'none');
             }
@@ -586,8 +604,8 @@
         const selectAllCheckbox = $('#select-all-objects');
         if (selectAllCheckbox) {
             const allCheckboxes = Array.from(objectsTbody.querySelectorAll('.object-select'));
-            const allChecked = allCheckboxes.length > 0 && allCheckboxes.every(c => c.checked);
-            const anyChecked = allCheckboxes.some(c => c.checked);
+            const allChecked = allCheckboxes.length > 0 && allCheckboxes.every((c) => c.checked);
+            const anyChecked = allCheckboxes.some((c) => c.checked);
             selectAllCheckbox.checked = allChecked;
             selectAllCheckbox.indeterminate = anyChecked && !allChecked;
         }
@@ -697,8 +715,9 @@
             tr.querySelector('.object-select').addEventListener('change', () => {
                 updateBatchDeleteBtnVisibility();
                 const allCheckboxes = Array.from(objectsTbody.querySelectorAll('.object-select'));
-                const allChecked = allCheckboxes.length > 0 && allCheckboxes.every(c => c.checked);
-                const anyChecked = allCheckboxes.some(c => c.checked);
+                const allChecked =
+                    allCheckboxes.length > 0 && allCheckboxes.every((c) => c.checked);
+                const anyChecked = allCheckboxes.some((c) => c.checked);
                 const selectAll = $('#select-all-objects');
                 if (selectAll) {
                     selectAll.checked = allChecked;
@@ -721,11 +740,15 @@
             tr.querySelector('.delete-obj-btn').addEventListener('click', async () => {
                 const ok = await confirmPremium(`Delete "${displayName}"?`);
                 if (!ok) return;
-                await apiAction('DELETE', `/api/buckets/${currentBucket}/objects?key=${encodeURIComponent(item.key)}`, {
-                    successMsg: `"${displayName}" deleted`,
-                    errorMsg: 'Failed to delete object',
-                    onSuccess: loadObjects,
-                });
+                await apiAction(
+                    'DELETE',
+                    `/api/buckets/${currentBucket}/objects?key=${encodeURIComponent(item.key)}`,
+                    {
+                        successMsg: `"${displayName}" deleted`,
+                        errorMsg: 'Failed to delete object',
+                        onSuccess: loadObjects,
+                    },
+                );
             });
         }
 
@@ -821,10 +844,11 @@
 
     // Each file with its path relative to what was chosen: just its name for
     // a single file, "folder/sub/name" for a file inside a chosen folder.
-    const filesFromInput = (input) => Array.from(input.files).map((file) => ({
-        file,
-        relPath: file.webkitRelativePath || file.name,
-    }));
+    const filesFromInput = (input) =>
+        Array.from(input.files).map((file) => ({
+            file,
+            relPath: file.webkitRelativePath || file.name,
+        }));
 
     for (const input of [fileInput, folderInput]) {
         input.addEventListener('change', () => {
@@ -859,13 +883,23 @@
         // names. Walk them through the entries API to keep their structure.
         // The entries must be taken synchronously, inside the event.
         const items = e.dataTransfer.items;
-        const entries = items ? Array.from(items).map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean) : [];
+        const entries = items
+            ? Array.from(items)
+                  .map((i) => i.webkitGetAsEntry?.())
+                  .filter(Boolean)
+            : [];
         if (entries.length > 0) {
             collectEntries(entries)
-                .then((list) => { if (list.length > 0) uploadFiles(list); })
-                .catch((err) => showToast(`Could not read the dropped items: ${err.message}`, 'error'));
+                .then((list) => {
+                    if (list.length > 0) uploadFiles(list);
+                })
+                .catch((err) =>
+                    showToast(`Could not read the dropped items: ${err.message}`, 'error'),
+                );
         } else if (e.dataTransfer.files.length > 0) {
-            uploadFiles(Array.from(e.dataTransfer.files).map((file) => ({ file, relPath: file.name })));
+            uploadFiles(
+                Array.from(e.dataTransfer.files).map((file) => ({ file, relPath: file.name })),
+            );
         }
     });
 
@@ -880,7 +914,9 @@
                 const reader = entry.createReader();
                 // readEntries returns a directory in batches; read until empty.
                 for (;;) {
-                    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+                    const batch = await new Promise((resolve, reject) =>
+                        reader.readEntries(resolve, reject),
+                    );
                     if (batch.length === 0) break;
                     for (const child of batch) {
                         await walk(child, path + entry.name + '/');
@@ -909,7 +945,9 @@
     uploadCancelBtn.addEventListener('click', () => {
         if (!activeUpload) return;
         activeUpload.cancelled = true;
-        activeUpload.xhrs.forEach((xhr) => xhr.abort());
+        activeUpload.xhrs.forEach((xhr) => {
+            xhr.abort();
+        });
     });
 
     function setUploadProgress(pct, index, total, name) {
@@ -952,11 +990,17 @@
             // One summary rather than a toast per file, which a folder of
             // hundreds of files turned into an unreadable stack.
             if (upload.cancelled) {
-                showToast(`Upload cancelled (${uploaded} of ${items.length} file${items.length !== 1 ? 's' : ''} uploaded)`, 'info');
+                showToast(
+                    `Upload cancelled (${uploaded} of ${items.length} file${items.length !== 1 ? 's' : ''} uploaded)`,
+                    'info',
+                );
             } else if (uploaded > 0) {
-                showToast(items.length === 1
-                    ? `"${items[0].relPath}" uploaded successfully`
-                    : `${uploaded} of ${items.length} files uploaded`, uploaded === items.length ? 'success' : 'info');
+                showToast(
+                    items.length === 1
+                        ? `"${items[0].relPath}" uploaded successfully`
+                        : `${uploaded} of ${items.length} files uploaded`,
+                    uploaded === items.length ? 'success' : 'info',
+                );
             }
             resetPagination();
             loadObjects();
@@ -1009,8 +1053,13 @@
         // The key travels in the query string: the server streams the
         // multipart body straight to storage and so cannot rely on a form
         // field that arrives after the file part.
-        await sendForm(upload, `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(key)}`, formData,
-            (loaded, size) => setUploadProgress(Math.round((loaded / size) * 100), index, total, name));
+        await sendForm(
+            upload,
+            `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(key)}`,
+            formData,
+            (loaded, size) =>
+                setUploadProgress(Math.round((loaded / size) * 100), index, total, name),
+        );
     }
 
     async function uploadLargeFile(upload, file, key, index, total, name) {
@@ -1021,7 +1070,7 @@
 
         const initResp = await api('POST', `/api/buckets/${currentBucket}/multipart/initiate`, {
             key,
-            contentType: file.type || 'application/octet-stream'
+            contentType: file.type || 'application/octet-stream',
         });
         if (!initResp.ok) {
             throw new Error(await errorFrom(initResp, 'Failed to start the upload'));
@@ -1033,7 +1082,12 @@
         const results = [];
         const updateProgress = () => {
             const sent = partProgress.reduce((sum, val) => sum + val, 0);
-            setUploadProgress(Math.min(Math.round((sent / file.size) * 100), 99), index, total, name);
+            setUploadProgress(
+                Math.min(Math.round((sent / file.size) * 100), 99),
+                index,
+                total,
+                name,
+            );
         };
 
         // A part is retried with backoff when the failure is one a retry can
@@ -1052,14 +1106,25 @@
                 formData.append('file', file.slice(start, end));
 
                 try {
-                    const text = await sendForm(upload, `/api/buckets/${currentBucket}/multipart/upload-part`, formData,
-                        (loaded) => { partProgress[partNum] = loaded; updateProgress(); });
+                    const text = await sendForm(
+                        upload,
+                        `/api/buckets/${currentBucket}/multipart/upload-part`,
+                        formData,
+                        (loaded) => {
+                            partProgress[partNum] = loaded;
+                            updateProgress();
+                        },
+                    );
                     partProgress[partNum] = end - start;
                     updateProgress();
                     return JSON.parse(text);
                 } catch (err) {
                     if (err instanceof UploadCancelled) throw err;
-                    const retryable = !err.status || err.status >= 500 || err.status === 408 || err.status === 429;
+                    const retryable =
+                        !err.status ||
+                        err.status >= 500 ||
+                        err.status === 408 ||
+                        err.status === 429;
                     if (!retryable || attempt + 1 >= PART_ATTEMPTS) {
                         throw new Error(`Part ${partNum} of ${numParts}: ${err.message}`);
                     }
@@ -1080,11 +1145,15 @@
             await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, numParts) }, worker));
 
             results.sort((a, b) => a.partNumber - b.partNumber);
-            const completeResp = await api('POST', `/api/buckets/${currentBucket}/multipart/complete`, {
-                uploadId,
-                key,
-                parts: results.map(p => ({ partNumber: p.partNumber, etag: p.etag }))
-            });
+            const completeResp = await api(
+                'POST',
+                `/api/buckets/${currentBucket}/multipart/complete`,
+                {
+                    uploadId,
+                    key,
+                    parts: results.map((p) => ({ partNumber: p.partNumber, etag: p.etag })),
+                },
+            );
             if (!completeResp.ok) {
                 throw new Error(await errorFrom(completeResp, 'Failed to complete the upload'));
             }
@@ -1092,8 +1161,13 @@
         } catch (err) {
             // Stop the other workers and discard the parts already stored.
             queue.length = 0;
-            upload.xhrs.forEach(xhr => xhr.abort());
-            await api('POST', `/api/buckets/${currentBucket}/multipart/abort`, { uploadId, key }).catch(() => {});
+            upload.xhrs.forEach((xhr) => {
+                xhr.abort();
+            });
+            await api('POST', `/api/buckets/${currentBucket}/multipart/abort`, {
+                uploadId,
+                key,
+            }).catch(() => {});
             throw err;
         }
     }
@@ -1105,7 +1179,9 @@
     // browsers ignore <a download>.
     async function downloadObject(key) {
         try {
-            const resp = await api('POST', `/api/buckets/${currentBucket}/objects/download-link`, { key });
+            const resp = await api('POST', `/api/buckets/${currentBucket}/objects/download-link`, {
+                key,
+            });
             if (!resp.ok) {
                 throw new Error(await errorFrom(resp, 'Download failed'));
             }
@@ -1130,7 +1206,11 @@
         const keys = [];
         let continuation = '';
         for (;;) {
-            const params = new URLSearchParams({ prefix, recursive: '1', maxKeys: String(BATCH_DELETE_SIZE) });
+            const params = new URLSearchParams({
+                prefix,
+                recursive: '1',
+                maxKeys: String(BATCH_DELETE_SIZE),
+            });
             if (continuation) params.set('continuationToken', continuation);
             const resp = await api('GET', `/api/buckets/${currentBucket}/objects?${params}`);
             if (!resp.ok) throw new Error(await errorFrom(resp, 'Failed to list the folder'));
@@ -1159,9 +1239,13 @@
     }
 
     function reportDeletion({ deleted, failures }) {
-        if (deleted > 0) showToast(`Deleted ${deleted} object${deleted !== 1 ? 's' : ''}`, 'success');
+        if (deleted > 0)
+            showToast(`Deleted ${deleted} object${deleted !== 1 ? 's' : ''}`, 'success');
         if (failures.length > 0) {
-            showToast(`Failed to delete ${failures.length} object${failures.length !== 1 ? 's' : ''}: ${failures[0].error}`, 'error');
+            showToast(
+                `Failed to delete ${failures.length} object${failures.length !== 1 ? 's' : ''}: ${failures[0].error}`,
+                'error',
+            );
         }
     }
 
@@ -1174,7 +1258,8 @@
             return;
         }
         const ok = await confirmPremium(
-            `Delete the folder "${name}" and the ${keys.length} object${keys.length !== 1 ? 's' : ''} in it?`);
+            `Delete the folder "${name}" and the ${keys.length} object${keys.length !== 1 ? 's' : ''} in it?`,
+        );
         if (!ok) return;
         try {
             reportDeletion(await deleteKeys(keys));
@@ -1211,7 +1296,8 @@
 
         const placeholderKey = key + FOLDER_PLACEHOLDER;
 
-        await apiAction('POST',
+        await apiAction(
+            'POST',
             `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(placeholderKey)}`,
             {
                 body: formData,
@@ -1222,7 +1308,8 @@
                     closeModal('create-folder-modal');
                     loadObjects();
                 },
-            });
+            },
+        );
     });
 
     // ---- Modal Helpers ----
@@ -1234,7 +1321,7 @@
 
     function isAnyModalOpen() {
         return Array.from($$('.modal-overlay')).some(
-            (m) => m.style.display && m.style.display !== 'none'
+            (m) => m.style.display && m.style.display !== 'none',
         );
     }
 
@@ -1243,12 +1330,12 @@
     function trapFocus(e) {
         if (e.key !== 'Tab') return;
         const modal = Array.from($$('.modal-overlay')).find(
-            (m) => m.style.display && m.style.display !== 'none'
+            (m) => m.style.display && m.style.display !== 'none',
         );
         if (!modal) return;
 
         const focusable = Array.from(modal.querySelectorAll(FOCUSABLE)).filter(
-            (el) => !el.disabled && el.offsetParent !== null
+            (el) => !el.disabled && el.offsetParent !== null,
         );
         if (focusable.length === 0) return;
 
@@ -1317,7 +1404,10 @@
         if (!shareTargetKey) return;
         const expires = shareExpires.value;
         try {
-            const resp = await api('GET', `/api/buckets/${currentBucket}/objects/presign?key=${encodeURIComponent(shareTargetKey)}&expires=${expires}&download=1`);
+            const resp = await api(
+                'GET',
+                `/api/buckets/${currentBucket}/objects/presign?key=${encodeURIComponent(shareTargetKey)}&expires=${expires}&download=1`,
+            );
             if (resp.ok) {
                 const data = await resp.json();
                 shareUrlInput.value = data.url;
@@ -1325,7 +1415,7 @@
                 shareUrlInput.value = 'Failed to generate link';
                 showToast('Failed to generate pre-signed link', 'error');
             }
-        } catch (err) {
+        } catch (_err) {
             shareUrlInput.value = 'Failed to generate link';
             showToast('Failed to generate pre-signed link', 'error');
         }
@@ -1336,7 +1426,8 @@
     copyShareUrlBtn.addEventListener('click', () => {
         shareUrlInput.select();
         shareUrlInput.setSelectionRange(0, 99999);
-        navigator.clipboard.writeText(shareUrlInput.value)
+        navigator.clipboard
+            .writeText(shareUrlInput.value)
             .then(() => showToast('Link copied to clipboard', 'success'))
             .catch(() => showToast('Failed to copy link', 'error'));
     });
@@ -1372,7 +1463,10 @@
             // console's own CSP (img-src/media-src/frame-src/connect-src
             // 'self') then blocks, breaking every preview type below. blob:
             // URLs are already permitted by the CSP for img/media/frame-src.
-            const resp = await api('GET', `/api/buckets/${currentBucket}/objects/download?key=${encodeURIComponent(key)}`);
+            const resp = await api(
+                'GET',
+                `/api/buckets/${currentBucket}/objects/download?key=${encodeURIComponent(key)}`,
+            );
             if (!resp.ok) {
                 throw new Error('Failed to fetch file for preview');
             }
@@ -1400,10 +1494,11 @@
                 previewContentContainer.innerHTML = `<iframe src="${blobURL}" class="preview-frame" sandbox="allow-scripts" title="PDF preview"></iframe>`;
             } else if (kind === 'text') {
                 const isTruncated = size > 256 * 1024;
-                let text = await blob.slice(0, 256 * 1024).text();
+                const text = await blob.slice(0, 256 * 1024).text();
                 let escapedText = escapeHtml(text);
                 if (isTruncated) {
-                    escapedText += '\n\n--- [TRUNCATED] File is larger than 256 KB. Showing the first 256 KB. ---';
+                    escapedText +=
+                        '\n\n--- [TRUNCATED] File is larger than 256 KB. Showing the first 256 KB. ---';
                 }
                 previewContentContainer.innerHTML = `
                     <pre class="preview-text">${escapedText}</pre>
@@ -1530,7 +1625,7 @@
         selectAllCheckbox.addEventListener('change', (e) => {
             const checked = e.target.checked;
             const rowCheckboxes = objectsTbody.querySelectorAll('.object-select');
-            rowCheckboxes.forEach(cb => {
+            rowCheckboxes.forEach((cb) => {
                 cb.checked = checked;
             });
             updateBatchDeleteBtnVisibility();
@@ -1541,10 +1636,12 @@
     if (batchDeleteBtn) {
         batchDeleteBtn.addEventListener('click', async () => {
             const checkedBoxes = objectsTbody.querySelectorAll('.object-select:checked');
-            const keys = Array.from(checkedBoxes).map(cb => cb.dataset.key);
+            const keys = Array.from(checkedBoxes).map((cb) => cb.dataset.key);
             if (keys.length === 0) return;
 
-            const ok = await confirmPremium(`Are you sure you want to delete the ${keys.length} selected object(s)?`);
+            const ok = await confirmPremium(
+                `Are you sure you want to delete the ${keys.length} selected object(s)?`,
+            );
             if (!ok) return;
 
             batchDeleteBtn.disabled = true;
@@ -1568,11 +1665,14 @@
 
     // confirmPremium asks for confirmation in the app's dialog. The wording
     // defaults to deletion, the usual case.
-    function confirmPremium(message, {
-        title = 'Confirm Deletion',
-        confirmLabel = 'Delete',
-        warning = 'Warning: This action is permanent and cannot be undone.',
-    } = {}) {
+    function confirmPremium(
+        message,
+        {
+            title = 'Confirm Deletion',
+            confirmLabel = 'Delete',
+            warning = 'Warning: This action is permanent and cannot be undone.',
+        } = {},
+    ) {
         return new Promise((resolve) => {
             const modal = document.getElementById('delete-modal');
             const msgEl = document.getElementById('delete-modal-msg');
@@ -1583,34 +1683,34 @@
             document.getElementById('delete-modal-warning').textContent = warning;
             confirmBtn.textContent = confirmLabel;
             openModal('delete-modal');
-            
+
             const handleConfirm = () => {
                 cleanup();
                 resolve(true);
             };
-            
+
             const handleCancel = () => {
                 cleanup();
                 resolve(false);
             };
-            
+
             const cleanup = () => {
                 confirmBtn.removeEventListener('click', handleConfirm);
-                modal.querySelectorAll('[data-close="delete-modal"]').forEach(btn => {
+                modal.querySelectorAll('[data-close="delete-modal"]').forEach((btn) => {
                     btn.removeEventListener('click', handleCancel);
                 });
                 modal.removeEventListener('click', handleOverlayClick);
                 closeModal('delete-modal');
             };
-            
+
             const handleOverlayClick = (e) => {
                 if (e.target === modal) {
                     handleCancel();
                 }
             };
-            
+
             confirmBtn.addEventListener('click', handleConfirm);
-            modal.querySelectorAll('[data-close="delete-modal"]').forEach(btn => {
+            modal.querySelectorAll('[data-close="delete-modal"]').forEach((btn) => {
                 btn.addEventListener('click', handleCancel);
             });
             modal.addEventListener('click', handleOverlayClick);
@@ -1643,7 +1743,8 @@
             if (isAnyModalOpen()) return;
 
             const activeEl = document.activeElement;
-            if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) return;
+            if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA'))
+                return;
 
             // Refreshing while the user is mid-selection would silently discard
             // the checkboxes they were about to act on.
