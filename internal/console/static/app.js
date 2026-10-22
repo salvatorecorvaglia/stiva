@@ -429,6 +429,133 @@
         });
     });
 
+    // Keep complete server rules so editing here preserves actions configured by S3 clients.
+    let lifecycleBucket = '';
+    let lifecycleRules = [];
+    let lifecycleBusy = false;
+    let lifecycleGeneration = 0;
+
+    function renderLifecycleRules() {
+        const container = $('#lifecycle-rules');
+        container.replaceChildren();
+        if (!lifecycleRules.length) container.textContent = 'No expiration rules configured.';
+        lifecycleRules.forEach((rule, index) => {
+            const row = document.createElement('div');
+            row.className = 'form-group';
+            const prefix = rule.prefix || rule.filter?.and?.prefix || rule.filter?.prefix || '';
+            const description = document.createElement('p');
+            const actions = [];
+            if (rule.expiration?.days) actions.push(`objects: ${rule.expiration.days} days`);
+            if (rule.noncurrentVersionExpiration)
+                actions.push(
+                    `older versions: ${rule.noncurrentVersionExpiration.noncurrentDays} days`,
+                );
+            if (rule.abortIncompleteMultipartUpload)
+                actions.push(
+                    `incomplete uploads: ${rule.abortIncompleteMultipartUpload.daysAfterInitiation} days`,
+                );
+            description.textContent = `${rule.id || 'Unnamed rule'} — ${rule.status} — ${prefix || 'All objects'} — ${actions.join(', ') || 'No expiration action'}`;
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'btn btn-secondary btn-sm';
+            toggle.textContent = rule.status.toLowerCase() === 'enabled' ? 'Disable' : 'Enable';
+            toggle.disabled = lifecycleBusy;
+            toggle.addEventListener('click', () => {
+                const rules = structuredClone(lifecycleRules);
+                rules[index].status =
+                    rule.status.toLowerCase() === 'enabled' ? 'Disabled' : 'Enabled';
+                saveLifecycleRules(rules);
+            });
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'btn btn-danger btn-sm';
+            remove.textContent = 'Remove rule';
+            remove.disabled = lifecycleBusy;
+            remove.addEventListener('click', () =>
+                saveLifecycleRules(lifecycleRules.filter((_, i) => i !== index)),
+            );
+            row.append(description, toggle, remove);
+            container.append(row);
+        });
+        $('#lifecycle-add').disabled = lifecycleBusy;
+    }
+
+    async function saveLifecycleRules(rules) {
+        if (lifecycleBusy) return;
+        lifecycleBusy = true;
+        renderLifecycleRules();
+        $('#lifecycle-error').textContent = '';
+        try {
+            const response = await api(
+                rules.length ? 'POST' : 'DELETE',
+                `/api/buckets/${encodeURIComponent(lifecycleBucket)}/lifecycle`,
+                rules.length ? { rules } : null,
+            );
+            if (!response.ok)
+                throw new Error(await errorFrom(response, 'Failed to save expiration rules'));
+            lifecycleRules = rules;
+            showToast('Expiration rules updated', 'success');
+        } catch (error) {
+            $('#lifecycle-error').textContent = error.message;
+        } finally {
+            lifecycleBusy = false;
+            renderLifecycleRules();
+        }
+    }
+
+    $('#lifecycle-btn').addEventListener('click', async () => {
+        if (lifecycleBusy) return;
+        const generation = ++lifecycleGeneration;
+        lifecycleBucket = currentBucket;
+        lifecycleRules = [];
+        $('#lifecycle-bucket').textContent = `Bucket: ${lifecycleBucket}`;
+        $('#lifecycle-error').textContent = '';
+        $('#lifecycle-prefix').value = '';
+        $('#lifecycle-days').value = '30';
+        $('#lifecycle-rules').textContent = 'Loading rules…';
+        $('#lifecycle-add').disabled = true;
+        openModal('lifecycle-modal');
+        try {
+            const response = await api(
+                'GET',
+                `/api/buckets/${encodeURIComponent(lifecycleBucket)}/lifecycle`,
+            );
+            const data = await response.json();
+            if (generation !== lifecycleGeneration) return;
+            if (
+                !response.ok &&
+                !(
+                    response.status === 404 &&
+                    data.error === 'The lifecycle configuration does not exist'
+                )
+            ) {
+                throw new Error(data.error || 'Failed to load expiration rules');
+            }
+            lifecycleRules = data.rules || [];
+            renderLifecycleRules();
+        } catch (error) {
+            if (generation !== lifecycleGeneration) return;
+            $('#lifecycle-rules').textContent = '';
+            $('#lifecycle-error').textContent = error.message;
+        }
+    });
+
+    $('#lifecycle-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (lifecycleBusy || $('#lifecycle-add').disabled) return;
+        const days = Number($('#lifecycle-days').value);
+        if (!Number.isInteger(days) || days < 1 || days > 2147483647) return;
+        saveLifecycleRules([
+            ...lifecycleRules,
+            {
+                id: `console-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                status: 'Disabled',
+                filter: { prefix: $('#lifecycle-prefix').value },
+                expiration: { days },
+            },
+        ]);
+    });
+
     // ---- Objects Browser ----
 
     function openBucket(name) {

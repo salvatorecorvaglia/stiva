@@ -138,6 +138,7 @@
                         </div>
                     </div>
                     <div class="view-actions">
+                        <button id="lifecycle-btn" class="btn btn-secondary">Expiration Rules</button>
                         <div class="search-box">
                             <input type="text" id="search-input" placeholder="Search prefix..." aria-label="Search prefix">
                         </div>
@@ -241,6 +242,33 @@
                 <button class="btn btn-ghost" data-close="create-folder-modal">Cancel</button>
                 <button id="confirm-create-folder" class="btn btn-primary">Create</button>
             </div>
+        </div>
+    </div>
+
+    <div id="lifecycle-modal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="lifecycle-title">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="lifecycle-title">Expiration Rules</h3>
+                <button class="modal-close" data-close="lifecycle-modal" aria-label="Close expiration rules">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="lifecycle-bucket" class="modal-desc"></p>
+                <p class="modal-desc">Enabled rules expire matching objects based on their age, including objects already stored. New rules are created disabled; enable them when ready. Cleanup runs periodically. In versioned buckets, expiration creates delete markers; older versions require a separate rule.</p>
+                <div id="lifecycle-rules" aria-live="polite"></div>
+                <form id="lifecycle-form">
+                    <div class="form-group">
+                        <label for="lifecycle-prefix">Object key prefix (empty means all objects)</label>
+                        <input id="lifecycle-prefix" type="text" placeholder="logs/">
+                    </div>
+                    <div class="form-group">
+                        <label for="lifecycle-days">Expire after days</label>
+                        <input id="lifecycle-days" type="number" min="1" max="2147483647" step="1" required value="30">
+                    </div>
+                    <button id="lifecycle-add" type="submit" class="btn btn-primary" disabled>Add Expiration Rule</button>
+                </form>
+                <p id="lifecycle-error" class="form-error" role="alert"></p>
+            </div>
+            <div class="modal-footer"><button class="btn btn-ghost" data-close="lifecycle-modal">Close</button></div>
         </div>
     </div>
 
