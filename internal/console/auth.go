@@ -103,17 +103,23 @@ const downloadTokenType = "download"
 
 // downloadClaims identify what a download link grants.
 type downloadClaims struct {
-	Bucket string
-	Key    string
-	ID     string // single-use identifier (jti)
-	Expiry time.Time
+	VersionID string
+	Bucket    string
+	Key       string
+	ID        string // single-use identifier (jti)
+	Expiry    time.Time
 }
 
 // generateDownload issues a link token for one object, valid for
 // downloadLinkTTL from now and bound to the current credentials like a
 // session.
 func (s sessionTokens) generateDownload(creds *auth.Credentials, bucket, key string, now time.Time) (string, error) {
+	return s.generateVersionDownload(creds, bucket, key, "", now)
+}
+
+func (s sessionTokens) generateVersionDownload(creds *auth.Credentials, bucket, key, versionID string, now time.Time) (string, error) {
 	claims := jwt.MapClaims{
+		"v":                        versionID,
 		"typ":                      downloadTokenType,
 		"b":                        bucket,
 		"k":                        key,
@@ -151,7 +157,8 @@ func (s sessionTokens) validateDownload(tokenString string, creds *auth.Credenti
 	if err != nil || bucket == "" || key == "" || id == "" {
 		return nil, fmt.Errorf("malformed download link")
 	}
-	return &downloadClaims{Bucket: bucket, Key: key, ID: id, Expiry: exp.Time}, nil
+	versionID, _ := claims["v"].(string)
+	return &downloadClaims{Bucket: bucket, Key: key, VersionID: versionID, ID: id, Expiry: exp.Time}, nil
 }
 
 func generateJTI() string {

@@ -1608,3 +1608,29 @@ th[aria-sort] {
 .skeleton-tall {
     height: 1.2rem;
 }
+
+/* Version history remains scrollable inside the bucket settings dialog. */
+.versions-list {
+    max-height: 320px;
+    overflow-y: auto;
+    margin: 16px 0;
+}
+.version-row {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border-primary);
+    overflow-wrap: anywhere;
+}
+.version-row p {
+    margin: 6px 0;
+    font-size: 12px;
+}
+
+#versioning-modal .modal {
+    max-width: 680px;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+}
+#versioning-modal .modal-body {
+    overflow-y: auto;
+}

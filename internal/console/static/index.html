@@ -138,6 +138,7 @@
                         </div>
                     </div>
                     <div class="view-actions">
+                        <button id="versioning-btn" class="btn btn-secondary">Versioning &amp; History</button>
                         <button id="lifecycle-btn" class="btn btn-secondary">Expiration Rules</button>
                         <div class="search-box">
                             <input type="text" id="search-input" placeholder="Search prefix..." aria-label="Search prefix">
@@ -269,6 +270,30 @@
                 <p id="lifecycle-error" class="form-error" role="alert"></p>
             </div>
             <div class="modal-footer"><button class="btn btn-ghost" data-close="lifecycle-modal">Close</button></div>
+        </div>
+    </div>
+
+    <div id="versioning-modal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="versioning-title">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="versioning-title">Versioning &amp; History</h3>
+                <button class="modal-close" data-close="versioning-modal" aria-label="Close versioning">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="versioning-bucket" class="modal-desc"></p>
+                <p class="modal-desc">Enabling versioning keeps separate versions of future writes. Suspending it preserves existing versions but stops creating new version IDs. Older versions consume storage. Delete markers hide an object; earlier versions can still be downloaded here.</p>
+                <p id="versioning-status" role="status"></p>
+                <button id="versioning-toggle" class="btn btn-secondary" disabled>Enable Versioning</button>
+                <form id="versions-filter" class="form-group">
+                    <label for="versions-prefix">Object key prefix</label>
+                    <input id="versions-prefix" type="text" placeholder="Filter by prefix…">
+                    <button id="versions-search" class="btn btn-secondary" type="submit" disabled>Show History</button>
+                </form>
+                <div id="versions-list" class="versions-list" aria-live="polite"></div>
+                <button id="versions-next" class="btn btn-secondary" disabled>Next Page</button>
+                <p id="versioning-error" class="form-error" role="alert"></p>
+            </div>
+            <div class="modal-footer"><button class="btn btn-ghost" data-close="versioning-modal">Close</button></div>
         </div>
     </div>
 

@@ -556,6 +556,156 @@
         ]);
     });
 
+    let versionsBucket = '';
+    let versioningStatus = '';
+    let versionsGeneration = 0;
+    let versionsBusy = false;
+    let versionsNext = null;
+    let versionsPrefix = '';
+
+    function versioningControls(ready) {
+        $('#versioning-toggle').disabled = !ready;
+        $('#versions-search').disabled = !ready;
+        $('#versions-next').disabled = !ready || !versionsNext;
+    }
+
+    function renderVersions(items) {
+        const list = $('#versions-list');
+        list.replaceChildren();
+        if (!items.length) list.textContent = 'No versions match this prefix.';
+        for (const item of items) {
+            const row = document.createElement('div');
+            row.className = 'version-row';
+            const name = document.createElement('strong');
+            name.textContent = item.key;
+            const detail = document.createElement('p');
+            detail.textContent = `${item.versionId || 'null'} • ${item.lastModified} • ${item.isDeleteMarker ? 'Delete marker' : formatSize(item.size)}${item.isLatest ? ' • Latest' : ''}`;
+            row.append(name, detail);
+            if (!item.isDeleteMarker) {
+                const download = document.createElement('button');
+                download.type = 'button';
+                download.className = 'btn btn-secondary btn-sm';
+                download.textContent = 'Download Version';
+                const bucket = versionsBucket;
+                download.addEventListener('click', () =>
+                    downloadObject(item.key, item.versionId || 'null', bucket),
+                );
+                row.append(download);
+            }
+            list.append(row);
+        }
+    }
+
+    async function loadVersions(next = false) {
+        const generation = ++versionsGeneration;
+        versionsBusy = true;
+        versioningControls(false);
+        $('#versioning-error').textContent = '';
+        $('#versions-list').textContent = 'Loading versions…';
+        const params = new URLSearchParams({ prefix: versionsPrefix, maxKeys: '50' });
+        if (next && versionsNext) {
+            params.set('keyMarker', versionsNext.key);
+            params.set('versionIdMarker', versionsNext.version);
+        }
+        versionsNext = null;
+        try {
+            const response = await api(
+                'GET',
+                `/api/buckets/${encodeURIComponent(versionsBucket)}/versions?${params}`,
+            );
+            if (!response.ok) throw new Error(await errorFrom(response, 'Failed to load versions'));
+            const data = await response.json();
+            if (generation !== versionsGeneration) return;
+            renderVersions(data.items);
+            if (data.isTruncated)
+                versionsNext = { key: data.nextKeyMarker, version: data.nextVersionIdMarker };
+        } catch (error) {
+            if (generation !== versionsGeneration) return;
+            $('#versions-list').textContent = '';
+            $('#versioning-error').textContent = error.message;
+        } finally {
+            if (generation === versionsGeneration) {
+                versionsBusy = false;
+                versioningControls(true);
+            }
+        }
+    }
+
+    $('#versioning-btn').addEventListener('click', async () => {
+        if (versionsBusy) return;
+        versionsBucket = currentBucket;
+        versionsPrefix = currentPrefix;
+        versionsNext = null;
+        versioningStatus = '';
+        const generation = ++versionsGeneration;
+        versionsBusy = true;
+        versioningControls(false);
+        $('#versions-prefix').value = versionsPrefix;
+        $('#versioning-bucket').textContent = `Bucket: ${versionsBucket}`;
+        $('#versioning-status').textContent = 'Loading status…';
+        $('#versioning-error').textContent = '';
+        $('#versions-list').replaceChildren();
+        openModal('versioning-modal');
+        try {
+            const response = await api(
+                'GET',
+                `/api/buckets/${encodeURIComponent(versionsBucket)}/versioning`,
+            );
+            if (!response.ok)
+                throw new Error(await errorFrom(response, 'Failed to load versioning'));
+            const data = await response.json();
+            if (generation !== versionsGeneration) return;
+            versioningStatus = data.status;
+            updateVersioningStatus();
+            await loadVersions();
+        } catch (error) {
+            $('#versioning-status').textContent = 'Status unavailable';
+            $('#versioning-error').textContent = error.message;
+        } finally {
+            versionsBusy = false;
+        }
+    });
+
+    function updateVersioningStatus() {
+        $('#versioning-status').textContent = `Versioning: ${versioningStatus || 'Disabled'}`;
+        $('#versioning-toggle').textContent =
+            versioningStatus === 'Enabled' ? 'Suspend Versioning' : 'Enable Versioning';
+    }
+
+    $('#versioning-toggle').addEventListener('click', async () => {
+        if (versionsBusy) return;
+        versionsBusy = true;
+        versioningControls(false);
+        $('#versioning-error').textContent = '';
+        try {
+            const status = versioningStatus === 'Enabled' ? 'Suspended' : 'Enabled';
+            const response = await api(
+                'POST',
+                `/api/buckets/${encodeURIComponent(versionsBucket)}/versioning`,
+                { status },
+            );
+            if (!response.ok)
+                throw new Error(await errorFrom(response, 'Failed to update versioning'));
+            versioningStatus = status;
+            updateVersioningStatus();
+            showToast(`Versioning ${status.toLowerCase()}`, 'success');
+        } catch (error) {
+            $('#versioning-error').textContent = error.message;
+        } finally {
+            versionsBusy = false;
+            versioningControls(true);
+        }
+    });
+    $('#versions-filter').addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (versionsBusy || $('#versions-search').disabled) return;
+        versionsPrefix = $('#versions-prefix').value;
+        loadVersions();
+    });
+    $('#versions-next').addEventListener('click', () => {
+        if (!versionsBusy && versionsNext) loadVersions(true);
+    });
+
     // ---- Objects Browser ----
 
     function openBucket(name) {
@@ -1304,11 +1454,16 @@
     // to be fetched whole into memory and saved from a blob, which failed on
     // large files; and a presigned S3-API URL is on another port, where
     // browsers ignore <a download>.
-    async function downloadObject(key) {
+    async function downloadObject(key, versionId = '', bucket = currentBucket) {
         try {
-            const resp = await api('POST', `/api/buckets/${currentBucket}/objects/download-link`, {
-                key,
-            });
+            const resp = await api(
+                'POST',
+                `/api/buckets/${encodeURIComponent(bucket)}/objects/download-link`,
+                {
+                    key,
+                    versionId,
+                },
+            );
             if (!resp.ok) {
                 throw new Error(await errorFrom(resp, 'Download failed'));
             }

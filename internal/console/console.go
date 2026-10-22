@@ -292,6 +292,9 @@ func (h *Handler) setupRoutes() {
 		{http.MethodPost, "/api/buckets", api(h.createBucket)},
 		{http.MethodDelete, "/api/buckets/{bucket}", bucketAPI(h.deleteBucket)},
 
+		{http.MethodGet, "/api/buckets/{bucket}/versioning", bucketAPI(h.getVersioning)},
+		{http.MethodPost, "/api/buckets/{bucket}/versioning", bucketAPI(h.setVersioning)},
+		{http.MethodGet, "/api/buckets/{bucket}/versions", bucketAPI(h.listVersions)},
 		{http.MethodGet, "/api/buckets/{bucket}/public", bucketAPI(h.handleGetBucketPublic)},
 		{http.MethodPost, "/api/buckets/{bucket}/public", bucketAPI(h.handleSetBucketPublic)},
 
@@ -775,13 +778,13 @@ func (h *Handler) downloadObject(w http.ResponseWriter, r *http.Request, bucket 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMissingKey})
 		return
 	}
-	h.serveObject(w, r, bucket, key)
+	h.serveObject(w, r, bucket, key, r.URL.Query().Get("versionId"))
 }
 
 // serveObject streams an object as an attachment, for the session download
 // endpoint and for download links.
-func (h *Handler) serveObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	reader, info, err := h.engine.GetObject(r.Context(), bucket, key, "")
+func (h *Handler) serveObject(w http.ResponseWriter, r *http.Request, bucket, key, versionID string) {
+	reader, info, err := h.engine.GetObject(r.Context(), bucket, key, versionID)
 	if err != nil {
 		// Every failure used to read as 404 "object not found", including
 		// an SSE-C object, which exists but needs its customer key.
@@ -824,17 +827,18 @@ func (h *Handler) serveObject(w http.ResponseWriter, r *http.Request, bucket, ke
 // natively instead.
 func (h *Handler) createDownloadLink(w http.ResponseWriter, r *http.Request, bucket string) {
 	var req struct {
-		Key string `json:"key"`
+		Key       string `json:"key"`
+		VersionID string `json:"versionId"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBody)).Decode(&req); err != nil || req.Key == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMissingKey})
 		return
 	}
-	if _, err := h.engine.HeadObject(r.Context(), bucket, req.Key, ""); err != nil {
+	if _, err := h.engine.HeadObject(r.Context(), bucket, req.Key, req.VersionID); err != nil {
 		writeStorageError(w, err, "failed to read object")
 		return
 	}
-	token, err := h.tokens.generateDownload(h.creds, bucket, req.Key, time.Now())
+	token, err := h.tokens.generateVersionDownload(h.creds, bucket, req.Key, req.VersionID, time.Now())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create download link"})
 		return
@@ -853,7 +857,7 @@ func (h *Handler) serveDownloadLink(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusGone, map[string]string{"error": "this download link has already been used"})
 		return
 	}
-	h.serveObject(w, r, claims.Bucket, claims.Key)
+	h.serveObject(w, r, claims.Bucket, claims.Key, claims.VersionID)
 }
 
 // spendDownloadLink records a link as used, reporting false if it already

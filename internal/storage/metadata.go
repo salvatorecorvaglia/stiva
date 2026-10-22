@@ -876,6 +876,20 @@ func (m *MetadataStore) GetObjectMeta(bucket, key, versionID string) (*ObjectInf
 		} else {
 			data = b.Get(objectMetaKey(bucket, key))
 		}
+		// Objects written before versioning was enabled are the S3 null
+		// version, even before the next write promotes their metadata.
+		if data == nil && versionID == "null" {
+			legacy := b.Get(objectMetaKey(bucket, key))
+			if legacy != nil {
+				var candidate ObjectInfo
+				if err := json.Unmarshal(legacy, &candidate); err != nil {
+					return err
+				}
+				if candidate.VersionID == "" {
+					data = legacy
+				}
+			}
+		}
 		if data == nil {
 			return fmt.Errorf("object not found: %s/%s (version=%s)", bucket, key, versionID)
 		}
