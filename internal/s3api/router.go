@@ -215,6 +215,10 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// per request, once for routing and again for logging.
 	bucket, key := rt.resolveBucketAndKey(r)
 
+	if bucket == "_ready" && isHealthCheck(r, "_health", key) {
+		httpx.ReadinessHandler(rt.engine)(w, r)
+		return
+	}
 	if isHealthCheck(r, bucket, key) {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -225,6 +229,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rt.metrics.IncRequests()
 
 	rt.serveHTTPInternal(mrw, r, bucket, key)
+	rt.metrics.ObserveLatency(time.Since(start))
 
 	if mrw.statusCode >= 400 {
 		rt.metrics.IncErrors()

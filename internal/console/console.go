@@ -347,6 +347,8 @@ func (h *Handler) setupRoutes() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	h.mux.HandleFunc("GET /_ready", httpx.ReadinessHandler(h.engine))
+
 	// Static files (embedded frontend) with SPA wildcard fallback
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	fileServer := http.FileServer(http.FS(staticFS))

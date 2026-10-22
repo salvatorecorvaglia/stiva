@@ -6,7 +6,7 @@
 # ================================================================
 
 # --- Builder Stage ---
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:5cb67f19c5e7994dcb80c074f7cfca8aeeada45bbdca035f73df269cefdcce61 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -29,7 +29,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     ./cmd/stiva
 
 # --- Runtime Stage ---
-FROM alpine:3.22
+FROM alpine:3.22@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654
 
 # wget is used by the container healthcheck.
 RUN apk add --no-cache ca-certificates tzdata wget

@@ -51,6 +51,8 @@ type bucketDBEntry struct {
 
 // MetadataStore manages bucket and object metadata using per-bucket bbolt databases.
 type MetadataStore struct {
+	replication bool
+
 	globalDB      *bolt.DB
 	activeBuckets map[string]*bucketDBEntry
 	mu            sync.RWMutex
@@ -166,6 +168,10 @@ func NewMetadataStore(dataDir string) (*MetadataStore, error) {
 		return nil, fmt.Errorf("failed to run startup metadata migration: %w", err)
 	}
 
+	if err := syncParents(metaDir, dataDir); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -317,6 +323,10 @@ func (m *MetadataStore) acquireBucketDB(bucket string) (*bolt.DB, func(), error)
 		return nil, nil, fmt.Errorf("failed to initialize metadata db for bucket %s: %w", bucket, err)
 	}
 
+	if err := syncParents(filepath.Dir(dbPath), m.dataDir); err != nil {
+		_ = db.Close()
+		return nil, nil, err
+	}
 	m.mu.Lock()
 	// Another goroutine may have won the race while we were opening.
 	if existing, ok := m.activeBuckets[bucket]; ok {
@@ -617,6 +627,12 @@ func (m *MetadataStore) IsBucketEmpty(bucket string) (bool, error) {
 	// that is then compared against zero.
 	isEmpty := true
 	err = db.View(func(tx *bolt.Tx) error {
+		if pending := tx.Bucket(replicationBucket); pending != nil {
+			if k, _ := pending.Cursor().First(); k != nil {
+				isEmpty = false
+				return nil
+			}
+		}
 		if objB := tx.Bucket(objectsBucket); objB != nil {
 			if k, _ := objB.Cursor().First(); k != nil {
 				isEmpty = false
@@ -772,6 +788,9 @@ func (m *MetadataStore) PutObjectMeta(info *ObjectInfo) error {
 	}
 	defer releasedb()
 	return db.Update(func(tx *bolt.Tx) error {
+		if err := m.markReplication(tx, info.Key); err != nil {
+			return err
+		}
 		b := tx.Bucket(objectsBucket)
 
 		info.IsLatest = true
@@ -879,6 +898,9 @@ func (m *MetadataStore) DeleteObjectMeta(bucket, key, versionID string) error {
 	}
 	defer releasedb()
 	return db.Update(func(tx *bolt.Tx) error {
+		if err := m.markReplication(tx, key); err != nil {
+			return err
+		}
 		b := tx.Bucket(objectsBucket)
 		if versionID != "" {
 			// Delete specific version

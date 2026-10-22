@@ -1,0 +1,67 @@
+groups:
+  - name: stiva
+    rules:
+      - alert: StivaUnavailable
+        expr: up{job="stiva"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Stiva metrics unavailable"
+      - alert: StivaDiskLow
+        expr: stiva_disk_free_bytes / stiva_disk_total_bytes < 0.15
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Stiva storage has less than 15% free space"
+      - alert: StivaErrors
+        expr: rate(stiva_request_errors_total[5m]) / clamp_min(rate(stiva_requests_total[5m]), 0.001) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of S3 requests fail (includes client errors)"
+      - alert: StivaReplicationFailure
+        expr: increase(stiva_sync_failures_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Replication failures; pending objects retained for retry"
+      - alert: StivaReplicationBacklog
+        expr: stiva_sync_pending > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Replication backlog has not cleared"
+      - alert: StivaWebhookLost
+        expr: increase(stiva_webhook_dropped_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Webhook notifications were lost"
+      - alert: StivaBackupStale
+        expr: time() - stiva_backup_last_verified_timestamp_seconds > 90000
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "No verified backup in the last 25 hours"
+      - alert: StivaBackupMetricMissing
+        expr: absent(stiva_backup_last_verified_timestamp_seconds)
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Backup verification metrics have not been configured"
+      - alert: StivaInodesLow
+        expr: (stiva_disk_inodes_free / stiva_disk_inodes_total < 0.15) and (stiva_disk_inodes_total > 0)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Stiva storage has less than 15% free inodes"
+      - alert: StivaHighLatency
+        expr: histogram_quantile(0.95, sum by (le, instance) (rate(stiva_request_duration_seconds_bucket[5m]))) > 5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "S3 request p95 duration exceeds 5 seconds (includes transfer time)"
+      - alert: StivaReadinessFailed
+        expr: probe_success{job="stiva-readiness"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Stiva storage readiness probe failed"

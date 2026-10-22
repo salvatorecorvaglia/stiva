@@ -129,6 +129,9 @@ func (fs *FilesystemEngine) beginSyncStop() {
 	if atomic.SwapInt32(&fs.isSyncShuttingDown, 1) == 1 {
 		return
 	}
+	if fs.durableStop != nil {
+		close(fs.durableStop)
+	}
 	if fs.syncQueue != nil {
 		close(fs.syncQueue)
 	}
@@ -136,7 +139,7 @@ func (fs *FilesystemEngine) beginSyncStop() {
 
 // MirrorSync schedules an async mirroring operation to the backup S3 bucket.
 func (fs *FilesystemEngine) MirrorSync(bucket, key, op string) {
-	if fs.syncConfig == nil {
+	if fs.syncConfig == nil || fs.durableReplication {
 		return
 	}
 

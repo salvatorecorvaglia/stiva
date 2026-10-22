@@ -191,6 +191,8 @@ type MultipartUploadInfo struct {
 
 // PartInfo holds metadata about a single uploaded part.
 type PartInfo struct {
+	// BlobID selects immutable part data. Empty reads the legacy numbered file.
+	BlobID     string `json:"blobId,omitempty"`
 	PartNumber int
 	ETag       string
 	Size       int64

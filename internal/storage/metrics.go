@@ -9,6 +9,11 @@ import (
 
 // MetricsTracker holds thread-safe global statistics about the server operations.
 type MetricsTracker struct {
+	latencyMu      sync.Mutex
+	latencyCount   uint64
+	latencySum     float64
+	latencyBuckets [len(latencyBounds)]uint64
+
 	RequestsTotal    uint64
 	RequestErrors    uint64
 	BytesUploaded    uint64
@@ -21,6 +26,9 @@ type MetricsTracker struct {
 	// to detect silent notification/replication loss.
 	WebhookDropped uint64
 	SyncDropped    uint64
+	SyncFailures   uint64
+	SyncPending    int64
+	SyncLastScan   int64
 
 	// Disk space caching
 	lastDiskCheck time.Time
@@ -83,6 +91,8 @@ func (m *MetricsTracker) IncSyncDropped() {
 	atomic.AddUint64(&m.SyncDropped, 1)
 }
 
+func (m *MetricsTracker) IncSyncFailure() { atomic.AddUint64(&m.SyncFailures, 1) }
+
 // FormatPrometheus generates a plain-text Prometheus-compliant metrics string.
 func (m *MetricsTracker) FormatPrometheus(dataDir string) string {
 	m.diskMu.Lock()
@@ -106,7 +116,23 @@ func (m *MetricsTracker) FormatPrometheus(dataDir string) string {
 	webhookDropped := atomic.LoadUint64(&m.WebhookDropped)
 	syncDropped := atomic.LoadUint64(&m.SyncDropped)
 
-	return fmt.Sprintf(`# HELP stiva_requests_total Total number of S3 requests processed.
+	inodesTotal, inodesFree := getDiskInodes(dataDir)
+	return m.formatLatency() + fmt.Sprintf(`# HELP stiva_disk_inodes_total Total inodes on the storage volume; zero if unsupported.
+# TYPE stiva_disk_inodes_total gauge
+stiva_disk_inodes_total %d
+# HELP stiva_disk_inodes_free Free inodes on the storage volume; zero if unsupported.
+# TYPE stiva_disk_inodes_free gauge
+stiva_disk_inodes_free %d
+# HELP stiva_sync_pending Number of objects awaiting replication at the start of the last scan.
+# TYPE stiva_sync_pending gauge
+stiva_sync_pending %d
+# HELP stiva_sync_failures_total Failed durable replication attempts including SSE-C skips.
+# TYPE stiva_sync_failures_total counter
+stiva_sync_failures_total %d
+# HELP stiva_sync_last_scan_timestamp_seconds Last completed durable replication scan.
+# TYPE stiva_sync_last_scan_timestamp_seconds gauge
+stiva_sync_last_scan_timestamp_seconds %d
+# HELP stiva_requests_total Total number of S3 requests processed.
 # TYPE stiva_requests_total counter
 stiva_requests_total %d
 
@@ -141,5 +167,5 @@ stiva_webhook_dropped_total %d
 # HELP stiva_sync_dropped_total Total replication tasks never delivered: discarded because the dispatch queue was full, or abandoned at shutdown.
 # TYPE stiva_sync_dropped_total counter
 stiva_sync_dropped_total %d
-`, reqs, errs, up, down, activeMP, diskTotalVal, diskFreeVal, webhookDropped, syncDropped)
+`, inodesTotal, inodesFree, atomic.LoadInt64(&m.SyncPending), atomic.LoadUint64(&m.SyncFailures), atomic.LoadInt64(&m.SyncLastScan), reqs, errs, up, down, activeMP, diskTotalVal, diskFreeVal, webhookDropped, syncDropped)
 }

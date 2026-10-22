@@ -14,6 +14,9 @@ import (
 
 // Config holds all runtime configuration for the Stiva server.
 type Config struct {
+	// Production enables stricter startup validation.
+	Production bool
+
 	// AccessKey is the S3 access key used for authentication.
 	AccessKey string
 	// SecretKey is the S3 secret key used for authentication.
@@ -107,6 +110,17 @@ const rateLimitDisabled = -1
 // insecure. It is called before anything binds a port.
 func (c *Config) Validate() error {
 	var errs []error
+	if c.Production {
+		if c.AccessKey == "stiva" || c.SecretKey == "stiva123" || len(c.SecretKey) < 32 {
+			errs = append(errs, errors.New("production requires custom credentials and STIVA_SECRET_KEY of at least 32 characters"))
+		}
+		if len(c.JWTSecret) < 32 || len(c.MetricsToken) < 32 {
+			errs = append(errs, errors.New("production requires STIVA_JWT_SECRET and STIVA_METRICS_TOKEN of at least 32 characters"))
+		}
+		if c.DisableMinPartSize {
+			errs = append(errs, errors.New("production forbids STIVA_DISABLE_MIN_PART_SIZE"))
+		}
+	}
 
 	if err := validatePort("STIVA_S3_PORT", c.S3Port); err != nil {
 		errs = append(errs, err)
@@ -337,6 +351,7 @@ func Load() *Config {
 	}
 
 	cfg := &Config{
+		Production:     boolVar("STIVA_PRODUCTION"),
 		AccessKey:      envOrDefault("STIVA_ACCESS_KEY", "stiva"),
 		SecretKey:      envOrDefault("STIVA_SECRET_KEY", "stiva123"),
 		DataDir:        envOrDefault("STIVA_DATA_DIR", "/data"),

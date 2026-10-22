@@ -48,3 +48,7 @@ Thumbs.db
 # Docs (unused by the build)
 *.md
 !README.md
+
+# Frontend tooling and deployment secrets
+node_modules/
+**/*.env

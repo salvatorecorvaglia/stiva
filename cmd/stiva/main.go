@@ -35,6 +35,12 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "backup", "restore", "verify-backup":
+			return maintenance(os.Args[1:])
+		}
+	}
 	// Parse version flags
 	for _, arg := range os.Args[1:] {
 		if arg == "-v" || arg == "--version" || arg == "-version" || arg == "version" {

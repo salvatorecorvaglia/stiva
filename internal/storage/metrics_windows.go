@@ -19,3 +19,5 @@ func GetDiskSpace(path string) (total uint64, free uint64, err error) {
 	}
 	return totalBytes, freeBytes, nil
 }
+
+func getDiskInodes(_ string) (uint64, uint64) { return 0, 0 }

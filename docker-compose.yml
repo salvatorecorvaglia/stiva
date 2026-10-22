@@ -7,6 +7,8 @@ services:
       - "${STIVA_CONSOLE_PORT:-9001}:${STIVA_CONSOLE_PORT:-9001}"   # Web Console
     volumes:
       - ./data:/data
+    env_file:
+      - .env
     environment:
       - STIVA_ACCESS_KEY=${STIVA_ACCESS_KEY:-stiva}
       - STIVA_SECRET_KEY=${STIVA_SECRET_KEY:-stiva123}

@@ -105,6 +105,13 @@ type FilesystemEngine struct {
 	// Zero disables the cap.
 	maxObjectSize int64
 
+	readyMu            sync.Mutex
+	readyAt            time.Time
+	readyErr           error
+	durableReplication bool
+	durableOnce        sync.Once
+	durableStop        chan struct{}
+
 	// Sync replication queue
 	syncConfig         *SyncConfig
 	syncQueue          chan syncTask
@@ -157,6 +164,7 @@ func NewFilesystemEngine(dataDir string, syncCfg *SyncConfig, webhookURL string)
 		return nil, err
 	}
 
+	meta.replication = syncCfg != nil
 	cleanupOrphanedTempFiles(dataDir)
 	seedActiveMultipartGauge(meta, GlobalMetrics)
 
@@ -316,6 +324,9 @@ func (fs *FilesystemEngine) CreateBucket(name string) error {
 		return fmt.Errorf("failed to create bucket directory: %w", err)
 	}
 
+	if err := syncParents(fs.bucketPath(name), fs.dataDir); err != nil {
+		return err
+	}
 	return fs.metadata.PutBucket(&BucketInfo{
 		Name:         name,
 		CreationDate: time.Now().UTC(),
@@ -537,6 +548,9 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 		return nil, &S3Error{Code: "BadRequest", Message: fmt.Sprintf("Size mismatch: expected %d bytes, wrote %d bytes", size, written)}
 	}
 
+	if err := tmpFile.Sync(); err != nil {
+		return nil, fmt.Errorf("sync object data: %w", err)
+	}
 	if err := tmpFile.Close(); err != nil {
 		return nil, fmt.Errorf("failed to close temp file: %w", err)
 	}
@@ -816,6 +830,14 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 // the new metadata is committed. A crash in between leaves an unreferenced
 // file, never a record pointing at the wrong or missing data.
 func (fs *FilesystemEngine) commitObject(tmpPath, blobID, blobPath string, info *ObjectInfo) error {
+	var obsolete []ObjectInfo
+	if info.VersionID == "" {
+		var err error
+		obsolete, err = fs.metadata.GetObjectVersions(info.Bucket, info.Key)
+		if err != nil {
+			return err
+		}
+	}
 	replaced, err := fs.prepareKeyForWrite(info.Bucket, info.Key, info.VersionID)
 	if err != nil {
 		return err
@@ -823,12 +845,18 @@ func (fs *FilesystemEngine) commitObject(tmpPath, blobID, blobPath string, info 
 	if err := os.Rename(tmpPath, blobPath); err != nil {
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
+	if err := syncParents(filepath.Dir(blobPath), fs.dataDir); err != nil {
+		return err
+	}
 	info.BlobID = blobID
 	if err := fs.metadata.PutObjectMeta(info); err != nil {
 		removeObjectFile(blobPath) // never referenced by any record
 		return err
 	}
 	fs.removeData(replaced)
+	for i := range obsolete {
+		fs.removeData(&obsolete[i])
+	}
 	return nil
 }
 
@@ -837,13 +865,12 @@ func (fs *FilesystemEngine) commitObject(tmpPath, blobID, blobPath string, info 
 // replaces, if any. Callers hold the key lock.
 //
 // An unversioned write replaces the current object and drops the key's
-// version history, whose data is removed here before its metadata goes in
-// PutObjectMeta. A versioned write first turns an object written before
+// version history, whose data is removed after PutObjectMeta commits.
+// A versioned write first turns an object written before
 // versioning was enabled into the "null" version, as S3 does; with
 // versioning suspended the write then replaces that null version.
 func (fs *FilesystemEngine) prepareKeyForWrite(bucket, key, versionID string) (*ObjectInfo, error) {
 	if versionID == "" {
-		fs.removeVersionFiles(bucket, key)
 		return fs.storedRecord(bucket, key, "")
 	}
 	if err := fs.promoteLegacyNullVersion(bucket, key); err != nil {
@@ -874,60 +901,73 @@ func (fs *FilesystemEngine) storedRecord(bucket, key, versionID string) (*Object
 // apply unchanged: with versioning Enabled it becomes a noncurrent version;
 // with it Suspended the write replaces it, as a Suspended write replaces the
 // null version. Blob data does not depend on the version ID; data in the old
-// key-path layout is moved to the null version's path.
+// key-path layout is copied into a durable immutable blob.
 func (fs *FilesystemEngine) promoteLegacyNullVersion(bucket, key string) error {
 	latest, err := fs.metadata.GetObjectMeta(bucket, key, "")
 	if err != nil || latest.VersionID != "" || latest.IsDeleteMarker {
-		return nil //nolint:nilerr // nothing stored, or already versioned: nothing to promote
+		return nil //nolint:nilerr // absent or already versioned
 	}
-
-	if latest.BlobID == "" {
-		src, err := fs.objectPathWithVersion(bucket, key, "")
-		if err != nil {
-			return &S3Error{Code: "InvalidArgument", Message: err.Error()}
-		}
-		dst, err := fs.objectPathWithVersion(bucket, key, "null")
-		if err != nil {
-			return &S3Error{Code: "InvalidArgument", Message: err.Error()}
-		}
-		// Resolve both names relative to a trusted root. Root.Rename also
-		// prevents symlink traversal outside the buckets directory.
-		base := filepath.Join(fs.dataDir, "buckets")
-		srcRel, err := filepath.Rel(base, src)
-		if err != nil || !filepath.IsLocal(srcRel) {
-			return &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-		}
-		dstRel, err := filepath.Rel(base, dst)
-		if err != nil || !filepath.IsLocal(dstRel) {
-			return &S3Error{Code: "InvalidArgument", Message: errInvalidKeyTraversal}
-		}
-		root, err := os.OpenRoot(base)
-		if err != nil {
-			return fmt.Errorf("failed to open buckets directory: %w", err)
-		}
-		defer root.Close()
-		if err := root.Rename(srcRel, dstRel); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to move pre-versioning object to its null version: %w", err)
-		}
-	}
-
 	latest.VersionID = "null"
 	latest.IsLatest = true
-	return fs.metadata.PutObjectMetaRaw(latest)
-}
+	if latest.BlobID != "" {
+		return fs.metadata.PutObjectMetaRaw(latest)
+	}
 
-// removeVersionFiles deletes the data of every stored version of key, leaving
-// the unversioned object's own data alone. Callers hold the key lock.
-func (fs *FilesystemEngine) removeVersionFiles(bucket, key string) {
-	versions, err := fs.metadata.GetObjectVersions(bucket, key)
+	// Copy legacy bytes to an immutable blob before changing metadata. Moving
+	// the old file first would leave its committed record dangling after a crash.
+	src, err := fs.objectPathWithVersion(bucket, key, "")
 	if err != nil {
-		return
+		return err
 	}
-	for i := range versions {
-		if versions[i].VersionID != "" {
-			fs.removeData(&versions[i])
+	base := filepath.Join(fs.dataDir, "buckets")
+	rel, err := filepath.Rel(base, src)
+	if err != nil || !filepath.IsLocal(rel) {
+		return fmt.Errorf("invalid legacy object path")
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	input, err := root.Open(rel)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	id, path, err := fs.newBlob(bucket)
+	if err != nil {
+		return err
+	}
+	output, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(path)
 		}
+	}()
+	_, copyErr := io.Copy(output, input)
+	inputCloseErr := input.Close()
+	syncErr := output.Sync()
+	closeErr := output.Close()
+	if err := errors.Join(copyErr, inputCloseErr, syncErr, closeErr); err != nil {
+		return err
 	}
+	if err := syncParents(filepath.Dir(path), fs.dataDir); err != nil {
+		return err
+	}
+	latest.BlobID = id
+	if err := fs.metadata.PutObjectMetaRaw(latest); err != nil {
+		return err
+	}
+	committed = true
+	// A failed cleanup leaves only an unreferenced legacy copy.
+	if err := root.Remove(rel); err != nil {
+		slog.Warn("[Storage] Legacy data cleanup failed", "error", err)
+	}
+	return nil
 }
 
 // removeData deletes the file holding a record's data, in whichever layout

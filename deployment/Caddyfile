@@ -1,0 +1,10 @@
+{$STIVA_S3_HOST} {
+ reverse_proxy stiva:9000 {
+  # Preserve Host and the URI: both are covered by S3 signatures.
+  transport http {
+   dial_timeout 10s
+   response_header_timeout 10m
+  }
+ }
+ log
+}

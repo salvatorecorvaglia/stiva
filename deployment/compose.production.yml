@@ -1,0 +1,93 @@
+# Run from the repo: docker compose --env-file deployment/production.env -f deployment/compose.production.yml up -d
+services:
+  stiva:
+    image: ${STIVA_IMAGE:?Set STIVA_IMAGE to an approved image digest}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    read_only: true
+    user: "1000:1000"
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    ports:
+      - "127.0.0.1:9001:9001"
+    expose: ["9000", "9001"]
+    volumes:
+      - ${STIVA_DATA_PATH:?Set absolute STIVA_DATA_PATH}:/data
+    environment:
+      STIVA_PRODUCTION: "true"
+      STIVA_DATA_DIR: /data
+      STIVA_S3_PORT: "9000"
+      STIVA_CONSOLE_PORT: "9001"
+      STIVA_ACCESS_KEY: ${STIVA_ACCESS_KEY:?Required}
+      STIVA_SECRET_KEY: ${STIVA_SECRET_KEY:?Required}
+      STIVA_JWT_SECRET: ${STIVA_JWT_SECRET:?Required}
+      STIVA_METRICS_TOKEN: ${STIVA_METRICS_TOKEN:?Required}
+      STIVA_REGION: ${STIVA_REGION:-us-east-1}
+      STIVA_S3_ENDPOINT: https://${STIVA_S3_HOST:?Required}
+      STIVA_DOMAIN: ${STIVA_DOMAIN:-}
+      STIVA_LOG_FORMAT: json
+      STIVA_LOG_LEVEL: ${STIVA_LOG_LEVEL:-info}
+      STIVA_TRUST_PROXY: "true"
+      STIVA_TRUSTED_PROXY_HOPS: "1"
+      STIVA_CONSOLE_ALLOWED_ORIGINS: ${STIVA_CONSOLE_ALLOWED_ORIGINS:-}
+      STIVA_LOGIN_RATE_LIMIT: ${STIVA_LOGIN_RATE_LIMIT:-5}
+      STIVA_API_RATE_LIMIT: ${STIVA_API_RATE_LIMIT:-60}
+      STIVA_MAX_OBJECT_SIZE: ${STIVA_MAX_OBJECT_SIZE:-5368709120}
+      STIVA_MULTIPART_EXPIRY: ${STIVA_MULTIPART_EXPIRY:-7d}
+      STIVA_SYNC_ENDPOINT: ${STIVA_SYNC_ENDPOINT:-}
+      STIVA_SYNC_BUCKET: ${STIVA_SYNC_BUCKET:-}
+      STIVA_SYNC_ACCESS_KEY: ${STIVA_SYNC_ACCESS_KEY:-}
+      STIVA_SYNC_SECRET_KEY: ${STIVA_SYNC_SECRET_KEY:-}
+      STIVA_SYNC_REGION: ${STIVA_SYNC_REGION:-us-east-1}
+      STIVA_WEBHOOK_URL: ${STIVA_WEBHOOK_URL:-}
+      STIVA_WEBHOOK_SECRET: ${STIVA_WEBHOOK_SECRET:-}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "--spider", "http://127.0.0.1:9000/_ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: ${STIVA_MEMORY_LIMIT:-2G}
+    networks: [backend]
+
+  proxy:
+    image: ${CADDY_IMAGE:?Set CADDY_IMAGE to an approved Caddy image digest}
+    restart: unless-stopped
+    environment:
+      STIVA_S3_HOST: ${STIVA_S3_HOST:?Required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      stiva:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [backend]
+
+networks:
+  backend:
+volumes:
+  caddy_data:
+  caddy_config:

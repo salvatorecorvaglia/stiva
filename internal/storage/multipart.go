@@ -53,6 +53,9 @@ func (fs *FilesystemEngine) CreateMultipartUpload(ctx context.Context, bucket, k
 		return nil, fmt.Errorf("failed to create multipart directory: %w", err)
 	}
 
+	if err := syncParents(partDir, fs.dataDir); err != nil {
+		return nil, err
+	}
 	meta := &MultipartMeta{
 		UploadID:    uploadID,
 		Bucket:      bucket,
@@ -156,7 +159,20 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 	if !strings.HasPrefix(partDir, basePrefix) {
 		return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidUploadID}
 	}
-	partPath := filepath.Join(partDir, fmt.Sprintf("part-%05d", partNumber))
+	partID, err := newBlobID()
+	if err != nil {
+		return nil, err
+	}
+	partPath, err := partDataPath(partDir, PartInfo{PartNumber: partNumber, BlobID: partID})
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(partPath)
+		}
+	}()
 
 	tmpFile, err := os.CreateTemp(partDir, ".part-tmp-*")
 	if err != nil {
@@ -208,6 +224,9 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 		return nil, fmt.Errorf("failed to flush part buffer: %w", err)
 	}
 
+	if err := tmpFile.Sync(); err != nil {
+		return nil, fmt.Errorf("sync object data: %w", err)
+	}
 	if err := tmpFile.Close(); err != nil {
 		return nil, fmt.Errorf("failed to close temp part file: %w", err)
 	}
@@ -223,8 +242,12 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 		return nil, fmt.Errorf("failed to rename part file: %w", err)
 	}
 
+	if err := syncParents(filepath.Dir(partPath), fs.dataDir); err != nil {
+		return nil, err
+	}
 	etag := hex.EncodeToString(hash.Sum(nil))
 	partInfo := PartInfo{
+		BlobID:     partID,
 		PartNumber: partNumber,
 		ETag:       etag,
 		Size:       written,
@@ -239,10 +262,13 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 		return nil, &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
 	}
 
+	// Retain the previous immutable file until the replacement metadata commits.
+	var previous *PartInfo
 	// Update metadata with part info
 	found := false
 	for i, p := range meta.Parts {
 		if p.PartNumber == partNumber {
+			previous = &p
 			meta.Parts[i] = partInfo
 			found = true
 			break
@@ -256,6 +282,12 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 		return nil, err
 	}
 
+	committed = true
+	if previous != nil {
+		if oldPath, err := partDataPath(partDir, *previous); err == nil {
+			removeObjectFile(oldPath)
+		}
+	}
 	fs.Metrics().AddUploaded(written)
 
 	return &partInfo, nil
@@ -438,7 +470,10 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 	}
 
 	for _, part := range parts {
-		partPath := filepath.Join(partDir, fmt.Sprintf("part-%05d", part.PartNumber))
+		partPath, err := partDataPath(partDir, uploadedParts[part.PartNumber])
+		if err != nil {
+			return nil, err
+		}
 		if !strings.HasPrefix(partPath, partBasePrefix) {
 			return nil, &S3Error{Code: "InvalidArgument", Message: errInvalidUploadID}
 		}
@@ -487,6 +522,9 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		gzipWriterPool.Put(gzipWriter)
 	}
 
+	if err := tmpFile.Sync(); err != nil {
+		return nil, fmt.Errorf("sync object data: %w", err)
+	}
 	if err := tmpFile.Close(); err != nil {
 		return nil, fmt.Errorf("failed to close temp file: %w", err)
 	}
@@ -709,4 +747,16 @@ func (fs *FilesystemEngine) lockPart(uploadID string, partNumber int) func() {
 // the ETag/size metadata from the other.
 func (fs *FilesystemEngine) lockObjectKey(bucket, key string) func() {
 	return fs.lockKey("object:" + bucket + "/" + key)
+}
+
+// partDataPath reads both the immutable and legacy part layouts.
+func partDataPath(directory string, part PartInfo) (string, error) {
+	name := fmt.Sprintf("part-%05d", part.PartNumber)
+	if part.BlobID != "" {
+		if !isBlobID(part.BlobID) {
+			return "", fmt.Errorf("invalid multipart blob ID")
+		}
+		name += "-" + part.BlobID
+	}
+	return filepath.Join(directory, name), nil
 }

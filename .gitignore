@@ -93,3 +93,6 @@ CLAUDE.md
 
 # JavaScript tooling
 node_modules/
+
+# Production deployment secrets
+/deployment/production.env

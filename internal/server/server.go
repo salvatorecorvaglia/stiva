@@ -217,6 +217,9 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to bind Console port %s: %w", s.consoleServer.Addr, err)
 	}
 	s.s3Listener, s.consoleListener = s3Listener, consoleListener
+	if engine, ok := s.engine.(*storage.FilesystemEngine); ok {
+		engine.StartDurableReplication()
+	}
 
 	go s.serve("S3 API", s.s3Server, s3Listener)
 	go s.serve("Console", s.consoleServer, consoleListener)

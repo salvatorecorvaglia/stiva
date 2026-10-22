@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Offline `backup`, `verify-backup` and `restore` commands with file checksums, bbolt integrity checks, a writer lock and staged publication.
+- Production Compose with HTTPS reverse proxy, private console, digest validation, independent secrets and bounded logs.
+- Durable replication journal committed with object metadata, startup backfill, retry/reconciliation and pending/failure metrics.
+- Storage readiness probes, request duration histograms, inode metrics and Prometheus alert rules.
+- Container qualification scripts for AWS CLI compatibility, concurrent transfers, SIGKILL recovery, ENOSPC recovery and backup restoration.
+- Production operations, backup scheduling and rollback instructions.
+
+### Changed
+
+- Flush object/part data and directory entries before publishing metadata; use immutable multipart part files while keeping legacy parts readable.
+- Copy legacy object data into durable blobs before promoting null versions; defer obsolete object cleanup until metadata commits.
+- Require Go 1.26.10, pin container base images, and gate tag releases on the full CI workflow with container smoke tests.
+- Produce image provenance, SBOMs and immutable digest summaries for releases.
+
+
 ## [1.1.0] - 2026-10-15
 
 ### Added

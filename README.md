@@ -34,7 +34,7 @@
 
 ### 🛡️ Production Hardening & Reliability
 *   **Structured Logging**: Production-grade JSON or text structured logs via Go's native `log/slog`.
-*   **LRU Database Caching**: Bounded LRU caching for per-bucket SQLite metadata connection handles to optimize file descriptor usage and memory footprint under multi-bucket workloads.
+*   **LRU Database Caching**: Bounded LRU caching for per-bucket bbolt metadata connection handles to optimize file descriptor usage and memory footprint under multi-bucket workloads.
 *   **Access Log Buffering**: High-throughput access log worker that batches disk writes (up to 100 entries or every 5s) to reduce lock contention and I/O.
 *   **Graceful Shutdown**: Monitors shutdown signals (`SIGINT`/`SIGTERM`) and tracks active requests using a `sync.WaitGroup` to ensure no connection is dropped mid-flight.
 *   **Orphan Cleanups**: Automated startup sweep that identifies and deletes partial multipart/temporary files left over by unexpected system crashes.
@@ -44,7 +44,7 @@
 ## 🚀 Getting Started
 
 ### Prerequisites
-- **Go 1.26 or higher** (to compile and run locally)
+- **Go 1.26.10 or higher** (to compile and run locally)
 - **Docker** and **Docker Compose** (for containerized deployments)
 
 ---
@@ -159,11 +159,12 @@ Stiva is configured exclusively via environment variables. You can find a baseli
 
 ### 🔄 Active-Passive Replication Configuration
 
-Setting these variables enables automated, asynchronous background replication. Whenever objects are written (`PUT`) or deleted (`DELETE`) in Stiva, the operations are queue-dispatched to the replication target.
+Setting these variables enables automated, asynchronous background replication. Whenever objects are written (`PUT`) or deleted (`DELETE`) in Stiva, the changes are journaled with object metadata and reconciled to the replication target.
+Pending replication survives restarts; failures remain pending for later scans.
 
 Objects are mirrored to **`<STIVA_SYNC_BUCKET>/<source-bucket>/<key>`**, so each source bucket occupies its own prefix in the target bucket and buckets sharing a key name cannot overwrite one another.
 
-> **Note:** SSE-C encrypted objects are **not** replicated. Stiva deliberately never persists the customer-provided key, so it cannot read those objects back to send them; each is skipped with a warning in the logs.
+> **Note:** SSE-C encrypted objects are **not** replicated. Stiva deliberately never persists the customer-provided key, so it cannot read those objects back to send them; they remain pending in the durable journal, emit errors/metrics, and require raw backups for recovery.
 
 ### 🪝 Webhook Event Notifications Configuration
 
