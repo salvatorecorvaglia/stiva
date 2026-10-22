@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Storage readiness probes, request duration histograms, inode metrics and Prometheus alert rules.
 - Container qualification scripts for AWS CLI compatibility, concurrent transfers, SIGKILL recovery, ENOSPC recovery and backup restoration.
 - Production operations, backup scheduling and rollback instructions.
+- Biome linting and formatting for console JavaScript and CSS, with console lint and test checks in CI.
 
 ### Changed
 
@@ -22,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Copy legacy object data into durable blobs before promoting null versions; defer obsolete object cleanup until metadata commits.
 - Require Go 1.26.10, pin container base images, and gate tag releases on the full CI workflow with container smoke tests.
 - Produce image provenance, SBOMs and immutable digest summaries for releases.
+- Use `corvaglia91/stiva:latest` in Docker examples and the default Compose configuration.
+- Update `golang.org/x/sys` to v0.49.0 and Biome to v2.6.2.
 
+### Fixed
+
+- Prevent path and symlink traversal outside the storage root when promoting legacy null versions.
 
 ## [1.1.0] - 2026-10-15
 
