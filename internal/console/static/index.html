@@ -97,6 +97,18 @@
 
         <!-- Main Content -->
         <main class="main-content">
+            <section class="storage-overview" aria-labelledby="storage-heading">
+                <h2 id="storage-heading" class="view-title">Storage Overview</h2>
+                <div class="storage-cards">
+                    <div class="storage-card"><span>Stored data (logical)</span><strong id="usage-bytes">—</strong><small id="usage-breakdown">Current and previous versions</small></div>
+                    <div class="storage-card"><span>Buckets</span><strong id="usage-buckets">—</strong></div>
+                    <div class="storage-card"><span>Current objects</span><strong id="usage-objects">—</strong></div>
+                    <div class="storage-card"><span>Stored versions</span><strong id="usage-versions">—</strong><small id="usage-markers">Delete markers counted separately</small></div>
+                    <div class="storage-card"><span>Disk space available</span><strong id="usage-free">—</strong><small id="usage-disk-total">Storage volume</small></div>
+                </div>
+                <p class="view-subtitle">Logical sizes include all stored object versions, before compression. Stored versions includes current versions and unversioned objects. Disk availability is shared with other files on the same volume.</p>
+                <p id="usage-status" class="view-subtitle" role="status">Calculating storage usage…</p>
+            </section>
             <!-- Buckets View -->
             <div id="buckets-view" class="view active">
                 <div class="view-header">
@@ -109,6 +121,15 @@
                         Create Bucket
                     </button>
                 </div>
+                <section class="bucket-usage" aria-labelledby="bucket-usage-heading">
+                    <h3 id="bucket-usage-heading">Usage by Bucket</h3>
+                    <div class="table-container usage-table-container">
+                        <table class="data-table">
+                            <thead><tr><th scope="col">Bucket</th><th scope="col">Current objects</th><th scope="col">Stored versions</th><th scope="col">Delete markers</th><th scope="col">Current data</th><th scope="col">Previous data</th><th scope="col">Total data</th></tr></thead>
+                            <tbody id="bucket-usage-body"><tr><td colspan="7">Calculating storage usage…</td></tr></tbody>
+                        </table>
+                    </div>
+                </section>
                 <div id="buckets-grid" class="buckets-grid">
                     <!-- Populated by JS -->
                 </div>

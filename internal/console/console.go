@@ -139,6 +139,7 @@ func (h *Handler) getClientIP(r *http.Request) string {
 // Options configures a console Handler. It replaces a seven-argument
 // constructor in which the proxy-trust setting was not threaded through at all.
 type Options struct {
+	Usage            *storage.UsageTracker
 	Engine           storage.DataStore
 	Creds            *auth.Credentials
 	S3Port           int
@@ -170,6 +171,7 @@ type Options struct {
 
 // Handler serves the web console UI and its REST API.
 type Handler struct {
+	usage            *storage.UsageTracker
 	engine           storage.DataStore
 	creds            *auth.Credentials
 	s3Port           int
@@ -205,6 +207,7 @@ func NewHandler(opts Options) *Handler {
 	}
 
 	h := &Handler{
+		usage:            opts.Usage,
 		engine:           opts.Engine,
 		creds:            opts.Creds,
 		s3Port:           opts.S3Port,
@@ -287,6 +290,7 @@ func (h *Handler) setupRoutes() {
 	}{
 		{http.MethodPost, "/api/login", h.rateLimitMiddleware(h.loginLimiter, h.handleLogin)},
 		{http.MethodGet, "/api/config", api(h.handleGetConfig)},
+		{http.MethodGet, "/api/storage/usage", api(h.getStorageUsage)},
 
 		{http.MethodGet, "/api/buckets", api(h.listBuckets)},
 		{http.MethodPost, "/api/buckets", api(h.createBucket)},

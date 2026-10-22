@@ -24,6 +24,7 @@ import (
 
 // Server holds both the S3 API server and the web console server, plus background workers.
 type Server struct {
+	usage           *storage.UsageTracker
 	s3Server        *http.Server
 	consoleServer   *http.Server
 	s3Router        *s3api.Router
@@ -130,7 +131,9 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	// Web console server
+	usage := storage.NewUsageTracker(engine)
 	consoleHandler := console.NewHandler(console.Options{
+		Usage:            usage,
 		Engine:           engine,
 		Creds:            creds,
 		S3Port:           cfg.S3Port,
@@ -191,6 +194,7 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	return &Server{
+		usage:           usage,
 		s3Server:        s3Server,
 		consoleServer:   consoleServer,
 		s3Router:        s3Router,
@@ -263,6 +267,13 @@ func (s *Server) serve(name string, srv *http.Server, l net.Listener) {
 // cancellation also cuts a running sweep short.
 func (s *Server) runCleanup(ctx context.Context) {
 	defer close(s.cleanupDone)
+	// The usage scanner shares the cleanup lifecycle; wait for it before the
+	// engine is closed, including when a scan is interrupted by shutdown.
+	if s.usage != nil {
+		done := make(chan struct{})
+		go func() { defer close(done); s.usage.Run(ctx) }()
+		defer func() { <-done }()
+	}
 	slog.Info("[Server] Starting background multipart cleanup worker", "multipartExpiry", s.multipartExpiry)
 
 	sweep := func() {

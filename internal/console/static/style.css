@@ -1634,3 +1634,43 @@ th[aria-sort] {
 #versioning-modal .modal-body {
     overflow-y: auto;
 }
+
+.storage-overview {
+    margin-bottom: 32px;
+}
+.storage-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+    margin: 16px 0;
+}
+.storage-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 20px;
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+}
+.storage-card span,
+.storage-card small {
+    color: var(--text-secondary);
+}
+.storage-card strong {
+    font-size: 1.6rem;
+}
+.bucket-usage {
+    margin-bottom: 24px;
+}
+.usage-table-container {
+    margin-top: 12px;
+    max-height: 360px;
+    overflow: auto;
+}
+.usage-table-container th {
+    white-space: nowrap;
+}
+.usage-table-container td:first-child {
+    overflow-wrap: anywhere;
+}

@@ -15,6 +15,8 @@
     } = window.StivaLib;
 
     // ---- State ----
+    let usageTimer = null;
+    let usageGeneration = 0;
     let token = localStorage.getItem('stiva_token') || '';
     let currentBucket = '';
     let currentPrefix = '';
@@ -246,6 +248,8 @@
     }
 
     function logout() {
+        clearTimeout(usageTimer);
+        usageGeneration++;
         token = '';
         localStorage.removeItem('stiva_token');
         dashboardScreen.classList.remove('active');
@@ -260,6 +264,7 @@
         dashboardScreen.classList.add('active');
         showBucketsView();
         loadServerConfig();
+        startUsagePolling();
     }
 
     // Populates the top-bar "S3 API: Port ####" badge from the server's
@@ -276,6 +281,97 @@
             }
         } catch (_err) {
             // Non-critical: the badge just keeps its static fallback text.
+        }
+    }
+
+    // Poll cached snapshots only while signed in. One in-flight request per
+    // session avoids overlapping refreshes and late responses after logout.
+    function startUsagePolling() {
+        clearTimeout(usageTimer);
+        const generation = ++usageGeneration;
+        const poll = async () => {
+            let delay = 30000;
+            try {
+                const response = await api('GET', '/api/storage/usage');
+                const data = await response.json();
+                if (generation !== usageGeneration || !token) return;
+                if (!response.ok) throw new Error(data.error || 'Storage summary unavailable');
+                if (!data.usage) {
+                    $('#usage-status').textContent = 'Calculating storage usage…';
+                    delay = 5000;
+                } else {
+                    renderUsage(data);
+                }
+            } catch (error) {
+                if (generation !== usageGeneration || !token) return;
+                $('#usage-status').textContent =
+                    `${error.message} Retrying automatically; any displayed figures are from the last snapshot.`;
+            } finally {
+                if (generation === usageGeneration && token) usageTimer = setTimeout(poll, delay);
+            }
+        };
+        // Do not carry another session's snapshot into the initial loading state.
+        for (const selector of [
+            '#usage-bytes',
+            '#usage-buckets',
+            '#usage-objects',
+            '#usage-versions',
+            '#usage-free',
+        ])
+            $(selector).textContent = '—';
+        $('#usage-breakdown').textContent = 'Current and previous versions';
+        $('#usage-markers').textContent = 'Delete markers counted separately';
+        $('#usage-disk-total').textContent = 'Storage volume';
+        $('#usage-status').textContent = 'Calculating storage usage…';
+        $('#bucket-usage-body').innerHTML =
+            '<tr><td colspan="7">Calculating storage usage…</td></tr>';
+        poll();
+    }
+
+    function renderUsage(snapshot) {
+        const usage = snapshot.usage;
+        const count = (value) => Number(value).toLocaleString();
+        $('#usage-bytes').textContent = formatSize(usage.logicalBytes);
+        $('#usage-breakdown').textContent =
+            `${formatSize(usage.currentBytes)} current • ${formatSize(usage.previousBytes)} previous`;
+        $('#usage-buckets').textContent = count(usage.buckets.length);
+        $('#usage-objects').textContent = count(usage.objects);
+        $('#usage-versions').textContent = count(usage.versions);
+        $('#usage-markers').textContent = `${count(usage.deleteMarkers)} delete markers`;
+        $('#usage-free').textContent = formatSize(usage.diskFreeBytes);
+        $('#usage-disk-total').textContent =
+            `of ${formatSize(usage.diskTotalBytes)} on the storage volume`;
+        const updated = new Date(snapshot.updatedAt).toLocaleString();
+        $('#usage-status').textContent =
+            `${snapshot.error ? `${snapshot.error} ` : ''}Last calculated: ${updated}. Updates every minute.${snapshot.refreshing ? ' Refresh in progress…' : ''}`;
+        const body = $('#bucket-usage-body');
+        body.replaceChildren();
+        if (!usage.buckets.length) {
+            body.innerHTML = '<tr><td colspan="7">No buckets in this snapshot.</td></tr>';
+        }
+        for (const bucket of usage.buckets) {
+            const row = document.createElement('tr');
+            const nameCell = document.createElement('td');
+            const link = document.createElement('button');
+            link.type = 'button';
+            link.className = 'btn btn-ghost btn-sm';
+            link.textContent = bucket.name;
+            link.addEventListener('click', () => openBucket(bucket.name));
+            nameCell.append(link);
+            row.append(nameCell);
+            for (const value of [
+                count(bucket.objects),
+                count(bucket.versions),
+                count(bucket.deleteMarkers),
+                formatSize(bucket.currentBytes),
+                formatSize(bucket.previousBytes),
+                formatSize(bucket.logicalBytes),
+            ]) {
+                const cell = document.createElement('td');
+                cell.textContent = value;
+                row.append(cell);
+            }
+            body.append(row);
         }
     }
 

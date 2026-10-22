@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Console bucket lifecycle controls to add prefix-based object expiration rules, enable or disable rules, and remove rules while preserving existing lifecycle actions.
+- Console bucket versioning controls and paginated, prefix-filtered history with object versions, delete markers and version-specific downloads.
+- Console storage overview and per-bucket usage with logical current and previous version sizes, object and version counts, delete markers and available disk space, backed by cached snapshots refreshed every minute.
 - Offline `backup`, `verify-backup` and `restore` commands with file checksums, bbolt integrity checks, a writer lock and staged publication.
 - Production Compose with HTTPS reverse proxy, private console, digest validation, independent secrets and bounded logs.
 - Durable replication journal committed with object metadata, startup backfill, retry/reconciliation and pending/failure metrics.
@@ -28,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Allow explicit null-version reads of objects written before versioning was enabled, before their metadata is promoted to a version record.
 - Prevent path and symlink traversal outside the storage root when promoting legacy null versions.
 
 ## [1.1.0] - 2026-10-15
