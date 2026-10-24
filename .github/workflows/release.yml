@@ -5,11 +5,16 @@ on:
     tags:
       - "v*.*.*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+defaults:
+  run:
+    shell: bash
 
 jobs:
   verify:
@@ -19,16 +24,18 @@ jobs:
     name: Release
     needs: verify
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -37,10 +44,27 @@ jobs:
       - name: Extract release notes for tag from CHANGELOG.md
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          awk -v ver="$VERSION" '$0 ~ "^## \\[*v?" ver "\\]?" {flag=1; next} $0 ~ "^## " {flag=0} flag' CHANGELOG.md > "${{ runner.temp }}/RELEASE_NOTES.md"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release version: $VERSION"
+            exit 1
+          fi
+          awk -v ver="$VERSION" '
+            /^## / {
+              heading = $2
+              gsub(/[][]/, "", heading)
+              sub(/^v/, "", heading)
+              selected = (heading == ver)
+              next
+            }
+            selected { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/RELEASE_NOTES.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/RELEASE_NOTES.md"; then
+            echo "::error::Missing release notes in CHANGELOG.md for $VERSION"
+            exit 1
+          fi
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
           version: "~> v2"
@@ -51,6 +75,7 @@ jobs:
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     needs: release
     permissions:
       contents: read
@@ -59,19 +84,21 @@ jobs:
     steps:
       - name: Checkout code
         if: env.DOCKERHUB_USERNAME != ''
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
         if: env.DOCKERHUB_USERNAME != ''
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
         if: env.DOCKERHUB_USERNAME != ''
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -79,17 +106,18 @@ jobs:
       - name: Extract metadata (tags, labels) for Docker
         if: env.DOCKERHUB_USERNAME != ''
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.DOCKERHUB_USERNAME }}/stiva
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push Docker image
         id: publish
         if: env.DOCKERHUB_USERNAME != ''
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
