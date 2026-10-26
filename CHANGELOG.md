@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Container qualification scripts for AWS CLI compatibility, concurrent transfers, SIGKILL recovery, ENOSPC recovery and backup restoration.
 - Production operations, backup scheduling and rollback instructions.
 - Biome linting and formatting for console JavaScript and CSS, with console lint and test checks in CI.
+- CI workflow validation with actionlint, plus manual, merge queue and weekly scheduled CI runs.
 
 ### Changed
 
@@ -28,11 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Produce image provenance, SBOMs and immutable digest summaries for releases.
 - Use `corvaglia91/stiva:latest` in Docker examples and the default Compose configuration.
 - Update `golang.org/x/sys` to v0.49.0 and Biome to v2.6.2.
+- Pin GitHub Actions to commit hashes, disable persisted checkout credentials, and bound workflow jobs and tests with timeouts.
+- Expand CI builds to Linux ARM64 and macOS AMD64, and pin Windows tests to Windows Server 2025.
+- Require valid release versions and matching, nonempty changelog entries before publishing releases.
 
 ### Fixed
 
 - Allow explicit null-version reads of objects written before versioning was enabled, before their metadata is promoted to a version record.
 - Prevent path and symlink traversal outside the storage root when promoting legacy null versions.
+- Keep prerelease Docker images from updating the `latest` tag.
+- Fail CI when total coverage is missing or invalid, or the coverage artifact is absent.
 
 ## [1.1.0] - 2026-10-15
 
