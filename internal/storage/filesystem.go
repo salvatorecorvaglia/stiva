@@ -938,14 +938,20 @@ func (fs *FilesystemEngine) promoteLegacyNullVersion(bucket, key string) error {
 	if err != nil {
 		return err
 	}
-	output, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	blobRoot, err := os.OpenRoot(fs.dataDir)
+	if err != nil {
+		return err
+	}
+	defer blobRoot.Close()
+	blobRel := filepath.Join("blobs", bucket, id[:2], id[2:4], id)
+	output, err := blobRoot.OpenFile(blobRel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			os.Remove(path)
+			blobRoot.Remove(blobRel)
 		}
 	}()
 	_, copyErr := io.Copy(output, input)

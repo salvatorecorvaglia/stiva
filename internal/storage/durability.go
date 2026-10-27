@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -21,8 +22,13 @@ func syncParents(path, root string) error {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("directory outside data root")
 	}
+	dirRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer dirRoot.Close()
 	for {
-		if err := syncDirectory(path); err != nil {
+		if err := syncDirectory(dirRoot, rel); err != nil {
 			return fmt.Errorf("sync directory %s: %w", path, err)
 		}
 		if path == root {
@@ -33,5 +39,6 @@ func syncParents(path, root string) error {
 			return fmt.Errorf("directory outside data root")
 		}
 		path = parent
+		rel = filepath.Dir(rel)
 	}
 }

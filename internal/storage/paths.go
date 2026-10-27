@@ -75,12 +75,21 @@ func (fs *FilesystemEngine) dataPath(info *ObjectInfo) (string, error) {
 // newBlob allocates a blob for a new object version and creates its
 // directory, returning the blob's ID and path.
 func (fs *FilesystemEngine) newBlob(bucket string) (id, path string, err error) {
+	if err := fs.validateBucketName(bucket); err != nil {
+		return "", "", err
+	}
 	id, err = newBlobID()
 	if err != nil {
 		return "", "", err
 	}
 	path = fs.blobPath(bucket, id)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	root, err := os.OpenRoot(fs.dataDir)
+	if err != nil {
+		return "", "", err
+	}
+	defer root.Close()
+	rel := filepath.Join("blobs", bucket, id[:2], id[2:4])
+	if err := root.MkdirAll(rel, 0755); err != nil {
 		return "", "", fmt.Errorf("failed to create blob directory: %w", err)
 	}
 	return id, path, nil
