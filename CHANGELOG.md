@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add controlled Compose image updates with health checks, a persistent image journal, and recovery to previous images.
+
 ### Changed
 
 - Remove the pull-request Dependency Review job from CI.

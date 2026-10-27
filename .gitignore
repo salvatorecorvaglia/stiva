@@ -96,3 +96,10 @@ node_modules/
 
 # Production deployment secrets
 /deployment/production.env
+
+# Local deployment update journal
+.update-state/
+
+# Python operations helpers
+__pycache__/
+*.pyc

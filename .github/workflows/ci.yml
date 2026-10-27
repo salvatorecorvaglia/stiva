@@ -60,6 +60,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm test
+      - run: python3 -m unittest discover -s scripts/tests -v
 
   vulncheck:
     name: Vulnerability Scan
