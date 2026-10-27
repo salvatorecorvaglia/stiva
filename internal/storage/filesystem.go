@@ -951,7 +951,9 @@ func (fs *FilesystemEngine) promoteLegacyNullVersion(bucket, key string) error {
 	committed := false
 	defer func() {
 		if !committed {
-			blobRoot.Remove(blobRel)
+			if err := blobRoot.Remove(blobRel); err != nil {
+				slog.Warn("[Storage] Uncommitted blob cleanup failed", "error", err)
+			}
 		}
 	}()
 	_, copyErr := io.Copy(output, input)
