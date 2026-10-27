@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Remove the pull-request Dependency Review job from CI.
+- Update Biome to `2.6.3` and refresh console branding.
+
+### Security
+
+- Confine blob directory creation, legacy null-version blob writes and cleanup, and parent-directory synchronization to the data root using `os.Root`, rejecting invalid bucket names and symlink escapes.
 
 ## [1.2.0] - 2026-10-26
 
