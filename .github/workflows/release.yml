@@ -17,30 +17,13 @@ defaults:
     shell: bash
 
 jobs:
-  verify:
-    uses: ./.github/workflows/ci.yml
-
-  release:
-    name: Release
-    needs: verify
+  validate:
+    name: Validate tag and release notes
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-          cache-dependency-path: go.sum
-
       - name: Extract release notes for tag from CHANGELOG.md
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -63,20 +46,65 @@ jobs:
             exit 1
           fi
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean --release-notes "${{ runner.temp }}/RELEASE_NOTES.md"
+          name: release-notes
+          path: ${{ runner.temp }}/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}
+
+      - name: Download final-version archives verified by CI
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-assets
+          path: dist
+      - name: Verify archive integrity and release version
+        run: |
+          (cd dist && sha256sum --check checksums.txt)
+          version="${GITHUB_REF_NAME#v}"
+          for file in dist/*.tar.gz dist/*.zip; do
+            [[ "$(basename "$file")" == "stiva_${version}_"* ]] || exit 1
+          done
+      - name: Publish verified release archives
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=false
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=true; fi
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "Stiva $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md" --prerelease="$prerelease"
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip dist/checksums.txt --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease="$prerelease" --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md"
 
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    needs: release
+    needs: verify
     permissions:
       contents: read
     env:
@@ -124,8 +152,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=smoke-amd64
+            type=gha,scope=smoke-arm64
+            type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
           provenance: mode=max
           sbom: true
 
