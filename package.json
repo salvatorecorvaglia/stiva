@@ -2,7 +2,7 @@
     "name": "stiva-console",
     "private": true,
     "version": "1.0.0",
-    "packageManager": "pnpm@11.23.0",
+    "packageManager": "pnpm@12.16.1",
     "description": "JavaScript tooling for the stiva web console.",
     "scripts": {
         "lint": "biome check . --error-on-warnings",
@@ -11,6 +11,6 @@
         "test": "node --test internal/console/jstest/*.test.cjs"
     },
     "devDependencies": {
-        "@biomejs/biome": "2.6.3"
+        "@biomejs/biome": "^2.6.4"
     }
 }
