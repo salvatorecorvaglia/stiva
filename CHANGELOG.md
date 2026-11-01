@@ -10,15 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add controlled Compose image updates with health checks, a persistent image journal, and recovery to previous images.
+- Add Chromium browser regression tests, storage and S3 performance benchmarks, and a performance profiling script.
+- Enforce package-specific coverage floors for authentication, console, S3 API and storage in CI.
 
 ### Changed
 
 - Remove the pull-request Dependency Review job from CI.
-- Update Biome to `2.6.3` and refresh console branding.
+- Update Biome to `2.6.4`, refresh console branding, and add Playwright for browser testing.
+- Publish the exact AMD64 and ARM64 container images tested by CI, retaining provenance and SBOMs instead of rebuilding for release.
+- Run container qualification on native AMD64 and ARM64 runners, shard Windows tests, and validate release archives in CI.
+- Deliver pending replication updates with four bounded workers, releasing object locks before remote transfers while retaining revision-aware acknowledgements.
+- Reduce allocations when collecting storage usage by decoding only the required metadata fields.
+- Split console navigation, dialogs, folder deletion and transfers into dedicated modules, and separate storage publication, metadata, versioning and cleanup logic.
+
+### Fixed
+
+- Apply bucket versioning changes made during uploads when publishing objects, and allow explicit deletion of legacy null versions before promotion.
+- Measure noncurrent-version retention from when a version became noncurrent, and recheck lifecycle candidates under the object lock before deleting them.
+- Propagate corrupt metadata and storage errors instead of treating them as missing objects or uploads; retain failed multipart cleanup operations for retry and bound cleanup batches.
+- Clear stale content length and range headers from S3 XML responses, and apply the configured maximum object size to request verification.
+- Initialize storage metrics tracking when starting the server.
+- Prevent stale console listing responses from replacing newer navigation state, settle cancelled confirmation dialogs, and delete folder contents in bounded pages with progress and failure reporting.
+- Return a token-refill-based `Retry-After` header for rate-limited console requests.
 
 ### Security
 
 - Confine blob directory creation, legacy null-version blob writes and cleanup, and parent-directory synchronization to the data root using `os.Root`, rejecting invalid bucket names and symlink escapes.
+- Bound console rate-limiter client tracking to 10,000 entries.
 
 ## [1.2.0] - 2026-10-26
 

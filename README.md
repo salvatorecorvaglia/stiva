@@ -47,6 +47,8 @@
 
 ## 🚀 Getting Started
 
+For production, use the hardened configuration in `deployment/compose.production.yml` and `deployment/production.env.example`. The quick-start configuration exposes both ports and uses development credentials; replace these before exposing the service.
+
 ### Prerequisites
 - **Go 1.26.10 or higher** (to compile and run locally)
 - **Docker** and **Docker Compose** (for containerized deployments)
@@ -131,6 +133,8 @@ Stiva is configured exclusively via environment variables. You can find a baseli
 
 | Environment Variable | Default Value | Description |
 | :--- | :--- | :--- |
+| **`STIVA_PRODUCTION`** | `false` | Enables strict startup validation of production credentials and secrets. |
+| **`STIVA_TRUSTED_PROXY_HOPS`** | `1` | Number of trusted reverse-proxy hops when proxy trust is enabled. |
 | **`STIVA_ACCESS_KEY`** | `stiva` | Access key used for S3 client credentials and Web Console login. |
 | **`STIVA_SECRET_KEY`** | `stiva123` | Secret key used for S3 client credentials and Web Console login. |
 | **`STIVA_DATA_DIR`** | `/data` (Docker) / `./data` (source) | Path to the directory where metadata and S3 objects are stored. |
@@ -245,9 +249,19 @@ go test -v ./...
 
 # Run tests with race detection
 go test -race ./...
+
+# Browser regressions (headless Chromium, loopback fixture server)
+pnpm install --frozen-lockfile
+pnpm exec playwright install chromium
+pnpm test:browser
+
+# Storage performance baselines
+go test ./internal/storage -run '^$' -bench 'BenchmarkStorage|BenchmarkReplicationSlowTarget' -benchmem
 ```
 
 ---
+
+See [PERFORMANCE.md](PERFORMANCE.md) for concurrent-write workloads, reproducible CPU/memory profiles, and measurement limits.
 
 ## 🤝 Contributing
 

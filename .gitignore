@@ -103,3 +103,7 @@ node_modules/
 # Python operations helpers
 __pycache__/
 *.pyc
+
+# Browser test output
+/test-results/
+/playwright-report/

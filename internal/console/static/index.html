@@ -108,7 +108,7 @@
                     <!-- Populated by JS -->
                 </div>
                 <div id="buckets-empty" class="empty-state" style="display:none;">
-                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3" aria-hidden="true" focusable="false"><use href="icons.svg#folder"></use></svg>
                     <h3>No buckets yet</h3>
                     <p>Create your first bucket to get started</p>
                 </div>
@@ -139,11 +139,11 @@
                             <input type="text" id="search-input" placeholder="Search prefix..." aria-label="Search prefix">
                         </div>
                         <button id="batch-delete-btn" class="btn btn-danger" style="display: none;">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false"><use href="icons.svg#trash-selected"></use></svg>
                             Delete Selected
                         </button>
                         <button id="upload-btn" class="btn btn-primary">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false"><use href="icons.svg#upload"></use></svg>
                             Upload
                         </button>
                         <button id="upload-folder-btn" class="btn btn-secondary" title="Upload a folder, keeping its structure">
@@ -159,7 +159,7 @@
 
                 <!-- Drop zone -->
                 <div id="drop-zone" class="drop-zone" style="display:none;">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false"><use href="icons.svg#upload"></use></svg>
                     <p>Drop files here to upload</p>
                 </div>
 
@@ -191,7 +191,7 @@
                 </div>
 
                 <div id="objects-empty" class="empty-state" style="display:none;">
-                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3" aria-hidden="true" focusable="false"><use href="icons.svg#file"></use></svg>
                     <h3>No objects</h3>
                     <p>Upload files or create a folder</p>
                 </div>
@@ -384,6 +384,10 @@
     <div id="toast-container" class="toast-container" role="region" aria-live="polite" aria-label="Notifications"></div>
 
     <script src="lib.js"></script>
+    <script src="dialogs.js"></script>
+    <script src="folders.js"></script>
+    <script src="transfers.js"></script>
+    <script src="browser-state.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

@@ -44,6 +44,7 @@ type logTask struct {
 
 // RouterOptions configures an S3 API Router.
 type RouterOptions struct {
+	MaxPayloadSize   *int64
 	Engine           storage.DataStore
 	Creds            *auth.Credentials
 	Region           string
@@ -108,6 +109,9 @@ func NewRouter(opts RouterOptions) *Router {
 		logFlushInterval: flush,
 		logChan:          make(chan logTask, 1000),
 		stopLogs:         make(chan struct{}),
+	}
+	if opts.MaxPayloadSize != nil {
+		rt.verifier.SetMaxPayloadSize(*opts.MaxPayloadSize)
 	}
 	rt.startLogWorkers()
 	return rt

@@ -59,3 +59,20 @@ func TestStartupSweepRemovesOrphanedTempFiles(t *testing.T) {
 		t.Errorf("sweep removed a real object file: %v", err)
 	}
 }
+
+func TestStartupSweepDoesNotFollowExternalDirectorySymlink(t *testing.T) {
+	dataDir := t.TempDir()
+	outside := t.TempDir()
+	keep := filepath.Join(outside, ".stiva-tmp-external")
+	if err := os.WriteFile(keep, []byte("external data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dataDir, "buckets")); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	cleanupOrphanedTempFiles(dataDir)
+	data, err := os.ReadFile(keep)
+	if err != nil || string(data) != "external data" {
+		t.Fatalf("cleanup escaped its root: data=%q error=%v", data, err)
+	}
+}

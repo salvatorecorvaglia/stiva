@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -106,6 +107,9 @@ func (rl *rateLimiter) allow(ip string) bool {
 				}
 			}
 		}
+		if len(rl.clients) >= 10000 {
+			return false
+		}
 		client = &clientRateLimit{
 			tokens:     rl.burst,
 			lastAccess: now,
@@ -125,6 +129,16 @@ func (rl *rateLimiter) allow(ip string) bool {
 		return true
 	}
 	return false
+}
+
+// retryAfter reports the next token's availability for a denied request.
+func (rl *rateLimiter) retryAfter(ip string) int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if client := rl.clients[ip]; client != nil && rl.rate > 0 {
+		return max(1, int(math.Ceil((1-client.tokens)/rl.rate)))
+	}
+	return 1
 }
 
 // getClientIP resolves the rate-limiting key for a request.
@@ -240,6 +254,7 @@ func NewHandler(opts Options) *Handler {
 func (h *Handler) rateLimitMiddleware(limiter *rateLimiter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !limiter.allow(h.getClientIP(r)) {
+			w.Header().Set("Retry-After", strconv.Itoa(limiter.retryAfter(h.getClientIP(r))))
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
 			return
 		}

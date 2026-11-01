@@ -172,6 +172,16 @@ func (fs *FilesystemEngine) MirrorSync(bucket, key, op string) {
 }
 
 func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client, cfg *SyncConfig, bucket, key, op string) error {
+	req, err := prepareSyncRequest(ctx, fs, cfg, bucket, key, op)
+	if err != nil {
+		return err
+	}
+	return sendSyncRequest(client, cfg, req)
+}
+
+// prepareSyncRequest opens the immutable source blob before callers release
+// the object lock. The HTTP request owns the resulting reader.
+func prepareSyncRequest(ctx context.Context, fs *FilesystemEngine, cfg *SyncConfig, bucket, key, op string) (*http.Request, error) {
 	// Construct the destination URL.
 	//
 	// The source bucket is part of the destination key. Every source bucket
@@ -191,12 +201,12 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 	case "DELETE":
 		req, err = http.NewRequestWithContext(ctx, http.MethodDelete, destURL, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	case "PUT":
 		info, metaErr := fs.metadata.GetObjectMeta(bucket, key, "")
 		if metaErr != nil {
-			return fmt.Errorf("failed to fetch object metadata: %w", metaErr)
+			return nil, fmt.Errorf("failed to fetch object metadata: %w", metaErr)
 		}
 
 		// GetObject below is called without SSE-C parameters, because the
@@ -204,14 +214,13 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 		// object it therefore always fails; detect that here so it is
 		// reported once, as a skip, rather than three times as a failure.
 		if info.SSECustomerAlgorithm != "" {
-			return errSkipSSEC
+			return nil, errSkipSSEC
 		}
 
 		reader, _, readErr := fs.GetObject(ctx, bucket, key, "")
 		if readErr != nil {
-			return fmt.Errorf("failed to get object reader: %w", readErr)
+			return nil, fmt.Errorf("failed to get object reader: %w", readErr)
 		}
-		defer reader.Close()
 
 		bufferedReader := &bufferedReadCloser{
 			Reader: bufio.NewReaderSize(reader, 64*1024),
@@ -220,7 +229,8 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 
 		req, err = http.NewRequestWithContext(ctx, http.MethodPut, destURL, bufferedReader)
 		if err != nil {
-			return err
+			reader.Close()
+			return nil, err
 		}
 		req.ContentLength = info.Size
 		req.Header.Set("Content-Length", strconv.FormatInt(info.Size, 10))
@@ -228,7 +238,15 @@ func performSync(ctx context.Context, fs *FilesystemEngine, client *http.Client,
 			req.Header.Set("Content-Type", info.ContentType)
 		}
 	default:
-		return fmt.Errorf("unsupported sync operation: %s", op)
+		return nil, fmt.Errorf("unsupported sync operation: %s", op)
+	}
+
+	return req, nil
+}
+
+func sendSyncRequest(client *http.Client, cfg *SyncConfig, req *http.Request) error {
+	if req.Body != nil {
+		defer req.Body.Close()
 	}
 
 	// Sign request

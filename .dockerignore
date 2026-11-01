@@ -52,3 +52,7 @@ Thumbs.db
 # Frontend tooling and deployment secrets
 node_modules/
 **/*.env
+
+# Browser test artifacts
+/test-results/
+/playwright-report/

@@ -142,6 +142,7 @@ type ObjectInfo struct {
 	LastModified         time.Time `json:"lastModified"`
 	VersionID            string    `json:"versionId,omitempty"`
 	IsLatest             bool      `json:"isLatest,omitempty"`
+	NoncurrentSince      time.Time `json:"noncurrentSince,omitempty"`
 	IsDeleteMarker       bool      `json:"isDeleteMarker,omitempty"`
 	SSECustomerAlgorithm string    `json:"sseCustomerAlgorithm,omitempty"`
 	SSECustomerKeyMD5    string    `json:"sseCustomerKeyMD5,omitempty"`

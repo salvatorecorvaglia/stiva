@@ -98,6 +98,8 @@ func writeS3Error(w http.ResponseWriter, code, message, resource string) {
 		RequestId: requestIDFor(w),
 	}
 
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Range")
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	_ = xml.NewEncoder(w).Encode(resp)
@@ -127,6 +129,8 @@ func requestIDFor(w http.ResponseWriter) string {
 
 // writeXML writes an XML response with the given status code.
 func writeXML(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Range")
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(xml.Header))

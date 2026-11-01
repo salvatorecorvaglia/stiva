@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -178,20 +179,37 @@ func (fs *FilesystemEngine) reconcilePending(ctx context.Context) error {
 			if len(batch) == 0 {
 				break
 			}
+			// Each page contains distinct keys. Bounded workers overlap remote
+			// latency while the next page waits, preserving per-key ordering.
+			jobs := make(chan pendingReplica)
+			var workers sync.WaitGroup
+			for range 4 {
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					for item := range jobs {
+						if err := fs.deliverPending(ctx, bucket.Name, item); err != nil {
+							fs.Metrics().IncSyncFailure()
+							slog.Error("[Sync] Pending object retained for retry", "bucket", bucket.Name, "key", item.key, "error", err)
+						}
+					}
+				}()
+			}
 			for _, item := range batch {
-				if ctx.Err() != nil {
-					return ctx.Err()
+				select {
+				case jobs <- item:
+				case <-ctx.Done():
 				}
-				// No other remote delivery runs concurrently. Holding the object lock
-				// keeps GET metadata/data consistent throughout the transfer.
-				unlock := fs.lockObjectKey(bucket.Name, item.key)
-				err = fs.deliverPending(ctx, bucket.Name, item)
-				unlock()
-				if err != nil {
-					fs.Metrics().IncSyncFailure()
-					slog.Error("[Sync] Pending object retained for retry", "bucket", bucket.Name, "key", item.key, "error", err)
+				if ctx.Err() != nil {
+					break
 				}
 			}
+			close(jobs)
+			workers.Wait()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
 			after = []byte(batch[len(batch)-1].key)
 		}
 	}
@@ -206,6 +224,7 @@ func (fs *FilesystemEngine) deliverPending(ctx context.Context, bucket string, i
 	}
 	defer release()
 	op := "DELETE"
+	unlock := fs.lockObjectKey(bucket, item.key)
 	err = db.View(func(tx *bolt.Tx) error {
 		data := tx.Bucket(objectsBucket).Get(objectMetaKey(bucket, item.key))
 		if data == nil {
@@ -221,9 +240,15 @@ func (fs *FilesystemEngine) deliverPending(ctx context.Context, bucket string, i
 		return nil
 	})
 	if err != nil {
+		unlock()
 		return err
 	}
-	if err := performSync(ctx, fs, fs.syncClient, fs.syncConfig, bucket, item.key, op); err != nil {
+	req, err := prepareSyncRequest(ctx, fs, fs.syncConfig, bucket, item.key, op)
+	unlock()
+	if err != nil {
+		return err
+	}
+	if err := sendSyncRequest(fs.syncClient, fs.syncConfig, req); err != nil {
 		return err
 	}
 	return db.Update(func(tx *bolt.Tx) error {

@@ -146,7 +146,24 @@
         return 'none';
     }
 
+    const iconNames = new Set([
+        'folder',
+        'trash',
+        'calendar',
+        'file',
+        'trash-selected',
+        'share',
+        'download',
+        'upload',
+    ]);
+    function icon(name, size = 16) {
+        if (!iconNames.has(name) || !Number.isInteger(size) || size < 8 || size > 128)
+            throw new TypeError('Invalid icon');
+        return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false"><use href="icons.svg#${name}"></use></svg>`;
+    }
+
     const lib = {
+        icon,
         partSizeFor,
         validateFolderName,
         objectKeyFor,

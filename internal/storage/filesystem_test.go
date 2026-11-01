@@ -1560,9 +1560,10 @@ func TestBucketLifecycleAndLogging(t *testing.T) {
 		t.Fatalf("PutObject failed: %v", err)
 	}
 
-	// Modify v1 to be 48 hours ago and noncurrent
+	// Backdate both creation and the time v1 became noncurrent.
 	v1Info.LastModified = time.Now().UTC().Add(-48 * time.Hour)
 	v1Info.IsLatest = false
+	v1Info.NoncurrentSince = time.Now().UTC().Add(-48 * time.Hour)
 	err = engine.Metadata().PutObjectMetaRaw(v1Info)
 	if err != nil {
 		t.Fatalf("PutObjectMetaRaw failed: %v", err)

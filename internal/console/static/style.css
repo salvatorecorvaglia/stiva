@@ -1208,7 +1208,7 @@ body {
     border: 1px solid rgba(234, 179, 8, 0.2);
     border-radius: 99px;
     font-size: 0.7rem;
-    color: var(--accent-yellow, #eab308);
+    color: var(--accent-amber);
     font-weight: 500;
 }
 
@@ -1334,7 +1334,7 @@ select:focus-visible,
 textarea:focus-visible,
 th[tabindex]:focus-visible,
 [role="button"]:focus-visible {
-    outline: 2px solid var(--primary, #3b82f6);
+    outline: 2px solid var(--accent-blue);
     outline-offset: 2px;
     border-radius: 4px;
 }
@@ -1673,4 +1673,17 @@ th[aria-sort] {
 }
 .usage-table-container td:first-child {
     overflow-wrap: anywhere;
+}
+
+.preview-link {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+}
+.bucket-card:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
 }

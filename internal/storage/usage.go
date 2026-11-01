@@ -37,6 +37,14 @@ type StorageUsage struct {
 	DiskFreeBytes  uint64        `json:"diskFreeBytes"`
 }
 
+// A usage scan only needs these fields. Decoding ObjectInfo also allocated
+// bucket names, keys, content types and encryption metadata for every version.
+type usageObjectMeta struct {
+	Size           int64  `json:"size"`
+	VersionID      string `json:"versionId,omitempty"`
+	IsDeleteMarker bool   `json:"isDeleteMarker,omitempty"`
+}
+
 // CollectStorageUsage scans metadata without reading payloads or retaining an
 // object list in memory. Each bucket is a consistent read transaction; buckets
 // may change between transactions, so the overall result is a periodic snapshot.
@@ -104,7 +112,7 @@ func (m *MetadataStore) bucketUsage(ctx context.Context, bucket string) (UsageCo
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			var obj ObjectInfo
+			var obj usageObjectMeta
 			if err := json.Unmarshal(value, &obj); err != nil {
 				return err
 			}

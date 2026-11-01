@@ -318,8 +318,11 @@ func (fs *FilesystemEngine) ListParts(bucket, key, uploadID string) ([]PartInfo,
 	}
 
 	meta, err := fs.metadata.GetMultipartMeta(bucket, key, uploadID)
-	if err != nil {
+	if errors.Is(err, errMultipartMetaNotFound) {
 		return nil, &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	parts := make([]PartInfo, len(meta.Parts))

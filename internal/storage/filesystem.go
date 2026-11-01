@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -439,7 +440,7 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 
 	versionStatus, err := fs.metadata.GetBucketVersioning(bucket)
 	if err != nil {
-		versionStatus = ""
+		return nil, err
 	}
 
 	var versionID string
@@ -568,6 +569,18 @@ func (fs *FilesystemEngine) PutObject(ctx context.Context, bucket, key string, r
 	}
 	defer unlockBucket()
 
+	versionStatus, err = fs.metadata.GetBucketVersioning(bucket)
+	if err != nil {
+		return nil, err
+	}
+	versionID = ""
+	switch versionStatus {
+	case "Enabled":
+		versionID = uuid.New().String()
+	case "Suspended":
+		versionID = "null"
+	}
+
 	etag := hex.EncodeToString(hash.Sum(nil))
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -619,8 +632,11 @@ func (fs *FilesystemEngine) GetObject(ctx context.Context, bucket, key, versionI
 	}
 
 	file, err := os.Open(objPath)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil, &S3Error{Code: "NoSuchKey", Message: errKeyNotFound}
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("open object data: %w", err)
 	}
 
 	var closers []io.Closer
@@ -694,8 +710,11 @@ func (fs *FilesystemEngine) HeadObject(ctx context.Context, bucket, key, version
 	}
 
 	info, err := fs.metadata.GetObjectMeta(bucket, key, versionID)
-	if err != nil {
+	if errors.Is(err, errObjectMetaNotFound) {
 		return nil, &S3Error{Code: "NoSuchKey", Message: errKeyNotFound}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	if info.IsDeleteMarker {
@@ -722,16 +741,24 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 	// metadata pointing at nothing.
 	unlockObj := fs.lockObjectKey(bucket, key)
 	defer unlockObj()
+	return fs.deleteObjectLocked(bucket, key, versionID)
+}
 
+func (fs *FilesystemEngine) deleteObjectLocked(bucket, key, versionID string) (bool, string, error) {
 	versionStatus, err := fs.metadata.GetBucketVersioning(bucket)
 	if err != nil {
-		versionStatus = ""
+		return false, "", err
 	}
 
 	// Throughout, metadata is removed before the data it points at: a crash
 	// in between leaves an unreferenced file, never a record whose data is
 	// gone.
 	if versionID != "" {
+		if versionID == "null" {
+			if err := fs.promoteLegacyNullVersion(bucket, key); err != nil {
+				return false, "", err
+			}
+		}
 		if _, err := fs.objectPathWithVersion(bucket, key, versionID); err != nil {
 			return false, "", &S3Error{Code: "InvalidArgument", Message: err.Error()}
 		}
@@ -739,8 +766,14 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 		// Whether the version being removed is the current one decides what
 		// the (unversioned) mirror needs, so capture it before deleting.
 		latest, latestErr := fs.metadata.GetObjectMeta(bucket, key, "")
+		if latestErr != nil && !errors.Is(latestErr, errObjectMetaNotFound) {
+			return false, "", latestErr
+		}
 		wasLatest := latestErr == nil && latest.VersionID == versionID
-		removed, _ := fs.storedRecord(bucket, key, versionID)
+		removed, err := fs.storedRecord(bucket, key, versionID)
+		if err != nil {
+			return false, "", err
+		}
 
 		err = fs.metadata.DeleteObjectMeta(bucket, key, versionID)
 		if err != nil {
@@ -770,7 +803,10 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 		case "Suspended":
 			// The delete marker becomes the null version, replacing it.
 			delVersionID = "null"
-			replaced, _ = fs.storedRecord(bucket, key, "null")
+			replaced, err = fs.storedRecord(bucket, key, "null")
+			if err != nil {
+				return false, "", err
+			}
 		}
 
 		info := &ObjectInfo{
@@ -795,17 +831,18 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 	}
 
 	info, err := fs.metadata.GetObjectMeta(bucket, key, "")
+	if errors.Is(err, errObjectMetaNotFound) {
+		return false, "", nil
+	}
 	if err != nil {
-		// Deleting a key that isn't there is a success in S3: DELETE is
-		// idempotent and returns 204 either way.
-		return false, "", nil //nolint:nilerr // intentional: absent key is not an error
+		return false, "", err
 	}
 
 	// Every version's data goes with the key: collect it before the
 	// metadata that locates it is deleted.
 	versions, err := fs.metadata.GetObjectVersions(bucket, key)
 	if err != nil {
-		versions = []ObjectInfo{*info}
+		return false, "", err
 	}
 
 	err = fs.metadata.DeleteObjectMeta(bucket, key, "")
@@ -819,209 +856,6 @@ func (fs *FilesystemEngine) DeleteObject(bucket, key, versionID string) (isDelet
 	fs.triggerWebhook("ObjectRemoved:Delete", info)
 	fs.MirrorSync(bucket, key, "DELETE")
 	return false, "", nil
-}
-
-// commitObject publishes a fully written temp file as the data of info, a
-// new version of info.Key, and records its metadata. Callers hold the key
-// lock and the shared bucket lock.
-//
-// The data goes to a new blob, so nothing is overwritten in place: the record
-// this write replaces (see prepareKeyForWrite) has its data removed only once
-// the new metadata is committed. A crash in between leaves an unreferenced
-// file, never a record pointing at the wrong or missing data.
-func (fs *FilesystemEngine) commitObject(tmpPath, blobID, blobPath string, info *ObjectInfo) error {
-	var obsolete []ObjectInfo
-	if info.VersionID == "" {
-		var err error
-		obsolete, err = fs.metadata.GetObjectVersions(info.Bucket, info.Key)
-		if err != nil {
-			return err
-		}
-	}
-	replaced, err := fs.prepareKeyForWrite(info.Bucket, info.Key, info.VersionID)
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, blobPath); err != nil {
-		return fmt.Errorf("failed to rename temp file: %w", err)
-	}
-	if err := syncParents(filepath.Dir(blobPath), fs.dataDir); err != nil {
-		return err
-	}
-	info.BlobID = blobID
-	if err := fs.metadata.PutObjectMeta(info); err != nil {
-		removeObjectFile(blobPath) // never referenced by any record
-		return err
-	}
-	fs.removeData(replaced)
-	for i := range obsolete {
-		fs.removeData(&obsolete[i])
-	}
-	return nil
-}
-
-// prepareKeyForWrite reconciles what is already stored under key with the
-// version about to be committed, and returns the record that version
-// replaces, if any. Callers hold the key lock.
-//
-// An unversioned write replaces the current object and drops the key's
-// version history, whose data is removed after PutObjectMeta commits.
-// A versioned write first turns an object written before
-// versioning was enabled into the "null" version, as S3 does; with
-// versioning suspended the write then replaces that null version.
-func (fs *FilesystemEngine) prepareKeyForWrite(bucket, key, versionID string) (*ObjectInfo, error) {
-	if versionID == "" {
-		return fs.storedRecord(bucket, key, "")
-	}
-	if err := fs.promoteLegacyNullVersion(bucket, key); err != nil {
-		return nil, err
-	}
-	if versionID == "null" {
-		return fs.storedRecord(bucket, key, "null")
-	}
-	return nil, nil
-}
-
-// storedRecord returns the record holding data for key at versionID ("" for
-// the current, unversioned object), or nil when there is none.
-func (fs *FilesystemEngine) storedRecord(bucket, key, versionID string) (*ObjectInfo, error) {
-	rec, err := fs.metadata.GetObjectMeta(bucket, key, versionID)
-	if err != nil || rec.IsDeleteMarker || rec.VersionID != versionID {
-		return nil, nil //nolint:nilerr // no record, or not the one asked for: nothing is replaced
-	}
-	return rec, nil
-}
-
-// promoteLegacyNullVersion makes an object written while the bucket was
-// unversioned addressable as version "null". Callers hold the key lock.
-//
-// Such an object has an empty version ID. The first versioned write or delete
-// used to replace its metadata outright, losing the object and orphaning its
-// file. Re-recording it as the "null" version lets the existing version logic
-// apply unchanged: with versioning Enabled it becomes a noncurrent version;
-// with it Suspended the write replaces it, as a Suspended write replaces the
-// null version. Blob data does not depend on the version ID; data in the old
-// key-path layout is copied into a durable immutable blob.
-func (fs *FilesystemEngine) promoteLegacyNullVersion(bucket, key string) error {
-	latest, err := fs.metadata.GetObjectMeta(bucket, key, "")
-	if err != nil || latest.VersionID != "" || latest.IsDeleteMarker {
-		return nil //nolint:nilerr // absent or already versioned
-	}
-	latest.VersionID = "null"
-	latest.IsLatest = true
-	if latest.BlobID != "" {
-		return fs.metadata.PutObjectMetaRaw(latest)
-	}
-
-	// Copy legacy bytes to an immutable blob before changing metadata. Moving
-	// the old file first would leave its committed record dangling after a crash.
-	src, err := fs.objectPathWithVersion(bucket, key, "")
-	if err != nil {
-		return err
-	}
-	base := filepath.Join(fs.dataDir, "buckets")
-	rel, err := filepath.Rel(base, src)
-	if err != nil || !filepath.IsLocal(rel) {
-		return fmt.Errorf("invalid legacy object path")
-	}
-	root, err := os.OpenRoot(base)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	input, err := root.Open(rel)
-	if err != nil {
-		return err
-	}
-	defer input.Close()
-	id, path, err := fs.newBlob(bucket)
-	if err != nil {
-		return err
-	}
-	blobRoot, err := os.OpenRoot(fs.dataDir)
-	if err != nil {
-		return err
-	}
-	defer blobRoot.Close()
-	blobRel := filepath.Join("blobs", bucket, id[:2], id[2:4], id)
-	output, err := blobRoot.OpenFile(blobRel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			if err := blobRoot.Remove(blobRel); err != nil {
-				slog.Warn("[Storage] Uncommitted blob cleanup failed", "error", err)
-			}
-		}
-	}()
-	_, copyErr := io.Copy(output, input)
-	inputCloseErr := input.Close()
-	syncErr := output.Sync()
-	closeErr := output.Close()
-	if err := errors.Join(copyErr, inputCloseErr, syncErr, closeErr); err != nil {
-		return err
-	}
-	if err := syncParents(filepath.Dir(path), fs.dataDir); err != nil {
-		return err
-	}
-	latest.BlobID = id
-	if err := fs.metadata.PutObjectMetaRaw(latest); err != nil {
-		return err
-	}
-	committed = true
-	// A failed cleanup leaves only an unreferenced legacy copy.
-	if err := root.Remove(rel); err != nil {
-		slog.Warn("[Storage] Legacy data cleanup failed", "error", err)
-	}
-	return nil
-}
-
-// removeData deletes the file holding a record's data, in whichever layout
-// it was written. Delete markers have none.
-func (fs *FilesystemEngine) removeData(rec *ObjectInfo) {
-	if rec == nil || rec.IsDeleteMarker {
-		return
-	}
-	path, err := fs.dataPath(rec)
-	if err != nil {
-		slog.Warn("[Storage] Cannot locate object data to remove", "bucket", rec.Bucket, "key", rec.Key, "error", err)
-		return
-	}
-	removeObjectFile(path)
-	if rec.BlobID == "" {
-		fs.cleanupParentDirs(path, rec.Bucket)
-	}
-}
-
-// removeObjectFile deletes a stored object's file. A file that is already
-// gone is fine; any other failure leaves data on disk that nothing references
-// any more, so it is logged rather than silently ignored as it used to be.
-func removeObjectFile(path string) {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn("[Storage] Failed to remove object file; it is now orphaned on disk", "path", path, "error", err)
-	}
-}
-
-// mirrorAfterVersionDelete brings the replica in line after one specific
-// version was removed.
-//
-// The mirror is a plain, unversioned copy of each key's current state, so a
-// DELETE there removes the object outright. Removing a noncurrent version
-// leaves the current state unchanged and needs nothing. Removing the current
-// version exposes whatever is now latest: re-upload it, or delete the mirror
-// copy if nothing readable is left (no versions, or a delete marker on top).
-func (fs *FilesystemEngine) mirrorAfterVersionDelete(bucket, key string, wasLatest bool) {
-	if !wasLatest {
-		return
-	}
-	next, err := fs.metadata.GetObjectMeta(bucket, key, "")
-	if err == nil && !next.IsDeleteMarker {
-		fs.MirrorSync(bucket, key, "PUT")
-		return
-	}
-	fs.MirrorSync(bucket, key, "DELETE")
 }
 
 // CopyObject copies an object from one location to another.
@@ -1061,42 +895,6 @@ func (fs *FilesystemEngine) CopyObject(ctx context.Context, src CopySource, dstB
 	defer reader.Close()
 
 	return fs.PutObject(ctx, dstBucket, dstKey, reader, srcInfo.Size, srcInfo.ContentType)
-}
-
-// GetBucketVersioning gets the versioning status of a bucket.
-func (fs *FilesystemEngine) GetBucketVersioning(bucket string) (string, error) {
-	if err := fs.requireBucket(bucket); err != nil {
-		return "", err
-	}
-	return fs.metadata.GetBucketVersioning(bucket)
-}
-
-// SetBucketVersioning sets the versioning status of a bucket.
-func (fs *FilesystemEngine) SetBucketVersioning(bucket, status string) error {
-	if err := fs.requireBucket(bucket); err != nil {
-		return err
-	}
-	if status != "Enabled" && status != "Suspended" && status != "Disabled" {
-		return &S3Error{Code: "InvalidArgument", Message: "Versioning status must be Enabled, Suspended, or Disabled"}
-	}
-	if status == "Disabled" {
-		// As in S3, a versioned bucket can be suspended but never returned to
-		// unversioned. Allowing it sent the next plain DELETE down the
-		// unversioned path, which erases every version of the key.
-		current, err := fs.metadata.GetBucketVersioning(bucket)
-		if err != nil {
-			return err
-		}
-		if current == "Enabled" || current == "Suspended" {
-			return &S3Error{
-				Code:    "IllegalVersioningConfigurationException",
-				Message: "A versioned bucket cannot be returned to an unversioned state; use Suspended instead.",
-			}
-		}
-		// Never versioned: Disabled is a no-op.
-		return nil
-	}
-	return fs.metadata.PutBucketVersioning(bucket, status)
 }
 
 // SetBucketPublic sets the public status of a bucket.
@@ -1443,29 +1241,40 @@ func seedActiveMultipartGauge(meta *MetadataStore, metrics *MetricsTracker) {
 }
 
 func cleanupOrphanedTempFiles(dataDir string) {
-	walkDirs := []string{
-		filepath.Join(dataDir, "buckets"),
-		filepath.Join(dataDir, "blobs"),
-		filepath.Join(dataDir, "multipart"),
-		filepath.Join(dataDir, "tmp"),
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		slog.Warn("[Storage] Cannot open startup cleanup root", "error", err)
+		return
 	}
-	for _, dir := range walkDirs {
-		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				// Skip anything unreadable rather than abandoning the sweep;
-				// this is best-effort startup cleanup.
-				return nil //nolint:nilerr // intentional: keep walking past unreadable entries
+	defer func() {
+		if err := root.Close(); err != nil {
+			slog.Warn("[Storage] Cannot close startup cleanup root", "error", err)
+		}
+	}()
+	for _, dir := range []string{"buckets", "blobs", "multipart", "tmp"} {
+		err := iofs.WalkDir(root.FS(), dir, func(path string, entry iofs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				if !errors.Is(walkErr, os.ErrNotExist) {
+					slog.Warn("[Storage] Cannot scan startup cleanup path", "path", path, "error", walkErr)
+				}
+				return nil // best-effort sweep; report failures and continue other entries
 			}
-			// Only regular files are removed: skipping symlinks avoids the
-			// TOCTOU traversal a symlinked temp name could otherwise cause.
-			if d.Type().IsRegular() {
-				name := d.Name()
-				if strings.HasPrefix(name, ".stiva-tmp-") || strings.HasPrefix(name, ".part-tmp-") || strings.HasPrefix(name, ".stiva-multipart-") || strings.HasPrefix(name, "stiva-body-") || strings.HasPrefix(name, "stiva-chunked-") {
-					_ = os.Remove(path) //nolint:gosec // startup sweep over our own data dir; symlinks excluded above
+			if !entry.Type().IsRegular() {
+				return nil
+			}
+			name := entry.Name()
+			if strings.HasPrefix(name, ".stiva-tmp-") || strings.HasPrefix(name, ".part-tmp-") || strings.HasPrefix(name, ".stiva-multipart-") || strings.HasPrefix(name, "stiva-body-") || strings.HasPrefix(name, "stiva-chunked-") {
+				// Root.Remove confines removal even if a parent becomes a symlink
+				// after enumeration. Path-based removal could escape the data tree.
+				if err := root.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					slog.Warn("[Storage] Cannot remove orphaned temporary file", "path", path, "error", err)
 				}
 			}
 			return nil
 		})
+		if err != nil {
+			slog.Warn("[Storage] Startup cleanup walk failed", "path", dir, "error", err)
+		}
 	}
 }
 

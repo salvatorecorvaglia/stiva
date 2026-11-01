@@ -203,7 +203,9 @@ func (m *MetadataStore) releaseBucketDB(entry *bucketDBEntry) {
 
 	entry.refCount--
 	if entry.refCount <= 0 && entry.evicted {
-		_ = entry.db.Close()
+		if err := entry.db.Close(); err != nil {
+			slog.Warn("[Storage] Failed to close bucket metadata handle", "error", err)
+		}
 	}
 }
 
@@ -234,7 +236,9 @@ func (m *MetadataStore) evictLocked(keep string) {
 
 	entry := m.activeBuckets[oldestBucket]
 	entry.evicted = true
-	_ = entry.db.Close()
+	if err := entry.db.Close(); err != nil {
+		slog.Warn("[Storage] Failed to close bucket metadata handle", "error", err)
+	}
 	delete(m.activeBuckets, oldestBucket)
 }
 
@@ -324,14 +328,18 @@ func (m *MetadataStore) acquireBucketDB(bucket string) (*bolt.DB, func(), error)
 	}
 
 	if err := syncParents(filepath.Dir(dbPath), m.dataDir); err != nil {
-		_ = db.Close()
+		if err := db.Close(); err != nil {
+			slog.Warn("[Storage] Failed to close redundant metadata handle", "error", err)
+		}
 		return nil, nil, err
 	}
 	m.mu.Lock()
 	// Another goroutine may have won the race while we were opening.
 	if existing, ok := m.activeBuckets[bucket]; ok {
 		m.mu.Unlock()
-		_ = db.Close()
+		if err := db.Close(); err != nil {
+			slog.Warn("[Storage] Failed to close redundant metadata handle", "error", err)
+		}
 		m.mu.Lock()
 		existing.lastUsed = time.Now()
 		existing.refCount++
@@ -356,7 +364,9 @@ func (m *MetadataStore) closeAndRemoveBucketDB(bucket string) error {
 			// Someone is mid-transaction; mark it so the last release closes it.
 			entry.evicted = true
 		} else {
-			_ = entry.db.Close()
+			if err := entry.db.Close(); err != nil {
+				slog.Warn("[Storage] Failed to close bucket metadata handle", "error", err)
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -398,10 +408,14 @@ func (m *MetadataStore) migrateIfNecessary() error {
 
 	err = m.globalDB.Update(func(tx *bolt.Tx) error {
 		if objectsBucketExists {
-			_ = tx.DeleteBucket(objectsBucket)
+			if err := tx.DeleteBucket(objectsBucket); err != nil {
+				return err
+			}
 		}
 		if multipartBucketExists {
-			_ = tx.DeleteBucket(multipartBucket)
+			if err := tx.DeleteBucket(multipartBucket); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -504,6 +518,8 @@ func (m *MetadataStore) PutBucket(info *BucketInfo) error {
 
 // errNoSuchBucketRecord marks a lookup of a bucket that is not in the
 // registry, as opposed to a failure to read the registry at all.
+var errMultipartMetaNotFound = errors.New("multipart upload not found")
+
 var errNoSuchBucketRecord = errors.New("bucket not found")
 
 // GetBucket retrieves bucket metadata by name.
@@ -770,238 +786,6 @@ func (m *MetadataStore) IsBucketPublic(bucket string) (bool, error) {
 	return info.IsPublic, nil
 }
 
-func objectMetaKey(bucket, key string) []byte {
-	return []byte(bucket + "\x00" + key)
-}
-
-func objectMetaKeyVersion(bucket, key, versionID string) []byte {
-	return []byte(bucket + "\x00" + key + "\x00" + versionID)
-}
-
-// PutObjectMeta stores object metadata (both the latest pointer and the historical record).
-func (m *MetadataStore) PutObjectMeta(info *ObjectInfo) error {
-	unlock := m.acquireBucketLock(info.Bucket, false)
-	defer unlock()
-	db, releasedb, err := m.acquireBucketDB(info.Bucket)
-	if err != nil {
-		return err
-	}
-	defer releasedb()
-	return db.Update(func(tx *bolt.Tx) error {
-		if err := m.markReplication(tx, info.Key); err != nil {
-			return err
-		}
-		b := tx.Bucket(objectsBucket)
-
-		info.IsLatest = true
-
-		// Update old latest version if present
-		oldData := b.Get(objectMetaKey(info.Bucket, info.Key))
-		if oldData == nil {
-			if err := adjustObjectCount(tx, 1); err != nil {
-				return err
-			}
-		}
-		if oldData != nil {
-			var oldInfo ObjectInfo
-			if err := json.Unmarshal(oldData, &oldInfo); err == nil {
-				if oldInfo.VersionID != "" && oldInfo.VersionID != info.VersionID {
-					oldInfo.IsLatest = false
-					oldHistData, err := json.Marshal(oldInfo)
-					if err != nil {
-						return err
-					}
-					if err := b.Put(objectMetaKeyVersion(oldInfo.Bucket, oldInfo.Key, oldInfo.VersionID), oldHistData); err != nil {
-						return err
-					}
-				}
-			}
-		}
-
-		data, err := json.Marshal(info)
-		if err != nil {
-			return err
-		}
-		if info.VersionID != "" {
-			// Write historical version record.
-			if err := b.Put(objectMetaKeyVersion(info.Bucket, info.Key, info.VersionID), data); err != nil {
-				return err
-			}
-		} else {
-			// Versioning is off for this write, so any history left behind by a
-			// previously-versioned period is unreachable: the version records
-			// could never be listed or deleted again and leaked forever.
-			if err := deleteVersionRecords(b, info.Bucket, info.Key); err != nil {
-				return err
-			}
-		}
-		// Write/Update latest version pointer
-		return b.Put(objectMetaKey(info.Bucket, info.Key), data)
-	})
-}
-
-// deleteVersionRecords removes every historical version record for a key,
-// leaving the latest-version pointer untouched.
-func deleteVersionRecords(b *bolt.Bucket, bucket, key string) error {
-	prefix := []byte(bucket + "\x00" + key + "\x00")
-	c := b.Cursor()
-
-	var stale [][]byte
-	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-		stale = append(stale, append([]byte(nil), k...))
-	}
-	for _, k := range stale {
-		if err := b.Delete(k); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// GetObjectMeta retrieves object metadata. If versionID is empty, retrieves the latest version.
-func (m *MetadataStore) GetObjectMeta(bucket, key, versionID string) (*ObjectInfo, error) {
-	unlock := m.acquireBucketLock(bucket, false)
-	defer unlock()
-	db, releasedb, err := m.acquireBucketDB(bucket)
-	if err != nil {
-		return nil, err
-	}
-	defer releasedb()
-	var info ObjectInfo
-	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(objectsBucket)
-		var data []byte
-		if versionID != "" {
-			data = b.Get(objectMetaKeyVersion(bucket, key, versionID))
-		} else {
-			data = b.Get(objectMetaKey(bucket, key))
-		}
-		// Objects written before versioning was enabled are the S3 null
-		// version, even before the next write promotes their metadata.
-		if data == nil && versionID == "null" {
-			legacy := b.Get(objectMetaKey(bucket, key))
-			if legacy != nil {
-				var candidate ObjectInfo
-				if err := json.Unmarshal(legacy, &candidate); err != nil {
-					return err
-				}
-				if candidate.VersionID == "" {
-					data = legacy
-				}
-			}
-		}
-		if data == nil {
-			return fmt.Errorf("object not found: %s/%s (version=%s)", bucket, key, versionID)
-		}
-		return json.Unmarshal(data, &info)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &info, nil
-}
-
-// DeleteObjectMeta removes object metadata. If versionID is specified, deletes only that version.
-// If latest is deleted, updates the latest pointer to the next newest version in history.
-func (m *MetadataStore) DeleteObjectMeta(bucket, key, versionID string) error {
-	unlock := m.acquireBucketLock(bucket, false)
-	defer unlock()
-	db, releasedb, err := m.acquireBucketDB(bucket)
-	if err != nil {
-		return err
-	}
-	defer releasedb()
-	return db.Update(func(tx *bolt.Tx) error {
-		if err := m.markReplication(tx, key); err != nil {
-			return err
-		}
-		b := tx.Bucket(objectsBucket)
-		if versionID != "" {
-			// Delete specific version
-			err = b.Delete(objectMetaKeyVersion(bucket, key, versionID))
-			if err != nil {
-				return err
-			}
-
-			// If this was the latest pointer, we must find the next newest version
-			latestData := b.Get(objectMetaKey(bucket, key))
-			if latestData != nil {
-				var latestInfo ObjectInfo
-				if err := json.Unmarshal(latestData, &latestInfo); err == nil && latestInfo.VersionID == versionID {
-					// We just deleted the latest version! Let's find the next newest version from history
-					nextLatest, err := m.findNextNewestVersion(tx, bucket, key, versionID)
-					if err == nil && nextLatest != nil {
-						nextLatest.IsLatest = true
-						nextData, err := json.Marshal(nextLatest)
-						if err != nil {
-							return err
-						}
-						if err := b.Put(objectMetaKey(bucket, key), nextData); err != nil {
-							return err
-						}
-						if nextLatest.VersionID != "" {
-							if err := b.Put(objectMetaKeyVersion(bucket, key, nextLatest.VersionID), nextData); err != nil {
-								return err
-							}
-						}
-					} else {
-						if err := b.Delete(objectMetaKey(bucket, key)); err != nil {
-							return err
-						}
-						if err := adjustObjectCount(tx, -1); err != nil {
-							return err
-						}
-					}
-				}
-			}
-			return nil
-		}
-
-		// Delete all metadata (pointer and all historical versions)
-		if b.Get(objectMetaKey(bucket, key)) != nil {
-			if err := b.Delete(objectMetaKey(bucket, key)); err != nil {
-				return err
-			}
-			if err := adjustObjectCount(tx, -1); err != nil {
-				return err
-			}
-		}
-		prefix := []byte(bucket + "\x00" + key + "\x00")
-		c := b.Cursor()
-		var keysToDelete [][]byte
-		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-			keysToDelete = append(keysToDelete, keyCopy)
-		}
-		for _, k := range keysToDelete {
-			if err := b.Delete(k); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (m *MetadataStore) findNextNewestVersion(tx *bolt.Tx, bucket, key, deletedVersionID string) (*ObjectInfo, error) {
-	b := tx.Bucket(objectsBucket)
-	prefix := []byte(bucket + "\x00" + key + "\x00")
-	c := b.Cursor()
-
-	var newest *ObjectInfo
-	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-		var info ObjectInfo
-		if err := json.Unmarshal(v, &info); err == nil {
-			if info.VersionID != deletedVersionID {
-				if newest == nil || info.LastModified.After(newest.LastModified) {
-					newest = &info
-				}
-			}
-		}
-	}
-	return newest, nil
-}
-
 // ListAllObjectMetas returns all object metadata for a given bucket (latest versions only).
 func (m *MetadataStore) ListAllObjectMetas(bucket string) ([]ObjectInfo, error) {
 	unlock := m.acquireBucketLock(bucket, false)
@@ -1239,7 +1023,7 @@ func (m *MetadataStore) GetMultipartMeta(bucket, key, uploadID string) (*Multipa
 		b := tx.Bucket(multipartBucket)
 		data := b.Get(multipartKey(bucket, key, uploadID))
 		if data == nil {
-			return fmt.Errorf("multipart upload not found: %s/%s/%s", bucket, key, uploadID)
+			return fmt.Errorf("%w: %s/%s/%s", errMultipartMetaNotFound, bucket, key, uploadID)
 		}
 		return json.Unmarshal(data, &meta)
 	})
@@ -1387,42 +1171,39 @@ func (m *MetadataStore) PutSystemValue(key, val string) error {
 func (m *MetadataStore) GetObjectVersions(bucket, key string) ([]ObjectInfo, error) {
 	unlock := m.acquireBucketLock(bucket, false)
 	defer unlock()
-	db, releasedb, err := m.acquireBucketDB(bucket)
+	db, release, err := m.acquireBucketDB(bucket)
 	if err != nil {
 		return nil, err
 	}
-	defer releasedb()
+	defer release()
 	var versions []ObjectInfo
-	prefix := []byte(bucket + "\x00" + key + "\x00")
+	seen := make(map[string]bool)
+	decode := func(data []byte) error {
+		var info ObjectInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			return err
+		}
+		if !seen[info.VersionID] {
+			seen[info.VersionID] = true
+			versions = append(versions, info)
+		}
+		return nil
+	}
 	err = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectsBucket)
 		if b == nil {
 			return nil
 		}
-		// Also read the latest version pointer
-		latestData := b.Get(objectMetaKey(bucket, key))
-		if latestData != nil {
-			var latestInfo ObjectInfo
-			if err := json.Unmarshal(latestData, &latestInfo); err == nil {
-				versions = append(versions, latestInfo)
+		if data := b.Get(objectMetaKey(bucket, key)); data != nil {
+			if err := decode(data); err != nil {
+				return err
 			}
 		}
-
+		prefix := objectMetaKeyVersion(bucket, key, "")
 		c := b.Cursor()
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			var info ObjectInfo
-			if err := json.Unmarshal(v, &info); err == nil {
-				// Avoid double adding if it's already there (though historical keys are distinct)
-				alreadyAdded := false
-				for _, existing := range versions {
-					if existing.VersionID == info.VersionID {
-						alreadyAdded = true
-						break
-					}
-				}
-				if !alreadyAdded {
-					versions = append(versions, info)
-				}
+			if err := decode(v); err != nil {
+				return err
 			}
 		}
 		return nil

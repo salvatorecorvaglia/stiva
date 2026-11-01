@@ -2,14 +2,11 @@ package storage
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
-
-	bolt "go.etcd.io/bbolt"
 )
 
 // maxLifecycleRules matches the S3 limit on rules per configuration.
@@ -176,12 +173,11 @@ func (fs *FilesystemEngine) CleanExpiredObjects(ctx context.Context) error {
 			if rule.Expiration != nil && rule.Expiration.Days > 0 {
 				cutoff := time.Duration(rule.Expiration.Days) * 24 * time.Hour
 				var expiredList []struct {
-					key            string
-					versionID      string
-					isDeleteMarker bool
-					lastModified   time.Time
+					key          string
+					versionID    string
+					lastModified time.Time
 				}
-				_ = fs.metadata.IterateObjectMetas(bInfo.Name, func(m *ObjectInfo) error {
+				scanErr := fs.metadata.IterateObjectMetas(bInfo.Name, func(m *ObjectInfo) error {
 					if len(expiredList) >= maxExpiryBatch {
 						return errExpiryBatchFull
 					}
@@ -191,39 +187,25 @@ func (fs *FilesystemEngine) CleanExpiredObjects(ctx context.Context) error {
 					// Check if expired
 					if now.Sub(m.LastModified) > cutoff {
 						expiredList = append(expiredList, struct {
-							key            string
-							versionID      string
-							isDeleteMarker bool
-							lastModified   time.Time
-						}{key: m.Key, versionID: m.VersionID, isDeleteMarker: m.IsDeleteMarker, lastModified: m.LastModified})
+							key          string
+							versionID    string
+							lastModified time.Time
+						}{key: m.Key, versionID: m.VersionID, lastModified: m.LastModified})
 					}
 					return nil
 				})
+				if scanErr != nil && !errors.Is(scanErr, errExpiryBatchFull) {
+					return scanErr
+				}
 
 				for _, exp := range expiredList {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
-					if exp.isDeleteMarker {
-						// If versioning is enabled and the only version left is a delete marker, expire it fully
-						hasNoncurrent := false
-						vers, err := fs.metadata.GetObjectVersions(bInfo.Name, exp.key)
-						if err == nil {
-							for _, v := range vers {
-								if v.VersionID != exp.versionID {
-									hasNoncurrent = true
-									break
-								}
-							}
-						}
-						if !hasNoncurrent {
-							slog.Info("[Storage] Removing expired object delete marker", "key", exp.key, "bucket", bInfo.Name, "versionID", exp.versionID)
-							_, _, _ = fs.DeleteObject(bInfo.Name, exp.key, exp.versionID)
-						}
-					} else {
-						slog.Info("[Storage] Expiring current version of key in bucket", "key", exp.key, "bucket", bInfo.Name, "age", now.Sub(exp.lastModified), "cutoff", cutoff)
-						_, _, _ = fs.DeleteObject(bInfo.Name, exp.key, "")
+					if err := fs.expireCurrentVersion(bInfo.Name, exp.key, exp.versionID, exp.lastModified); err != nil {
+						return err
 					}
+
 				}
 			}
 
@@ -233,9 +215,8 @@ func (fs *FilesystemEngine) CleanExpiredObjects(ctx context.Context) error {
 				var expiredNoncurrentList []struct {
 					key       string
 					versionID string
-					age       time.Duration
 				}
-				_ = fs.metadata.IterateObjectVersions(bInfo.Name, func(v *ObjectInfo) error {
+				scanErr := fs.metadata.IterateObjectVersions(bInfo.Name, func(v *ObjectInfo) error {
 					if len(expiredNoncurrentList) >= maxExpiryBatch {
 						return errExpiryBatchFull
 					}
@@ -245,139 +226,42 @@ func (fs *FilesystemEngine) CleanExpiredObjects(ctx context.Context) error {
 					if !strings.HasPrefix(v.Key, prefix) {
 						return nil
 					}
-					if now.Sub(v.LastModified) > cutoff {
+					if v.NoncurrentSince.IsZero() || now.Sub(v.NoncurrentSince) > cutoff {
 						expiredNoncurrentList = append(expiredNoncurrentList, struct {
 							key       string
 							versionID string
-							age       time.Duration
-						}{key: v.Key, versionID: v.VersionID, age: now.Sub(v.LastModified)})
+						}{key: v.Key, versionID: v.VersionID})
 					}
 					return nil
 				})
+				if scanErr != nil && !errors.Is(scanErr, errExpiryBatchFull) {
+					return scanErr
+				}
 
 				for _, exp := range expiredNoncurrentList {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
-					slog.Info("[Storage] Expiring noncurrent version of key in bucket", "versionID", exp.versionID, "key", exp.key, "bucket", bInfo.Name, "age", exp.age, "cutoff", cutoff)
-					_, _, _ = fs.DeleteObject(bInfo.Name, exp.key, exp.versionID)
+					if err := fs.expireNoncurrentVersion(bInfo.Name, exp.key, exp.versionID, now, cutoff); err != nil {
+						return err
+					}
+
 				}
 			}
 
 			// 3. Abort Incomplete Multipart Upload
 			if rule.AbortIncompleteMultipartUpload != nil && rule.AbortIncompleteMultipartUpload.DaysAfterInitiation > 0 {
 				cutoff := time.Duration(rule.AbortIncompleteMultipartUpload.DaysAfterInitiation) * 24 * time.Hour
-				db, releasedb, err := fs.metadata.acquireBucketDB(bInfo.Name)
-				if err == nil {
-					var aborts []struct {
-						key      string
-						uploadID string
-					}
-					_ = db.View(func(tx *bolt.Tx) error {
-						b := tx.Bucket(multipartBucket)
-						if b == nil {
-							return nil
-						}
-						return b.ForEach(func(_, v []byte) error {
-							if len(aborts) >= maxExpiryBatch {
-								return errExpiryBatchFull
-							}
-							var m MultipartMeta
-							if err := json.Unmarshal(v, &m); err == nil {
-								if strings.HasPrefix(m.Key, prefix) && now.Sub(m.Created) > cutoff {
-									aborts = append(aborts, struct {
-										key      string
-										uploadID string
-									}{key: m.Key, uploadID: m.UploadID})
-								}
-							}
-							return nil
-						})
-					})
-					// Release before aborting: AbortMultipartUpload re-acquires
-					// the same handle, and holding a reference across the calls
-					// would pin it for the whole sweep.
-					releasedb()
-					for _, a := range aborts {
-						if err := ctx.Err(); err != nil {
-							return err
-						}
-						slog.Info("[Storage] Aborting incomplete multipart upload of key in bucket", "uploadID", a.uploadID, "key", a.key, "bucket", bInfo.Name, "cutoff", cutoff)
-						_ = fs.AbortMultipartUpload(bInfo.Name, a.key, a.uploadID)
-					}
+				uploads, err := fs.expiredMultipartUploads(ctx, bInfo.Name, prefix, now, cutoff, maxExpiryBatch)
+				if err != nil {
+					return err
 				}
-			}
-		}
-	}
-	return nil
-}
-
-// CleanExpiredMultipartUploads aborts uploads older than cutoff. It returns
-// ctx's error, leaving the rest for the next sweep, once ctx is cancelled.
-func (fs *FilesystemEngine) CleanExpiredMultipartUploads(ctx context.Context, cutoff time.Duration) error {
-	type uploadToAbort struct {
-		bucket   string
-		key      string
-		uploadID string
-	}
-	var aborts []uploadToAbort
-
-	buckets, err := fs.metadata.ListBuckets()
-	if err != nil {
-		return err
-	}
-
-	now := time.Now().UTC()
-	for _, bInfo := range buckets {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		func() {
-			unlock := fs.metadata.acquireBucketLock(bInfo.Name, false)
-			defer unlock()
-
-			db, releasedb, err := fs.metadata.acquireBucketDB(bInfo.Name)
-			if err != nil {
-				slog.Error("[Storage] Failed to open DB for bucket during multipart cleanup", "bucket", bInfo.Name, "error", err)
-				return
-			}
-			defer releasedb()
-
-			err = db.View(func(tx *bolt.Tx) error {
-				b := tx.Bucket(multipartBucket)
-				if b == nil {
-					return nil
+				if err := fs.abortExpiredUploads(ctx, uploads); err != nil {
+					return err
 				}
-				return b.ForEach(func(_, v []byte) error {
-					if len(aborts) >= maxExpiryBatch {
-						return errExpiryBatchFull
-					}
-					var meta MultipartMeta
-					if err := json.Unmarshal(v, &meta); err == nil {
-						if now.Sub(meta.Created) > cutoff {
-							aborts = append(aborts, uploadToAbort{
-								bucket:   meta.Bucket,
-								key:      meta.Key,
-								uploadID: meta.UploadID,
-							})
-						}
-					}
-					return nil
-				})
-			})
-			if err != nil && !errors.Is(err, errExpiryBatchFull) {
-				slog.Error("[Storage] Failed to scan multipart uploads for bucket", "bucket", bInfo.Name, "error", err)
+
 			}
-		}()
-	}
-
-	for _, u := range aborts {
-		if err := ctx.Err(); err != nil {
-			return err
 		}
-		slog.Info("[Storage] Cleaning up expired multipart upload", "uploadID", u.uploadID, "bucket", u.bucket, "key", u.key)
-		_ = fs.AbortMultipartUpload(u.bucket, u.key, u.uploadID)
 	}
-
 	return nil
 }

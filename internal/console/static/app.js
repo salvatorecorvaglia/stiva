@@ -5,29 +5,31 @@
 (() => {
     const {
         apiErrorMessage,
+        icon,
         escapeHtml,
         formatSize,
         objectKeyFor,
-        partSizeFor,
         previewKind,
-        retryDelay,
         validateFolderName,
     } = window.StivaLib;
+
+    const { UploadCancelled, sleep } = window.StivaTransfers;
+    const { uploadSmallFile, uploadLargeFile } = window.StivaTransfers.createClient({
+        api,
+        getToken: () => token,
+        logout,
+        errorFrom,
+        setUploadProgress,
+    });
+
+    const browserState = window.StivaBrowser.createBrowserState();
 
     // ---- State ----
     let usageTimer = null;
     let usageGeneration = 0;
     let token = localStorage.getItem('stiva_token') || '';
-    let currentBucket = '';
-    let currentPrefix = '';
-    let searchPrefix = '';
-    let currentPageIndex = 0;
-    let pageTokens = [''];
     let shareTargetKey = '';
     let currentPreviewBlobURL = '';
-    let loadedItems = [];
-    let currentSortField = 'name';
-    let currentSortOrder = 'asc';
 
     // Zero-byte marker object used to make an empty "folder" visible. It is an
     // implementation detail and must never be listed as a file.
@@ -88,11 +90,18 @@
     const previewContentContainer = $('#preview-content-container');
     const previewFileSize = $('#preview-file-size');
 
+    const confirmPremium = window.StivaDialogs.createConfirmation({
+        document,
+        openModal,
+        closeModal,
+    });
+
     // ---- API Helpers ----
 
-    async function api(method, path, body = null, isFormData = false) {
+    async function api(method, path, body = null, isFormData = false, signal = undefined) {
         const opts = {
             method,
+            signal,
             headers: {},
         };
 
@@ -107,7 +116,15 @@
             opts.body = body;
         }
 
-        const resp = await fetch(path, opts);
+        let resp;
+        for (let attempt = 0; ; attempt++) {
+            resp = await fetch(path, opts);
+            if (resp.status !== 429 || attempt >= 5) break;
+            const wait = Math.max(1000, Number(resp.headers.get('Retry-After')) * 1000 || 1000);
+            await resp.body?.cancel();
+            await sleep(Math.min(wait, 60000), signal);
+            signal?.throwIfAborted();
+        }
         // A 401 from /api/login means wrong credentials, not an expired
         // session. Treating it as expiry threw here, and the login form then
         // reported "Connection failed. Is the server running?" for a typo'd
@@ -213,14 +230,14 @@
 
     if (bucketPublicToggle) {
         bucketPublicToggle.addEventListener('change', async () => {
-            if (!currentBucket) return;
+            if (!browserState.state.bucket) return;
             const publicVal = bucketPublicToggle.checked;
             // Opening a bucket to anonymous reads is the one irreversible-in-
             // effect setting here (anything read meanwhile is out), so it is
             // confirmed rather than applied on a single click.
             if (publicVal) {
                 const ok = await confirmPremium(
-                    `Make "${currentBucket}" public? Anyone who knows or guesses an object's URL will be able to download it without credentials.`,
+                    `Make "${browserState.state.bucket}" public? Anyone who knows or guesses an object's URL will be able to download it without credentials.`,
                     {
                         title: 'Make Bucket Public',
                         confirmLabel: 'Make Public',
@@ -232,22 +249,27 @@
                     return;
                 }
             }
-            await apiAction('POST', `/api/buckets/${currentBucket}/public?public=${publicVal}`, {
-                successMsg: 'Bucket public access updated',
-                errorMsg: 'Failed to update public access',
-                onSuccess: () => {
-                    if (bucketPublicBadge) {
-                        bucketPublicBadge.style.display = publicVal ? 'inline-flex' : 'none';
-                    }
+            await apiAction(
+                'POST',
+                `/api/buckets/${browserState.state.bucket}/public?public=${publicVal}`,
+                {
+                    successMsg: 'Bucket public access updated',
+                    errorMsg: 'Failed to update public access',
+                    onSuccess: () => {
+                        if (bucketPublicBadge) {
+                            bucketPublicBadge.style.display = publicVal ? 'inline-flex' : 'none';
+                        }
+                    },
+                    onError: () => {
+                        bucketPublicToggle.checked = !publicVal;
+                    },
                 },
-                onError: () => {
-                    bucketPublicToggle.checked = !publicVal;
-                },
-            });
+            );
         });
     }
 
     function logout() {
+        browserState.invalidate();
         clearTimeout(usageTimer);
         usageGeneration++;
         token = '';
@@ -378,10 +400,11 @@
     // ---- Buckets ----
 
     async function showBucketsView() {
+        browserState.invalidate();
         bucketsView.classList.add('active');
         objectsView.classList.remove('active');
-        currentBucket = '';
-        currentPrefix = '';
+        browserState.state.bucket = '';
+        browserState.state.prefix = '';
         await loadBuckets();
     }
 
@@ -421,6 +444,14 @@
     function createBucketCard(bucket) {
         const card = document.createElement('div');
         card.className = 'bucket-card';
+        card.tabIndex = 0;
+        card.setAttribute('aria-label', `Open bucket ${bucket.name}`);
+        card.addEventListener('keydown', (event) => {
+            if (event.target === card && (event.key === 'Enter' || event.key === ' ')) {
+                event.preventDefault();
+                openBucket(bucket.name);
+            }
+        });
 
         const created = new Date(bucket.creationDate);
         const dateStr = created.toLocaleDateString('en-US', {
@@ -432,20 +463,20 @@
         card.innerHTML = `
             <div class="bucket-card-header">
                 <div class="bucket-card-icon">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    ${icon('folder', 20)}
                 </div>
                 <button class="btn-icon btn-danger bucket-delete-btn" title="Delete bucket" aria-label="Delete bucket ${escapeHtml(bucket.name)}" data-bucket="${escapeHtml(bucket.name)}">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                    ${icon('trash', 16)}
                 </button>
             </div>
             <div class="bucket-card-name">${escapeHtml(bucket.name)}${bucket.isPublic ? ' <span class="public-badge">Public</span>' : ''}</div>
             <div class="bucket-card-meta">
                 <span>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                    ${icon('calendar', 14)}
                     ${dateStr}
                 </span>
                 <span>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+                    ${icon('file', 14)}
                     ${bucket.objectCount} object${bucket.objectCount !== 1 ? 's' : ''}
                 </span>
             </div>
@@ -602,7 +633,7 @@
     $('#lifecycle-btn').addEventListener('click', async () => {
         if (lifecycleBusy) return;
         const generation = ++lifecycleGeneration;
-        lifecycleBucket = currentBucket;
+        lifecycleBucket = browserState.state.bucket;
         lifecycleRules = [];
         $('#lifecycle-bucket').textContent = `Bucket: ${lifecycleBucket}`;
         $('#lifecycle-error').textContent = '';
@@ -729,8 +760,8 @@
 
     $('#versioning-btn').addEventListener('click', async () => {
         if (versionsBusy) return;
-        versionsBucket = currentBucket;
-        versionsPrefix = currentPrefix;
+        versionsBucket = browserState.state.bucket;
+        versionsPrefix = browserState.state.prefix;
         versionsNext = null;
         versioningStatus = '';
         const generation = ++versionsGeneration;
@@ -805,9 +836,9 @@
     // ---- Objects Browser ----
 
     function openBucket(name) {
-        currentBucket = name;
-        currentPrefix = '';
-        searchPrefix = '';
+        browserState.state.bucket = name;
+        browserState.state.prefix = '';
+        browserState.state.searchPrefix = '';
         if (searchInput) searchInput.value = '';
         resetPagination();
         bucketsView.classList.remove('active');
@@ -817,6 +848,7 @@
         api('GET', `/api/buckets/${name}/public`)
             .then((r) => r.json())
             .then((data) => {
+                if (browserState.state.bucket !== name) return;
                 const isPublic = !!data.public;
                 if (bucketPublicToggle) bucketPublicToggle.checked = isPublic;
                 if (bucketPublicBadge)
@@ -830,6 +862,7 @@
     const itemsPerPage = 50;
 
     async function loadObjects(silent = false) {
+        const request = browserState.beginRequest();
         updateBreadcrumb();
 
         if (!silent) {
@@ -845,25 +878,31 @@
 
         try {
             const params = new URLSearchParams({
-                prefix: currentPrefix,
+                prefix: request.prefix,
                 delimiter: '/',
                 maxKeys: itemsPerPage,
             });
 
-            if (searchPrefix) {
-                params.set('searchPrefix', searchPrefix);
+            if (browserState.state.searchPrefix) {
+                params.set('searchPrefix', request.searchPrefix);
             }
 
-            if (currentPageIndex > 0 && pageTokens[currentPageIndex]) {
-                params.set('continuationToken', pageTokens[currentPageIndex]);
-            }
+            if (request.continuationToken)
+                params.set('continuationToken', request.continuationToken);
 
-            const resp = await api('GET', `/api/buckets/${currentBucket}/objects?${params}`);
+            const resp = await api(
+                'GET',
+                `/api/buckets/${request.bucket}/objects?${params}`,
+                null,
+                false,
+                request.signal,
+            );
             if (!resp.ok) throw new Error(await errorFrom(resp, 'Failed to load objects'));
             const data = await resp.json();
+            if (!request.isCurrent()) return;
             // Hide the folder placeholder: it used to appear as a stray file
             // inside every folder created from the console.
-            loadedItems = (data.items || []).filter(
+            browserState.state.items = (data.items || []).filter(
                 (item) => item.isPrefix || !item.key.endsWith(FOLDER_PLACEHOLDER),
             );
 
@@ -871,19 +910,20 @@
 
             const hasNext = data.isTruncated;
             if (hasNext) {
-                pageTokens[currentPageIndex + 1] = data.nextContinuationToken;
+                browserState.state.pageTokens[browserState.state.pageIndex + 1] =
+                    data.nextContinuationToken;
             }
 
-            if (currentPageIndex > 0 || hasNext) {
+            if (browserState.state.pageIndex > 0 || hasNext) {
                 paginationContainer.style.display = 'flex';
-                prevPageBtn.disabled = currentPageIndex === 0;
+                prevPageBtn.disabled = browserState.state.pageIndex === 0;
                 nextPageBtn.disabled = !hasNext;
-                pageIndicator.textContent = `Page ${currentPageIndex + 1}`;
+                pageIndicator.textContent = `Page ${browserState.state.pageIndex + 1}`;
             } else {
                 paginationContainer.style.display = 'none';
             }
         } catch (err) {
-            if (!silent) {
+            if (!silent && request.isCurrent()) {
                 objectsTbody.innerHTML = '';
                 objectsTableContainer.style.display = 'none';
                 objectsEmpty.style.display = 'block';
@@ -895,11 +935,13 @@
     function renderObjectsTable() {
         objectsTbody.innerHTML = '';
 
-        if (loadedItems.length === 0) {
+        if (browserState.state.items.length === 0) {
             objectsEmpty.style.display = 'block';
             objectsTableContainer.style.display = 'none';
             paginationContainer.style.display = 'none';
-            objectCount.textContent = searchPrefix ? 'No matching items' : 'Empty';
+            objectCount.textContent = browserState.state.searchPrefix
+                ? 'No matching items'
+                : 'Empty';
 
             const headers = {
                 name: $('#th-name'),
@@ -923,28 +965,28 @@
         // Sorting is applied to the loaded page only, not the whole bucket. Say
         // so rather than letting the column arrows imply a global ordering.
         const scopeNote = paginationContainer.style.display !== 'none' ? ' on this page' : '';
-        objectCount.textContent = `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''}${scopeNote}`;
+        objectCount.textContent = `${browserState.state.items.length} item${browserState.state.items.length !== 1 ? 's' : ''}${scopeNote}`;
 
-        const folders = loadedItems.filter((item) => item.isPrefix);
-        const files = loadedItems.filter((item) => !item.isPrefix);
+        const folders = browserState.state.items.filter((item) => item.isPrefix);
+        const files = browserState.state.items.filter((item) => !item.isPrefix);
 
         folders.sort((a, b) => a.key.localeCompare(b.key));
 
         files.sort((a, b) => {
             let valA, valB;
-            if (currentSortField === 'name') {
+            if (browserState.state.sortField === 'name') {
                 valA = a.key.toLowerCase();
                 valB = b.key.toLowerCase();
-            } else if (currentSortField === 'size') {
+            } else if (browserState.state.sortField === 'size') {
                 valA = a.size || 0;
                 valB = b.size || 0;
-            } else if (currentSortField === 'date') {
+            } else if (browserState.state.sortField === 'date') {
                 valA = a.lastModified ? new Date(a.lastModified).getTime() : 0;
                 valB = b.lastModified ? new Date(b.lastModified).getTime() : 0;
             }
 
-            if (valA < valB) return currentSortOrder === 'asc' ? -1 : 1;
-            if (valA > valB) return currentSortOrder === 'asc' ? 1 : -1;
+            if (valA < valB) return browserState.state.sortOrder === 'asc' ? -1 : 1;
+            if (valA > valB) return browserState.state.sortOrder === 'asc' ? 1 : -1;
             return 0;
         });
 
@@ -963,11 +1005,11 @@
         for (const [field, th] of Object.entries(headers)) {
             if (!th) continue;
             th.classList.remove('sort-asc', 'sort-desc');
-            if (field === currentSortField) {
-                th.classList.add(currentSortOrder === 'asc' ? 'sort-asc' : 'sort-desc');
+            if (field === browserState.state.sortField) {
+                th.classList.add(browserState.state.sortOrder === 'asc' ? 'sort-asc' : 'sort-desc');
                 th.setAttribute(
                     'aria-sort',
-                    currentSortOrder === 'asc' ? 'ascending' : 'descending',
+                    browserState.state.sortOrder === 'asc' ? 'ascending' : 'descending',
                 );
             } else {
                 th.setAttribute('aria-sort', 'none');
@@ -995,7 +1037,7 @@
         if (count > 0) {
             batchDeleteBtn.style.display = 'inline-flex';
             batchDeleteBtn.innerHTML = `
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+                ${icon('trash-selected', 16)}
                 Delete Selected (${count})
             `;
         } else {
@@ -1008,13 +1050,13 @@
 
         if (item.isPrefix) {
             // Folder
-            const displayName = item.key.replace(currentPrefix, '').replace(/\/$/, '');
+            const displayName = item.key.replace(browserState.state.prefix, '').replace(/\/$/, '');
             tr.innerHTML = `
                 <td></td>
                 <td>
                     <div class="file-name">
                         <div class="file-icon folder">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                            ${icon('folder', 16)}
                         </div>
                         <span class="file-name-text folder-link" data-prefix="${escapeHtml(item.key)}">${escapeHtml(displayName)}/</span>
                     </div>
@@ -1024,7 +1066,7 @@
                 <td>
                     <div class="file-actions">
                         <button class="btn-icon btn-danger delete-folder-btn" title="Delete folder" aria-label="Delete folder ${escapeHtml(displayName)}">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                            ${icon('trash', 16)}
                         </button>
                     </div>
                 </td>
@@ -1036,15 +1078,15 @@
             });
 
             tr.querySelector('.folder-link').addEventListener('click', () => {
-                currentPrefix = item.key;
-                searchPrefix = '';
+                browserState.state.prefix = item.key;
+                browserState.state.searchPrefix = '';
                 if (searchInput) searchInput.value = '';
                 resetPagination();
                 loadObjects();
             });
         } else {
             // File
-            const displayName = item.key.replace(currentPrefix, '');
+            const displayName = item.key.replace(browserState.state.prefix, '');
             const size = formatSize(item.size);
             const modified = item.lastModified
                 ? new Date(item.lastModified).toLocaleString('en-US', {
@@ -1063,9 +1105,9 @@
                 <td>
                     <div class="file-name">
                         <div class="file-icon file">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+                            ${icon('file', 16)}
                         </div>
-                        <span class="file-name-text preview-link" data-key="${escapeHtml(item.key)}">${escapeHtml(displayName)}</span>
+                        <button type="button" class="file-name-text preview-link" data-key="${escapeHtml(item.key)}">${escapeHtml(displayName)}</button>
                     </div>
                 </td>
                 <td>${size}</td>
@@ -1073,13 +1115,13 @@
                 <td>
                     <div class="file-actions">
                         <button class="btn-icon share-btn" title="Share Link" aria-label="Share ${escapeHtml(displayName)}" data-key="${escapeHtml(item.key)}">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54-.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="8" y1="16" x2="16" y2="8"/></svg>
+                            ${icon('share', 16)}
                         </button>
                         <button class="btn-icon download-btn" title="Download" aria-label="Download ${escapeHtml(displayName)}" data-key="${escapeHtml(item.key)}">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            ${icon('download', 16)}
                         </button>
                         <button class="btn-icon btn-danger delete-obj-btn" title="Delete" aria-label="Delete ${escapeHtml(displayName)}" data-key="${escapeHtml(item.key)}">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                            ${icon('trash', 16)}
                         </button>
                     </div>
                 </td>
@@ -1111,11 +1153,12 @@
             });
 
             tr.querySelector('.delete-obj-btn').addEventListener('click', async () => {
+                const bucket = browserState.state.bucket;
                 const ok = await confirmPremium(`Delete "${displayName}"?`);
                 if (!ok) return;
                 await apiAction(
                     'DELETE',
-                    `/api/buckets/${currentBucket}/objects?key=${encodeURIComponent(item.key)}`,
+                    `/api/buckets/${bucket}/objects?key=${encodeURIComponent(item.key)}`,
                     {
                         successMsg: `"${displayName}" deleted`,
                         errorMsg: 'Failed to delete object',
@@ -1158,18 +1201,18 @@
         addBreadcrumbSep();
 
         // Bucket name
-        if (!currentPrefix) {
+        if (!browserState.state.prefix) {
             const bucketSpan = document.createElement('span');
             bucketSpan.className = 'breadcrumb-item current';
-            bucketSpan.textContent = currentBucket;
+            bucketSpan.textContent = browserState.state.bucket;
             breadcrumb.appendChild(bucketSpan);
         } else {
             const bucketBtn = document.createElement('button');
             bucketBtn.className = 'breadcrumb-item';
-            bucketBtn.textContent = currentBucket;
+            bucketBtn.textContent = browserState.state.bucket;
             bucketBtn.addEventListener('click', () => {
-                currentPrefix = '';
-                searchPrefix = '';
+                browserState.state.prefix = '';
+                browserState.state.searchPrefix = '';
                 if (searchInput) searchInput.value = '';
                 resetPagination();
                 loadObjects();
@@ -1177,7 +1220,7 @@
             breadcrumb.appendChild(bucketBtn);
 
             // Prefix parts
-            const parts = currentPrefix.split('/').filter(Boolean);
+            const parts = browserState.state.prefix.split('/').filter(Boolean);
             parts.forEach((part, i) => {
                 addBreadcrumbSep();
                 const prefix = parts.slice(0, i + 1).join('/') + '/';
@@ -1191,8 +1234,8 @@
                     btn.className = 'breadcrumb-item';
                     btn.textContent = part;
                     btn.addEventListener('click', () => {
-                        currentPrefix = prefix;
-                        searchPrefix = '';
+                        browserState.state.prefix = prefix;
+                        browserState.state.searchPrefix = '';
                         if (searchInput) searchInput.value = '';
                         resetPagination();
                         loadObjects();
@@ -1304,20 +1347,15 @@
     }
 
     const MULTIPART_THRESHOLD = 10 * 1024 * 1024; // 10MB
-    const PART_ATTEMPTS = 3;
-    const PART_CONCURRENCY = 3;
 
     // The upload in progress, if any: whether it was cancelled, and its
     // in-flight requests so Cancel can abort them.
     let activeUpload = null;
 
-    class UploadCancelled extends Error {}
-
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
     uploadCancelBtn.addEventListener('click', () => {
         if (!activeUpload) return;
         activeUpload.cancelled = true;
+        activeUpload.cancelController?.abort();
         activeUpload.xhrs.forEach((xhr) => {
             xhr.abort();
         });
@@ -1334,15 +1372,21 @@
             showToast('Another upload is still in progress', 'info');
             return;
         }
-        const upload = { cancelled: false, xhrs: new Set() };
+        const upload = {
+            cancelled: false,
+            xhrs: new Set(),
+            bucket: browserState.state.bucket,
+            prefix: browserState.state.prefix,
+        };
         activeUpload = upload;
         uploadProgress.style.display = 'block';
 
         let uploaded = 0;
         try {
             for (let i = 0; i < items.length && !upload.cancelled; i++) {
+                upload.cancelController = new AbortController();
                 const { file, relPath } = items[i];
-                const key = objectKeyFor(currentPrefix, relPath);
+                const key = objectKeyFor(upload.prefix, relPath);
                 setUploadProgress(0, i + 1, items.length, relPath);
                 try {
                     if (file.size >= MULTIPART_THRESHOLD) {
@@ -1380,177 +1424,12 @@
         }
     }
 
-    // sendForm POSTs multipart form data as part of an upload, reporting
-    // progress, and rejects with the server's own error message (the status
-    // is attached, for deciding whether a retry can help) or UploadCancelled.
-    function sendForm(upload, url, formData, onProgress) {
-        return new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            upload.xhrs.add(xhr);
-            xhr.open('POST', url);
-            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
-            };
-            const fail = (status, text) => {
-                const err = new Error(apiErrorMessage(status, text, 'Upload failed'));
-                err.status = status;
-                reject(err);
-            };
-            xhr.onload = () => {
-                upload.xhrs.delete(xhr);
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    resolve(xhr.responseText);
-                } else if (xhr.status === 401) {
-                    logout();
-                    fail(401, '{"error":"Session expired"}');
-                } else {
-                    fail(xhr.status, xhr.responseText);
-                }
-            };
-            xhr.onerror = () => {
-                upload.xhrs.delete(xhr);
-                fail(0, '');
-            };
-            xhr.onabort = () => {
-                upload.xhrs.delete(xhr);
-                reject(new UploadCancelled('Upload cancelled'));
-            };
-            xhr.send(formData);
-        });
-    }
-
-    async function uploadSmallFile(upload, file, key, index, total, name) {
-        const formData = new FormData();
-        formData.append('file', file);
-        // The key travels in the query string: the server streams the
-        // multipart body straight to storage and so cannot rely on a form
-        // field that arrives after the file part.
-        await sendForm(
-            upload,
-            `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(key)}`,
-            formData,
-            (loaded, size) =>
-                setUploadProgress(Math.round((loaded / size) * 100), index, total, name),
-        );
-    }
-
-    async function uploadLargeFile(upload, file, key, index, total, name) {
-        const partSize = partSizeFor(file.size);
-        if (!partSize) {
-            throw new Error('This file is larger than S3 allows (10,000 parts of 5 GiB)');
-        }
-
-        const initResp = await api('POST', `/api/buckets/${currentBucket}/multipart/initiate`, {
-            key,
-            contentType: file.type || 'application/octet-stream',
-        });
-        if (!initResp.ok) {
-            throw new Error(await errorFrom(initResp, 'Failed to start the upload'));
-        }
-        const { uploadId } = await initResp.json();
-
-        const numParts = Math.ceil(file.size / partSize);
-        const partProgress = new Array(numParts + 1).fill(0);
-        const results = [];
-        const updateProgress = () => {
-            const sent = partProgress.reduce((sum, val) => sum + val, 0);
-            setUploadProgress(
-                Math.min(Math.round((sent / file.size) * 100), 99),
-                index,
-                total,
-                name,
-            );
-        };
-
-        // A part is retried with backoff when the failure is one a retry can
-        // fix (network error, server error, timeout, rate limit). One dropped
-        // request used to abort the whole upload.
-        const uploadPart = async (partNum) => {
-            const start = (partNum - 1) * partSize;
-            const end = Math.min(start + partSize, file.size);
-            for (let attempt = 0; ; attempt++) {
-                if (upload.cancelled) throw new UploadCancelled('Upload cancelled');
-
-                const formData = new FormData();
-                formData.append('uploadId', uploadId);
-                formData.append('key', key);
-                formData.append('partNumber', partNum.toString());
-                formData.append('file', file.slice(start, end));
-
-                try {
-                    const text = await sendForm(
-                        upload,
-                        `/api/buckets/${currentBucket}/multipart/upload-part`,
-                        formData,
-                        (loaded) => {
-                            partProgress[partNum] = loaded;
-                            updateProgress();
-                        },
-                    );
-                    partProgress[partNum] = end - start;
-                    updateProgress();
-                    return JSON.parse(text);
-                } catch (err) {
-                    if (err instanceof UploadCancelled) throw err;
-                    const retryable =
-                        !err.status ||
-                        err.status >= 500 ||
-                        err.status === 408 ||
-                        err.status === 429;
-                    if (!retryable || attempt + 1 >= PART_ATTEMPTS) {
-                        throw new Error(`Part ${partNum} of ${numParts}: ${err.message}`);
-                    }
-                    partProgress[partNum] = 0;
-                    updateProgress();
-                    await sleep(retryDelay(attempt));
-                }
-            }
-        };
-
-        const queue = Array.from({ length: numParts }, (_, i) => i + 1);
-        try {
-            const worker = async () => {
-                while (queue.length > 0) {
-                    results.push(await uploadPart(queue.shift()));
-                }
-            };
-            await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, numParts) }, worker));
-
-            results.sort((a, b) => a.partNumber - b.partNumber);
-            const completeResp = await api(
-                'POST',
-                `/api/buckets/${currentBucket}/multipart/complete`,
-                {
-                    uploadId,
-                    key,
-                    parts: results.map((p) => ({ partNumber: p.partNumber, etag: p.etag })),
-                },
-            );
-            if (!completeResp.ok) {
-                throw new Error(await errorFrom(completeResp, 'Failed to complete the upload'));
-            }
-            setUploadProgress(100, index, total, name);
-        } catch (err) {
-            // Stop the other workers and discard the parts already stored.
-            queue.length = 0;
-            upload.xhrs.forEach((xhr) => {
-                xhr.abort();
-            });
-            await api('POST', `/api/buckets/${currentBucket}/multipart/abort`, {
-                uploadId,
-                key,
-            }).catch(() => {});
-            throw err;
-        }
-    }
-
     // Downloads go through a short-lived, single-use link on the console's
     // own origin, which the browser then downloads natively. The object used
     // to be fetched whole into memory and saved from a blob, which failed on
     // large files; and a presigned S3-API URL is on another port, where
     // browsers ignore <a download>.
-    async function downloadObject(key, versionId = '', bucket = currentBucket) {
+    async function downloadObject(key, versionId = '', bucket = browserState.state.bucket) {
         try {
             const resp = await api(
                 'POST',
@@ -1579,33 +1458,13 @@
 
     const BATCH_DELETE_SIZE = 1000;
 
-    // listAllKeys returns every object key under prefix, across pages.
-    async function listAllKeys(prefix) {
-        const keys = [];
-        let continuation = '';
-        for (;;) {
-            const params = new URLSearchParams({
-                prefix,
-                recursive: '1',
-                maxKeys: String(BATCH_DELETE_SIZE),
-            });
-            if (continuation) params.set('continuationToken', continuation);
-            const resp = await api('GET', `/api/buckets/${currentBucket}/objects?${params}`);
-            if (!resp.ok) throw new Error(await errorFrom(resp, 'Failed to list the folder'));
-            const data = await resp.json();
-            keys.push(...data.items.filter((item) => !item.isPrefix).map((item) => item.key));
-            if (!data.isTruncated) return keys;
-            continuation = data.nextContinuationToken;
-        }
-    }
-
     // deleteKeys deletes keys in batches, one request per 1,000 keys — the
     // console used to send one DELETE per object — and reports the outcome.
-    async function deleteKeys(keys) {
+    async function deleteKeys(keys, bucket = browserState.state.bucket) {
         let deleted = 0;
         const failures = [];
         for (let i = 0; i < keys.length; i += BATCH_DELETE_SIZE) {
-            const resp = await api('POST', `/api/buckets/${currentBucket}/objects/delete`, {
+            const resp = await api('POST', `/api/buckets/${bucket}/objects/delete`, {
                 keys: keys.slice(i, i + BATCH_DELETE_SIZE),
             });
             if (!resp.ok) throw new Error(await errorFrom(resp, 'Delete failed'));
@@ -1616,35 +1475,27 @@
         return { deleted, failures };
     }
 
-    function reportDeletion({ deleted, failures }) {
+    function reportDeletion({ deleted, failures, failureCount = failures.length }) {
         if (deleted > 0)
             showToast(`Deleted ${deleted} object${deleted !== 1 ? 's' : ''}`, 'success');
         if (failures.length > 0) {
             showToast(
-                `Failed to delete ${failures.length} object${failures.length !== 1 ? 's' : ''}: ${failures[0].error}`,
+                `Failed to delete ${failureCount} object${failureCount !== 1 ? 's' : ''}: ${failures[0].error}`,
                 'error',
             );
         }
     }
 
     async function deleteFolder(prefix, name) {
-        let keys;
-        try {
-            keys = await listAllKeys(prefix);
-        } catch (err) {
-            showToast(err.message, 'error');
-            return;
-        }
-        const ok = await confirmPremium(
-            `Delete the folder "${name}" and the ${keys.length} object${keys.length !== 1 ? 's' : ''} in it?`,
-        );
+        const bucket = browserState.state.bucket;
+        const ok = await confirmPremium(`Delete the folder "${name}" and all objects under it?`);
         if (!ok) return;
         try {
-            reportDeletion(await deleteKeys(keys));
+            reportDeletion(await window.StivaFolders.deleteFolderContents({ api, bucket, prefix }));
         } catch (err) {
             showToast(err.message, 'error');
         }
-        loadObjects();
+        if (bucket === browserState.state.bucket) loadObjects();
     }
 
     // ---- Create Folder ----
@@ -1666,7 +1517,7 @@
         folderError.style.display = problem ? 'block' : 'none';
         if (problem) return;
 
-        const key = currentPrefix + name + '/';
+        const key = browserState.state.prefix + name + '/';
 
         // Create a "folder" by uploading a zero-byte placeholder object.
         const formData = new FormData();
@@ -1676,7 +1527,7 @@
 
         await apiAction(
             'POST',
-            `/api/buckets/${currentBucket}/objects/upload?key=${encodeURIComponent(placeholderKey)}`,
+            `/api/buckets/${browserState.state.bucket}/objects/upload?key=${encodeURIComponent(placeholderKey)}`,
             {
                 body: formData,
                 isFormData: true,
@@ -1745,10 +1596,17 @@
 
     function closeModal(id) {
         const modal = document.getElementById(id);
+        if (modal.cancelConfirmation) {
+            const cancel = modal.cancelConfirmation;
+            modal.cancelConfirmation = null;
+            cancel();
+            return;
+        }
         modal.style.display = 'none';
         modal.setAttribute('aria-hidden', 'true');
 
         if (id === 'preview-modal') {
+            previewController?.abort();
             previewContentContainer.innerHTML = '';
             if (currentPreviewBlobURL) {
                 URL.revokeObjectURL(currentPreviewBlobURL);
@@ -1784,7 +1642,7 @@
         try {
             const resp = await api(
                 'GET',
-                `/api/buckets/${currentBucket}/objects/presign?key=${encodeURIComponent(shareTargetKey)}&expires=${expires}&download=1`,
+                `/api/buckets/${browserState.state.bucket}/objects/presign?key=${encodeURIComponent(shareTargetKey)}&expires=${expires}&download=1`,
             );
             if (resp.ok) {
                 const data = await resp.json();
@@ -1810,7 +1668,11 @@
             .catch(() => showToast('Failed to copy link', 'error'));
     });
 
+    let previewController = null;
     async function showPreview(key, size, contentType) {
+        previewController?.abort();
+        const controller = new AbortController();
+        previewController = controller;
         const filename = key.split('/').pop();
         previewTitle.textContent = `Preview: ${filename}`;
         previewFileSize.textContent = formatSize(size);
@@ -1843,12 +1705,16 @@
             // URLs are already permitted by the CSP for img/media/frame-src.
             const resp = await api(
                 'GET',
-                `/api/buckets/${currentBucket}/objects/download?key=${encodeURIComponent(key)}`,
+                `/api/buckets/${browserState.state.bucket}/objects/download?key=${encodeURIComponent(key)}`,
+                null,
+                false,
+                controller.signal,
             );
             if (!resp.ok) {
                 throw new Error('Failed to fetch file for preview');
             }
             const blob = await resp.blob();
+            controller.signal.throwIfAborted();
             if (currentPreviewBlobURL) {
                 URL.revokeObjectURL(currentPreviewBlobURL);
             }
@@ -1873,6 +1739,7 @@
             } else if (kind === 'text') {
                 const isTruncated = size > 256 * 1024;
                 const text = await blob.slice(0, 256 * 1024).text();
+                controller.signal.throwIfAborted();
                 let escapedText = escapeHtml(text);
                 if (isTruncated) {
                     escapedText +=
@@ -1885,7 +1752,7 @@
                 previewContentContainer.innerHTML = `
                     <div class="preview-notice">
                         <div class="preview-notice-icon">📄</div>
-                        <p class="preview-notice-text">No preview available for this file type (${ext}).</p>
+                        <p class="preview-notice-text">No preview available for this file type (${escapeHtml(ext)}).</p>
                         <button id="preview-download-btn" class="btn btn-primary">Download File</button>
                     </div>
                 `;
@@ -1894,6 +1761,7 @@
                 });
             }
         } catch (err) {
+            if (controller.signal.aborted) return;
             previewContentContainer.innerHTML = `<div class="preview-status preview-status-error">Error loading preview: ${escapeHtml(err.message)}</div>`;
         }
     }
@@ -1904,19 +1772,18 @@
     });
 
     function resetPagination() {
-        currentPageIndex = 0;
-        pageTokens = [''];
+        browserState.resetPagination();
     }
 
     prevPageBtn.addEventListener('click', () => {
-        if (currentPageIndex > 0) {
-            currentPageIndex--;
+        if (browserState.state.pageIndex > 0) {
+            browserState.state.pageIndex--;
             loadObjects();
         }
     });
 
     nextPageBtn.addEventListener('click', () => {
-        currentPageIndex++;
+        browserState.state.pageIndex++;
         loadObjects();
     });
 
@@ -1924,7 +1791,7 @@
     searchInput.addEventListener('input', (e) => {
         clearTimeout(searchDebounceTimeout);
         searchDebounceTimeout = setTimeout(() => {
-            searchPrefix = e.target.value.trim();
+            browserState.state.searchPrefix = e.target.value.trim();
             resetPagination();
             loadObjects();
         }, 300);
@@ -1969,11 +1836,11 @@
     const thDate = $('#th-date');
 
     function handleSort(field) {
-        if (currentSortField === field) {
-            currentSortOrder = currentSortOrder === 'asc' ? 'desc' : 'asc';
+        if (browserState.state.sortField === field) {
+            browserState.state.sortOrder = browserState.state.sortOrder === 'asc' ? 'desc' : 'asc';
         } else {
-            currentSortField = field;
-            currentSortOrder = 'asc';
+            browserState.state.sortField = field;
+            browserState.state.sortOrder = 'asc';
         }
         renderObjectsTable();
     }
@@ -1982,6 +1849,7 @@
     // must announce their state via aria-sort.
     function makeSortable(th, field) {
         if (!th) return;
+        th.title = 'Sort this page';
         th.setAttribute('role', 'columnheader');
         th.setAttribute('tabindex', '0');
         th.setAttribute('aria-sort', 'none');
@@ -2013,6 +1881,7 @@
     const batchDeleteBtn = $('#batch-delete-btn');
     if (batchDeleteBtn) {
         batchDeleteBtn.addEventListener('click', async () => {
+            const bucket = browserState.state.bucket;
             const checkedBoxes = objectsTbody.querySelectorAll('.object-select:checked');
             const keys = Array.from(checkedBoxes).map((cb) => cb.dataset.key);
             if (keys.length === 0) return;
@@ -2027,7 +1896,7 @@
             batchDeleteBtn.textContent = 'Deleting...';
 
             try {
-                reportDeletion(await deleteKeys(keys));
+                reportDeletion(await deleteKeys(keys, bucket));
                 loadObjects();
             } catch (err) {
                 showToast(err.message, 'error');
@@ -2040,60 +1909,6 @@
     }
 
     // ---- Utilities ----
-
-    // confirmPremium asks for confirmation in the app's dialog. The wording
-    // defaults to deletion, the usual case.
-    function confirmPremium(
-        message,
-        {
-            title = 'Confirm Deletion',
-            confirmLabel = 'Delete',
-            warning = 'Warning: This action is permanent and cannot be undone.',
-        } = {},
-    ) {
-        return new Promise((resolve) => {
-            const modal = document.getElementById('delete-modal');
-            const msgEl = document.getElementById('delete-modal-msg');
-            const confirmBtn = document.getElementById('confirm-delete-btn');
-
-            msgEl.textContent = message;
-            document.getElementById('delete-modal-title').textContent = title;
-            document.getElementById('delete-modal-warning').textContent = warning;
-            confirmBtn.textContent = confirmLabel;
-            openModal('delete-modal');
-
-            const handleConfirm = () => {
-                cleanup();
-                resolve(true);
-            };
-
-            const handleCancel = () => {
-                cleanup();
-                resolve(false);
-            };
-
-            const cleanup = () => {
-                confirmBtn.removeEventListener('click', handleConfirm);
-                modal.querySelectorAll('[data-close="delete-modal"]').forEach((btn) => {
-                    btn.removeEventListener('click', handleCancel);
-                });
-                modal.removeEventListener('click', handleOverlayClick);
-                closeModal('delete-modal');
-            };
-
-            const handleOverlayClick = (e) => {
-                if (e.target === modal) {
-                    handleCancel();
-                }
-            };
-
-            confirmBtn.addEventListener('click', handleConfirm);
-            modal.querySelectorAll('[data-close="delete-modal"]').forEach((btn) => {
-                btn.addEventListener('click', handleCancel);
-            });
-            modal.addEventListener('click', handleOverlayClick);
-        });
-    }
 
     // ---- Init ----
 
@@ -2113,7 +1928,8 @@
 
         // Auto-refresh objects list every 10 seconds silently.
         setInterval(() => {
-            if (!token || !currentBucket || document.visibilityState !== 'visible') return;
+            if (!token || !browserState.state.bucket || document.visibilityState !== 'visible')
+                return;
 
             // Modals are opened with `display: flex`, so the previous check for
             // `display: block` never matched and the table refreshed underneath

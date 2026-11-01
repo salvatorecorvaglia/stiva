@@ -69,6 +69,7 @@ func New(cfg *config.Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
+	engine.SetMetrics(&storage.MetricsTracker{})
 	engine.SetWebhookSecret(cfg.WebhookSecret)
 	engine.SetMaxObjectSize(cfg.MaxObjectSize)
 	engine.SetDisableMinPartSize(cfg.DisableMinPartSize)
@@ -114,6 +115,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// S3 API server
 	s3Router := s3api.NewRouter(s3api.RouterOptions{
+		MaxPayloadSize:   &cfg.MaxObjectSize,
 		Engine:           engine,
 		Creds:            creds,
 		Region:           cfg.Region,

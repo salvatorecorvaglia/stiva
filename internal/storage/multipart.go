@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -123,8 +124,11 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 	ssecParams := extractSSECParams(ctx)
 
 	meta, err := fs.metadata.GetMultipartMeta(bucket, key, uploadID)
-	if err != nil {
+	if errors.Is(err, errMultipartMetaNotFound) {
 		return nil, &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	// Every part must match the SSE-C mode declared at creation. The mode used
@@ -258,8 +262,11 @@ func (fs *FilesystemEngine) UploadPart(ctx context.Context, bucket, key, uploadI
 	defer unlock()
 
 	meta, err = fs.metadata.GetMultipartMeta(bucket, key, uploadID)
-	if err != nil {
+	if errors.Is(err, errMultipartMetaNotFound) {
 		return nil, &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	// Retain the previous immutable file until the replacement metadata commits.
@@ -305,8 +312,11 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 	defer unlock()
 
 	meta, err := fs.metadata.GetMultipartMeta(bucket, key, uploadID)
-	if err != nil {
+	if errors.Is(err, errMultipartMetaNotFound) {
 		return nil, &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	// Because the customer key is never persisted, an SSE-C upload can only be
@@ -379,7 +389,7 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 
 	versionStatus, err := fs.metadata.GetBucketVersioning(bucket)
 	if err != nil {
-		versionStatus = ""
+		return nil, err
 	}
 
 	var versionID string
@@ -540,6 +550,17 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		return nil, err
 	}
 	defer unlockBucket()
+	versionStatus, err = fs.metadata.GetBucketVersioning(bucket)
+	if err != nil {
+		return nil, err
+	}
+	versionID = ""
+	switch versionStatus {
+	case "Enabled":
+		versionID = uuid.New().String()
+	case "Suspended":
+		versionID = "null"
+	}
 
 	contentType := meta.ContentType
 	if contentType == "" {
@@ -566,15 +587,20 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 		return nil, err
 	}
 
-	// Clean up multipart temp files
-	if uploadPath, err := fs.multipartUploadPath(bucket, uploadID); err == nil {
-		removeUploadDir(uploadPath)
-	}
+	// Publication is committed. Report maintenance failures without making a
+	// successful completion look retryable; keep pending metadata/gauge intact.
 	if err := fs.metadata.DeleteMultipartMeta(bucket, key, uploadID); err != nil {
 		slog.Error("Failed to delete multipart metadata", "error", err, "bucket", bucket, "key", key, "uploadID", uploadID)
+	} else {
+		fs.Metrics().DecActiveMultiparts()
+		uploadPath, err := fs.multipartUploadPath(bucket, uploadID)
+		if err == nil {
+			err = removeUploadDir(uploadPath)
+		}
+		if err != nil {
+			slog.Error("Failed to remove completed multipart data", "error", err, "bucket", bucket, "uploadID", uploadID)
+		}
 	}
-
-	fs.Metrics().DecActiveMultiparts()
 
 	fs.triggerWebhook("ObjectCreated:CompleteMultipartUpload", info)
 
@@ -583,13 +609,9 @@ func (fs *FilesystemEngine) CompleteMultipartUpload(ctx context.Context, bucket,
 	return info, nil
 }
 
-// removeUploadDir deletes a finished or aborted upload's part files, logging
-// a failure instead of silently leaving the parts on disk.
-func removeUploadDir(path string) {
-	if err := os.RemoveAll(path); err != nil {
-		slog.Warn("[Storage] Failed to remove multipart upload directory; its parts are now orphaned on disk", "path", path, "error", err)
-	}
-}
+// removeUploadDir reports filesystem failures so aborted uploads remain
+// retryable and post-publication cleanup failures can be logged.
+func removeUploadDir(path string) error { return os.RemoveAll(path) }
 
 // multipartETag computes the S3 ETag of an assembled multipart object: the
 // MD5 of the concatenated binary MD5s of its parts, then "-" and the part
@@ -620,15 +642,20 @@ func (fs *FilesystemEngine) AbortMultipartUpload(bucket, key, uploadID string) e
 	defer unlock()
 
 	_, err := fs.metadata.GetMultipartMeta(bucket, key, uploadID)
-	if err != nil {
+	if errors.Is(err, errMultipartMetaNotFound) {
 		return &S3Error{Code: "NoSuchUpload", Message: errUploadNotFound}
+	}
+	if err != nil {
+		return err
 	}
 
 	uploadPath, err := fs.multipartUploadPath(bucket, uploadID)
 	if err != nil {
 		return &S3Error{Code: "InvalidArgument", Message: err.Error()}
 	}
-	removeUploadDir(uploadPath)
+	if err := removeUploadDir(uploadPath); err != nil {
+		return fmt.Errorf("remove multipart data: %w", err)
+	}
 	err = fs.metadata.DeleteMultipartMeta(bucket, key, uploadID)
 	if err == nil {
 		fs.Metrics().DecActiveMultiparts()
