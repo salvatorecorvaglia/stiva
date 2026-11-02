@@ -10,7 +10,7 @@
 
 ---
 
-## ✨ Features
+## Features ✨
 
 ### 📡 S3 API Compatibility
 *   **Core Bucket & Object Operations**: Full support for listing, creating, and deleting buckets, as well as putting, getting, and deleting objects.
@@ -45,7 +45,7 @@
 
 ---
 
-## 🚀 Getting Started
+## Getting Started 🚀
 
 For production, use the hardened configuration in `deployment/compose.production.yml` and `deployment/production.env.example`. The quick-start configuration exposes both ports and uses development credentials; replace these before exposing the service.
 
@@ -237,48 +237,22 @@ rclone lsd stiva:
 
 ---
 
-## 🧪 Running Tests
-
-Unit, integration, and fuzz tests live alongside the code they cover, as in-package `_test.go` files under `internal/` (`internal/auth`, `internal/config`, `internal/console`, `internal/httpx`, `internal/s3api`, `internal/server`, `internal/storage`).
-
-To run the test suite:
-
-```bash
-# Run all tests
-go test -v ./...
-
-# Run tests with race detection
-go test -race ./...
-
-# Browser regressions (headless Chromium, loopback fixture server)
-pnpm install --frozen-lockfile
-pnpm exec playwright install chromium
-pnpm test:browser
-
-# Storage performance baselines
-go test ./internal/storage -run '^$' -bench 'BenchmarkStorage|BenchmarkReplicationSlowTarget' -benchmem
-```
-
----
-
-See [PERFORMANCE.md](PERFORMANCE.md) for concurrent-write workloads, reproducible CPU/memory profiles, and measurement limits.
-
-## 🤝 Contributing
+## Contributing 🤝
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-## 📜 Changelog
+## Changelog 📜
 
 Detailed release history and version changes can be found in [CHANGELOG.md](CHANGELOG.md).
 
-## 🔐 Security
+## Security 🔐
 
 If you discover a security vulnerability, please see our [Security Policy](SECURITY.md).
 
-## 📝 License
+## License 📝
 
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
 
----
+## Author ✍️
 
-**Author**: [Salvatore Corvaglia](https://github.com/salvatorecorvaglia)
+[Salvatore Corvaglia](https://github.com/salvatorecorvaglia)
