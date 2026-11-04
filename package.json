@@ -12,7 +12,7 @@
         "test:browser": "playwright test"
     },
     "devDependencies": {
-        "@biomejs/biome": "^2.6.4",
+        "@biomejs/biome": "^2.6.5",
         "@playwright/test": "1.64.1"
     }
 }
