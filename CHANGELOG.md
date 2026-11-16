@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Update `golang.org/x/sys` to `v0.50.0`, Biome to `2.6.8`, and Playwright to `1.65.1`; refresh dependency overrides and lockfiles.
+- Streamline the README.
+
 ## [1.3.0] - 2026-11-01
 
 ### Added
