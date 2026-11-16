@@ -2,7 +2,7 @@
   <img src="resources/stiva.svg" alt="Stiva logo" width="96" height="96">
 </p>
 
-# Stiva 🖼️
+# Stiva
 
 **Self-hosted, high-performance S3-compatible object storage server with web console**
 
