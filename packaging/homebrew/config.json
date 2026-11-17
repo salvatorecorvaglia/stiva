@@ -1,0 +1,6 @@
+{
+  "name": "stiva",
+  "kind": "binary",
+  "description": "S3-compatible object storage server",
+  "title": "Stiva"
+}
