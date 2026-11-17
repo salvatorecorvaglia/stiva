@@ -1,0 +1,21 @@
+# Optional: customize host, ingress class and TLS Secret before applying.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stiva-s3
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [s3.example.com]
+      secretName: stiva-s3-tls
+  rules:
+    - host: s3.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stiva
+                port:
+                  name: s3
