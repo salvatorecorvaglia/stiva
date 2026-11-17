@@ -9,7 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add stable-release Homebrew formula generation with SHA-256 checksums, CI validation, release attachments, and optional publication to the personal tap; document installation and release maintenance.
 - Add Kustomize-based Kubernetes manifests with environment configuration through ConfigMap and Secret, persistent storage, a single-replica Deployment, health probes, and an internal S3/console Service.
 - Document Kubernetes credential setup, image pinning, configuration updates, Stiva Browser connectivity, and optional S3 Ingress with TLS.
 

@@ -10,14 +10,6 @@
 
 ---
 
-## Homebrew
-
-Stable releases are distributed through the personal tap:
-
-```sh
-brew install salvatorecorvaglia/tap/stiva
-```
-
 ## Features ✨
 
 ### 📡 S3 API Compatibility
