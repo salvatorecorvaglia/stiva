@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Update `golang.org/x/sys` to `v0.50.0`, Biome to `2.6.8`, and Playwright to `1.65.1`; refresh dependency overrides and lockfiles.
 - Streamline the README.
+- Update the runtime container base to Alpine `3.24`.
+- Add weekly Dependabot checks for GitHub Actions, Go and frontend dependencies, and the container base; refresh CI actions.
+- Preserve tag-triggered CI runs, skip external vulnerability checks during release checks, and bound release validation time.
 
 ## [1.3.0] - 2026-11-01
 
