@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-20
+
 ### Added
 
 - Add Kustomize-based Kubernetes manifests with environment configuration through ConfigMap and Secret, persistent storage, a single-replica Deployment, health probes, and an internal S3/console Service.
